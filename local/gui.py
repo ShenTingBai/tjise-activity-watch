@@ -332,11 +332,12 @@ class WelcomeDialog(tk.Toplevel):
          "程序会等到报名开放的那一刻自动提交，不用你盯着屏幕。"),
         ("3", "保持在线",
          "电脑别睡眠、别断网；界面可以最小化，但不要关掉。\n"
-         "失败原因会写在下面的运行日志里。"),
+         "抢到或没抢到都会弹窗提示，日志里留着完整过程。"),
     )
 
-    def __init__(self, root: tk.Tk, on_close):
+    def __init__(self, root: tk.Tk, on_close, standalone: bool = False):
         super().__init__(root)
+        self.standalone = standalone
         self.withdraw()                      # 先摆好位置再显示，避免闪一下
         self.on_close = on_close
         self.title("使用说明")
@@ -376,7 +377,8 @@ class WelcomeDialog(tk.Toplevel):
 
         note = tk.Frame(body, bg=SIGNAL_SOFT)
         note.pack(fill="x", pady=(6, 14))
-        tk.Label(note, text="只给本人账号使用。不要借别人的账号，也不要同时开多个。",
+        tk.Label(note, text="只给本人账号使用，不要借别人的账号，也不要同时开多个。\n"
+                            "双击没反应、提示缺依赖等问题，看文件夹里的「启动不了点我.txt」。",
                  bg=SIGNAL_SOFT, fg=SIGNAL_DEEP, font=_font(9),
                  justify="left", anchor="w", wraplength=520,
                  padx=14, pady=10).pack(fill="x")
@@ -385,11 +387,14 @@ class WelcomeDialog(tk.Toplevel):
         foot.pack(fill="x", side="bottom")
         # 默认不勾：新用户第一次该看到说明，勾了才是"别再来烦我"
         self.no_more = tk.BooleanVar(value=False)
-        tk.Checkbutton(foot, text="下次启动不再显示", variable=self.no_more,
-                       bg=CARD, fg=TEXT, activebackground=CARD, selectcolor=CARD,
-                       bd=0, highlightthickness=0, font=_font(9)).pack(side="left")
-        RoundButton(foot, "知道了，开始用", self._done, kind="primary",
-                    width=132, height=38).pack(side="right")
+        if not standalone:
+            tk.Checkbutton(foot, text="下次启动不再显示", variable=self.no_more,
+                           bg=CARD, fg=TEXT, activebackground=CARD,
+                           selectcolor=CARD, bd=0, highlightthickness=0,
+                           font=_font(9)).pack(side="left")
+        RoundButton(foot, "知道了" if standalone else "知道了，开始用",
+                    self._done, kind="primary", width=132 if not standalone else 96,
+                    height=38).pack(side="right")
 
         self._center_on(root)
         self.deiconify()
@@ -426,6 +431,7 @@ class App:
         self._token_ok: bool | None = None
         self._busy: str = ""
         self._ui = _load_ui()
+        self._log_tail: list[str] = []
         self._base_h = 0
         self._log_expanded = bool(self._ui.get("log_expanded"))
         self._save_job = None
@@ -508,6 +514,9 @@ class App:
         self.pill = Pill(right, bg=CARD)
         self.pill.pack(side="left", padx=(0, 14))
         self._pill("未检查", GREY, "#EEF2F4")
+        self.btn_help = RoundButton(right, "使用说明", self.show_help,
+                                    bg=CARD, width=96, height=40)
+        self.btn_help.pack(side="left", padx=(0, 8))
         self.btn_refresh = RoundButton(right, "刷新活动  F5", self.refresh,
                                        bg=CARD, height=40)
         self.btn_refresh.pack(side="left", padx=(0, 8))
@@ -605,6 +614,13 @@ class App:
                                     bg=ACCENT_SOFT, width=132, height=42)
         self.btn_open.pack(side="right")
 
+        # 日志滚得快，抢没抢到不该让人去翻——单独留一行结论
+        self.result_var = tk.StringVar(value="")
+        self.result_label = tk.Label(act.body, textvariable=self.result_var,
+                                     bg=ACCENT_SOFT, fg=MUTED, font=_font(9),
+                                     anchor="w", justify="left")
+        self.result_label.pack(fill="x", pady=(9, 0))
+
         # ---- 日志卡：固定成窄条，保留事件流但不抢活动列表的注意力。
         log_height = LOG_EXPANDED if self._log_expanded else LOG_COLLAPSED
         logcard = Card(outer, radius=8, padding=(22, 14, 22, 14),
@@ -688,6 +704,28 @@ class App:
         self.logbox.insert("end", "%s  %s\n" % (stamp, text))
         self.logbox.see("end")
         self.logbox.configure(state="disabled")
+        # 只留最近几十行：结束时要用它说清"为什么没抢到"
+        self._log_tail.append(text)
+        del self._log_tail[:-40]
+
+    def show_help(self):
+        WelcomeDialog(self.root, lambda _never: self.root.focus_force(),
+                      standalone=True)
+
+    def _set_result(self, ok: bool, text: str):
+        self.result_var.set(("\u2713 " if ok else "\u2717 ") + text)
+        self.result_label.configure(fg=OK if ok else BAD)
+
+    def _last_failure_reason(self) -> str:
+        for line in reversed(self._log_tail):
+            m = (re.search(r"\[X\]\s*(.+)", line)
+                 or re.search(r"\u6ca1\u62a2\u5230[\uff1a:]\s*(.+)", line))
+            if m:
+                reason = m.group(1).strip()
+                # 日志里常写成「[X] 没抢到：原因」，外面还要再加一次前缀，先剥掉
+                reason = re.sub(r"^(没抢到|未抢到|报名失败)[：:]\s*", "", reason)
+                return reason[:160]
+        return ""
 
     def clear_log(self):
         self.logbox.configure(state="normal")
@@ -1013,13 +1051,26 @@ class App:
 
         self.target = row
         self.deadline = start_ts
+        self._log_tail.clear()
+        self.result_var.set("")
         self.log("目标已锁定：%s（按 id 定位，不依赖序号）" % row["name"])
 
         def done(rc):
             self.deadline = None
             self.countdown_var.set("")
-            if rc == 0:
-                messagebox.showinfo("抢到了", "「%s」报名成功，结果见日志。" % row["name"])
+            ok = rc == 0 and any("报名成功" in t for t in self._log_tail)
+            if ok:
+                self._set_result(True, "报名成功：" + row["name"])
+                messagebox.showinfo(
+                    "抢到了", "「%s」报名成功。\n\n建议现在去活动页确认一眼。" % row["name"])
+            else:
+                reason = self._last_failure_reason() or ("程序退出码 %s" % rc)
+                self._set_result(False, "没抢到：" + reason)
+                messagebox.showwarning(
+                    "没抢到",
+                    "「%s」没有报上。\n\n原因：%s\n\n"
+                    "可以重试一次，或手动打开活动页报名（下方日志有完整过程）。"
+                    % (row["name"], reason))
             self.refresh()
         self._run(args, "等待并抢报名：" + row["name"], done)
 
