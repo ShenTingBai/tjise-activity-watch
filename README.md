@@ -1,173 +1,197 @@
 # 智慧元小元 · 校园活动推送机器人
 
-定时抓取 `xg.tjise.edu.cn`（智慧元小元学生端）的校园活动，把「今天要参加的」「即将开放报名的」推到飞书群和私聊；
-群里 @ 机器人可查询，私聊点「预报名」按钮可挂号，到点自动报名；登录态由服务器守护进程自动续期，失效时用验证码 OCR 无人值守重登。
+> 天津软件学院（专升本）学生端 `xg.tjise.edu.cn` 的活动，自动整理后推送到飞书；可以 @ 机器人查询，可以在私聊点「预报名」到点自动报名。
 
-当前线上部署：**<你的服务器IP>**（Ubuntu 22.04，systemd + cron 常驻）。
+[![Release](https://img.shields.io/github/v/release/ShenTingBai/tjise-activity-watch)](https://github.com/ShenTingBai/tjise-activity-watch/releases)
+[![License](https://img.shields.io/github/license/ShenTingBai/tjise-activity-watch)](LICENSE)
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![Node](https://img.shields.io/badge/Node-20-339933?logo=nodedotjs&logoColor=white)
 
-## 功能一览
+![本机版界面](local/gui-preview.png)
 
-| 能力 | 从哪里触发 | 说明 |
-|------|-----------|------|
-| 定时日报 | cron 07:00 / 10:30 / 16:30 / 21:30 | 先推群卡片，再给 owner 私发一张带「预报名」按钮的卡片 |
-| 群里 @ 查询 | 飞书群 @机器人 | 待开放 / 已开放 / 全部活动，卡片回复 |
-| 私人提醒 | cron 07:05 | 只发 owner 私聊：今天要参加的活动 |
-| 预报名 | 私聊卡片按钮 | 点一下排队，可再点「取消预报名」 |
-| 到点抢报名 | watchlist_runner（每分钟） | 到开放时刻自动点「立即报名」并私聊回报结果 |
-| 登录态续期 | tjise-login 守护进程 | 每 2 小时校验一次，成功即刷新会话文件 |
-| 失效重登 | tjise-autologin.timer（每 5 分钟） | 探针判失效才动作；16h 主动换新；验证码 OCR + 最多 3 次 |
-| 监控告警 | token 探针 / 出网自检 | 连续 2 次失败才私聊告警，同一失效周期只提醒一次 |
+> **适用对象**：天津市大学软件学院（天软）**专升本**学生。项目按该校学生端的接口与页面写死；换学校要改 `SCHOOL_ORIGIN` 与接口适配，不在支持范围内。
+> **不适用范围**：不代他人报名、不多账号批量占位、不抢别人的名额。
 
-## 快速开始
+## 目录
 
-### A. 部署到服务器（7×24，推荐）
+- [这是什么](#这是什么)
+- [我该用哪个](#我该用哪个)
+- [快速开始 · 本机版](#快速开始--本机版5-分钟)
+- [快速开始 · 服务器版](#快速开始--服务器版15-分钟)
+- [功能](#功能)
+- [两版对照](#两版对照)
+- [飞书机器人怎么建](#飞书机器人怎么建)
+- [配置](#配置)
+- [常见问题](#常见问题)
+- [目录结构](#目录结构)
+- [文档](#文档)
+- [边界与安全](#边界与安全)
+- [License](#license)
 
-前置：Ubuntu 22.04 / root / 能出网（需访问学校站点与 `open.feishu.cn`）。
+## 这是什么
+
+学校学生端每天挂着各种「校园活动」：有的要卡点抢报名，有的报名了但时间在几天后容易忘。这个项目做两件事：
+
+1. **盯**：定时把「今天要参加的」「即将开放报名的」整理成卡片，推到飞书群，人手一份。
+2. **抢**：开放报名的那一刻自动点「立即报名」，结果回执发到私聊。
+
+登录态会 17 小时左右过期。服务器版用守护进程每 2 小时续一次；真失效了用验证码 OCR 无人值守重登，连续失败再私聊告警。
+
+## 我该用哪个
+
+| 你的情况 | 用这个 | 需要什么 |
+|---|---|---|
+| 只想抢某一两场，不想维护服务器 | [本机版](#快速开始--本机版5-分钟)（`local/` / Release 绿色版） | 一台 Windows，双击就能跑 |
+| 想让群里同学都能看推送，还想 @ 查询 | [服务器版](#快速开始--服务器版15-分钟)（`server/`） | 一台 7×24 Linux + 飞书自建应用 |
+
+两版共用同一套接口知识，抢报名时序完全一致（提前开详情页 → 开放前 reload → 点按钮 → 读返回码 → 复核结果）。
+
+## 快速开始 · 本机版（5 分钟）
+
+**不想装 Python**：下 [绿色版](https://github.com/ShenTingBai/tjise-activity-watch/releases)，解压双击 `启动.bat`。
+
+**装了 Python**：
 
 ```bash
-# 1) 运行时
-apt install -y python3 cron
-# Node 20（playwright 驱动需要 >=18）
+git clone -b local https://github.com/ShenTingBai/tjise-activity-watch.git
+cd tjise-activity-watch
+```
+
+1. 双击 `install.bat`：装 Playwright 与 Chromium（只第一次，约 3 分钟）
+2. 双击 `1-登录.bat`：弹出真实 Chrome，手动登录一次，token 存本地
+3. 双击 `4-图形界面.bat`：选中要抢的活动 → 点「到点抢选中的活动」
+4. 等结果，控制台/飞书卡片会告诉你抢到没抢到
+
+> 登录只做一次，token 大约能撑 17 小时；失效了再点一次「登录 · 重新登录」。
+> 工具只有命令行和 GUI，没有密码落盘，也不会动你浏览器里的账号。
+
+## 快速开始 · 服务器版（15 分钟）
+
+前置：Ubuntu 22.04 / root / 能访问学校站点与 `open.feishu.cn`。
+
+```bash
+# 1) 依赖
+apt install -y python3 cron tesseract-ocr
 cd /tmp && curl -fsSLO https://npmmirror.com/mirrors/node/v20.20.2/node-v20.20.2-linux-x64.tar.xz \
   && tar -xJf node-v20.20.2-linux-x64.tar.xz -C /usr/local --strip-components=1
 
 # 2) 目录
 mkdir -p /root/tjise-activity-watch /root/tjise-bot /root/tjise-login
 
-# 3) 依赖与文件见 docs/OPERATIONS.md「部署」
+# 3) 代码
+git clone -b server https://github.com/ShenTingBai/tjise-activity-watch.git /root/tjise-activity-watch
 ```
 
-完整步骤、systemd 单元、crontab、日志位置见 [docs/OPERATIONS.md](docs/OPERATIONS.md)。
-
-### B. 只在本机跑（不留服务器）
+4. **建飞书机器人** → 跟着 [docs/FEISHU_BOT.md](docs/FEISHU_BOT.md) 走（两条路线：只推送 / 全功能）
+5. **填配置** → [docs/CONFIG.md](docs/CONFIG.md)：`server/config.json` + systemd 环境变量
+6. **装服务与定时任务** → [docs/OPERATIONS.md](docs/OPERATIONS.md)：3 个 systemd 单元 + 9 条 cron
+7. **验证**：
 
 ```bash
-python -m pip install -r server/requirements.txt
-python server/scripts/login.py      # 弹真实 Chrome 登录一次，token 存 server/data/session.json
-python server/scripts/run.py --dry  # 只看不推
-python server/scripts/run.py        # 正常跑一轮
+cd /root/tjise-activity-watch
+python3 scripts/selfcheck.py          # 凭据/锁/卡片自检
+python3 scripts/run.py --dry          # 看这一轮会推什么（不发）
+python3 scripts/run.py --force        # 真推一次
 ```
 
-本机不想装环境也行：直接用 [local/](local/) 里的工具（双击 `install.bat` 装一次环境，之后双击 bat 手动登录、按序号抢单个活动），见 [local/README.md](local/README.md)。
+群里收到卡片就说明通了。之后每天四个时点自动推送，登录态自己续。
 
-## 两个版本
+## 功能
 
-仓库里放了两套东西，共用同一套接口知识，但跑法完全不同：
+| 能力 | 从哪触发 | 说明 |
+|---|---|---|
+| 定时日报 | cron 07:00 / 10:30 / 16:30 / 21:30 | 先推群卡片，再给 owner 私发带「预报名」按钮的卡片 |
+| 群里 @ 查询 | 飞书群 @机器人 | 待开放 / 已开放 / 全部活动，卡片回复 |
+| 私人提醒 | cron 07:05 | 只发 owner 私聊：今天要参加的活动 |
+| 预报名 | 私聊卡片按钮 | 点一下排队，可再点「取消预报名」 |
+| 到点抢报名 | watchlist_runner（每分钟） | 到开放时刻自动点「立即报名」并私聊回报 |
+| 登录态续期 | tjise-login 守护进程 | 每 2 小时校验一次，成功即刷新会话文件 |
+| 失效重登 | tjise-autologin.timer（每 5 分钟） | 探针判失效才动作；16h 主动换新；验证码 OCR + 最多 3 次 |
+| 监控告警 | token 探针 / 出网自检 | 连续 2 次失败才私聊告警，同一失效周期只提醒一次 |
+
+## 两版对照
 
 | | 服务器版 `server/` | 本机版 `local/` |
 |---|---|---|
 | 跑在哪 | 一台常驻 Linux（systemd + cron） | 自己电脑，用的时候才开 |
-| 登录 | 无人值守：token 探针判失效 → 验证码 OCR 重登，3 次失败私聊告警 | 手动弹真实 Chrome 登录一次，token 存本地 |
-| 能力 | 定时日报推送、群 @ 查询、私聊预报名按钮、到点自动报名、失效重登、断网自检 | 查活动列表、指定单个活动到点抓报名 |
+| 登录 | 无人值守：探针判失效 → 验证码 OCR 重登，3 次失败私聊告警 | 手动弹真实 Chrome 登录一次，token 存本地 |
+| 能力 | 定时日报、群 @ 查询、私聊预报名、到点自动报名、失效重登、断网自检 | 查活动列表、指定单个活动到点抓报名、图形界面 |
 | 依赖 | Python + Node 20 + Chromium + Tesseract + cron | Python + Playwright（或本机 Chrome） |
 | 适合 | 7×24 盯着，群里同学都能看 | 只想抢某一两场，不想维护服务器 |
 
-两边的抢报名时序是同一套（提前开详情页 → 开放前 reload → 点「立即报名」→ 读 `signUp` 返回码 → `getJoinInfo` 复核），改一边时要同步另一边。
+## 飞书机器人怎么建
 
-## 怎么拿
+一句话：**只想推送**用群自定义机器人（webhook，2 分钟）；**要 @ 查询和私聊预报名**必须建企业自建应用（长连接，约 30 分钟）。完整步骤、权限清单、事件订阅、`chat_id`/`open_id` 怎么拿、错误码对照，全在 [docs/FEISHU_BOT.md](docs/FEISHU_BOT.md)。
 
-| 想要什么 | 去哪 |
-|---|---|
-| 本机版绿色版（不用装 Python，解压双击 `启动.bat`） | [Releases](https://github.com/ShenTingBai/tjise-activity-watch/releases) 里下 `tjise-grab-portable-*.zip` |
-| 本机版源码（自己装 Python） | 分支 [`local`](https://github.com/ShenTingBai/tjise-activity-watch/tree/local)，或仓库里 `local/` 目录 |
-| 服务器版源码（含 `docs/` 运维文档） | 分支 [`server`](https://github.com/ShenTingBai/tjise-activity-watch/tree/server)，或 Releases 里的 `tjise-server-*.zip` |
-| 两版一起看 / 提改动 | `main`（开发主线，两版都在这） |
+最容易踩的三个坑：
 
-## 三条分支各自是什么
+1. 事件订阅选成「发送到开发者服务器」而不是「长连接」→ 永远收不到消息
+2. 权限开了但没「发布版本」并过审 → 一条消息都发不出去
+3. `PRIVATE_OWNER_OPEN_ID` 与 `bot/data/users.json` 里的记录对不上 → 私聊静默关闭
 
-三条分支各有一份自己的 `README.md`，打开就写清楚「这份代码跑在哪、怎么用」：
+## 配置
 
-| 分支 | 根目录是什么 | 首页 README 讲什么 |
-|---|---|---|
-| `main` | 两版源码并存（`server/` + `local/` + `docs/` + `tools/`） | 本文件：总览、两版对照、目录结构、发版流程 |
-| [`local`](https://github.com/ShenTingBai/tjise-activity-watch/tree/local) | 本机版成品：`grab.py`、`gui.py`、几个 `.bat`、`config.example.json` 全在根目录 | [local/README.md](local/README.md)：双击装环境、登录、按序号抢活动、图形界面、常见问题 |
-| [`server`](https://github.com/ShenTingBai/tjise-activity-watch/tree/server) | 服务器版成品：`scripts/`、`bot/`、`deploy/`、`tests/`、`docs/` | [server/README.md](server/README.md)：能力清单、部署前置、常用命令、配置、文档索引 |
+所有可调项（10 个 config 键 + 13 个环境变量 + 三套可抄示例）见 [docs/CONFIG.md](docs/CONFIG.md)。
 
-`local` 与 `server` 是**自动生成的分发快照**：根目录直接就是成品，由 `python tools/split_branches.py` 从 `main` 拆出来强推，所以只读——改代码一律在 `main`，再跑脚本重建。
+```bash
+cp server/config.example.json server/config.json   # 再填 webhook / 应用凭据
+```
 
-发版一条命令：`python tools/release.py v1.1.0`（构建绿色版 → 打两个 zip → 打 tag → 传 Release → 重建分支）。
+`config.json` 含密钥，已在 `.gitignore` 中，**不要提交**。
 
-`.claude/`、`.Codex/` 这类本机工具配置不入库（见 `.gitignore`），只提交代码与文档。
+## 常见问题
+
+**Q：抢报名会不会被学校查到/封号？**
+只操作你自己的账号、只在开放时刻点一次、不批量。请求量和人工点几下差不多（每天约 400 次业务接口，含 288 次带 token 的探针）。
+
+**Q：推送没样式，是一段纯文本？**
+飞书整点会限流（`11232`），代码已重试 1.5/3/6 秒；仍失败会退回纯文本。错峰或等下一轮即可。
+
+**Q：登录态多久过期？**
+实测约 17.5 小时（单次样本）。服务器版 16 小时主动换新，避免失效后 15-20 分钟的盲窗。
+
+**Q：验证码识别率多少？**
+单次约 60%（7 变体投票），3 次重试成功率约 93.6%；仍失败会私聊喊你人工登一次。
+
+**Q：私聊一条都收不到？**
+先查 `data/remind.log` 有没有 `[i] 未配置 PRIVATE_OWNER_OPEN_ID`；再对照 [docs/CONFIG.md](docs/CONFIG.md) 的四条判据。
+
+**Q：能给我舍友的账号也抢吗？**
+不能。多账号批量报名属于占位，会损害其他同学，也容易触发平台风控。本机版给舍友自己跑，各自抢各自的。
 
 ## 目录结构
 
 ```
 tjise-activity-watch/
-├── server/                    # 服务器版：部署到 Linux 的那一套
-│   ├── scripts/               # 生产脚本（cron/systemd 直接调，目录名是相对的，别随意改）
-│   │   ├── run.py             # 定时推送入口（--with-grab 时附带私聊预报名卡）
-│   │   ├── fetch.py           # 抓取 + 解析 + 去重标记
-│   │   ├── scan.py            # 每 5 分钟：报名冲刺 / 晚归签到提醒
-│   │   ├── remind.py          # 每天 07:05 私聊「今天要参加的活动」
-│   │   ├── token_probe.py     # 每 15 分钟探一次 token，连续失败告警
-│   │   ├── token_report.py    # 每 30 分钟汇总 token 寿命
-│   │   ├── net_probe.py       # 每 5 分钟出网自检（区分断网 / 学校站点不通）
-│   │   ├── watchlist.py       # 预报名清单（CLI + JSON）
-│   │   ├── watchlist_runner.py# 每分钟对齐清单，到点拉起 grab_signup
-│   │   ├── grab_card.py       # 私聊预报名卡片的快照与整卡刷新
-│   │   ├── card.py / render.py / notify.py   # 卡片结构 / 文案 / 发送
-│   │   ├── common.py          # 学校地址、会话读写（唯一域名来源）
-│   │   └── dev/               # 一次性排查脚本，不参与线上链路
-│   ├── bot/                   # 飞书机器人（长连接，@ 查询 + 私聊按钮回调）
-│   ├── deploy/                # 部署脚本、systemd 单元、server_refresh.js / auto_login.py
-│   ├── tests/                 # 离线测试（不碰真实数据）
-│   ├── README.md              # 服务器版首页（同时是 server 分支的根 README）
-│   ├── config.example.json
-│   └── requirements.txt
-├── local/                     # 本机版：给同学的单文件工具，不需要服务器
-│   ├── grab.py                # login / check / list / grab / selftest 五个子命令
-│   ├── README.md
-│   ├── 1-登录.bat / 2-抢活动.bat / 3-检查登录和活动.bat
-│   └── config.example.json
-├── docs/                      # 文档（见下方索引）
-└── README.md / CHANGELOG.md
+├── server/        # 服务器版：scripts/（生产脚本）bot/（飞书机器人）deploy/（systemd、登录）tests/
+├── local/         # 本机版：grab.py + gui.py + 几个 .bat（双击即用）
+├── docs/          # 架构、运维、登录、抢报名、时点推导、飞书机器人、配置
+├── tools/         # 发版工具（拆分支、打 zip、发 Release）
+└── README.md / CHANGELOG.md / LICENSE
 ```
 
-服务器版运行时会在 `server/` 下生成 `data/`（会话、状态、日志）和 `reports/`，两者都不入库；本机版在 `local/data/` 下存自己的登录态。
+运行时生成 `server/data/`（会话、状态、日志）与 `reports/`，不入库；本机版在 `local/data/`。
 
-## 常用命令
-
-```bash
-python server/scripts/run.py --dry                 # 看这一轮会推什么，不发
-python server/scripts/run.py --force               # 忽略「今天已推过」的限制，真推一次
-python server/scripts/query.py [pending|open|all]  # 命令行查活动
-python server/scripts/watchlist.py list            # 看预报名清单
-python server/tests/test_endpoints.py              # 站点地址测试（离线）
-python server/tests/test_notify.py                 # 推送成败判定（离线）
-python server/scripts/selfcheck.py                 # 运行时自检
-python server/scripts/regress.py                   # 回归（会联网）
-```
-
-服务器上的运维命令（重启服务、看日志、补发提醒）见 [docs/OPERATIONS.md](docs/OPERATIONS.md)。
-
-## 配置
-
-复制 `server/config.example.json` 为 `server/config.json` 再填；`config.json` 含 webhook / 密钥，**不入库**。本机版另有自己的 `local/config.json`（只有可选的 webhook，可留空）。
-
-| 键 | 说明 |
-|----|------|
-| `notify.channel` / `notify.platform` | 推送通道：`webhook` / `feishu` |
-| `notify.feishu_app.app_id` / `app_secret` | 飞书自建应用凭据（私聊、卡片用） |
-| `notify.private_chat_id` | owner 私聊会话 ID（与 `users.json` 里那条 p2p 记录一致） |
-| `filter.keyword_blocklist` | 标题关键词黑名单 |
-
-环境变量 `PRIVATE_OWNER_OPEN_ID` 决定「私聊只发给谁」，必须与 `server/bot/data/users.json` 里的 p2p 记录对得上，
-否则私聊通道静默关闭（`remind.log` 里会写 `[i] 未配置 PRIVATE_OWNER_OPEN_ID`）。
-
-## 文档索引
+## 文档
 
 | 文档 | 内容 |
-|------|------|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 数据流、模块职责、接口清单、去重机制、推送节奏 |
+|---|---|
+| [docs/FEISHU_BOT.md](docs/FEISHU_BOT.md) | 机器人创建、权限、事件订阅、拿 chat_id/open_id、排错码 |
+| [docs/CONFIG.md](docs/CONFIG.md) | 配置项与环境变量全表、三套示例 |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | 服务器布局、systemd、crontab、日志、部署更新、回滚、故障处理 |
-| [docs/LOGIN.md](docs/LOGIN.md) | token 寿命实测、守护进程续期、验证码 OCR 无人值守登录、凭据管理 |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 数据流、模块职责、接口清单、去重机制 |
+| [docs/LOGIN.md](docs/LOGIN.md) | token 寿命实测、守护续期、验证码 OCR 无人值守登录 |
 | [docs/GRAB.md](docs/GRAB.md) | 预报名状态机、到点抢报名时间线、结果回执 |
 | [docs/TIMING_AND_DEDUP_ANALYSIS.md](docs/TIMING_AND_DEDUP_ANALYSIS.md) | 推送时点与去重的设计推导、请求量账本 |
 | [CHANGELOG.md](CHANGELOG.md) | 变更记录 |
-| [docs/archive/](docs/archive/) | 历史文档：搭建指南、旧版 README、评审提示词 |
 
 ## 边界与安全
 
 - 只服务**本人账号**：不代他人报名、不做多账号批量报名、不占位。
 - 日志不写账号、密码、验证码、token、姓名；`credentials.json` 与 `storage_state.json` 权限 600。
 - 抢报名只在用户明确点了「预报名」的清单内动作，不会无差别抢。
+- 本项目与学校无关，接口若有调整，随时可能失效。
+
+## License
+
+[MIT](LICENSE)

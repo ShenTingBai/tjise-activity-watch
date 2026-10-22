@@ -67,6 +67,22 @@ def copy_tree(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst / src.name)
 
 
+def flatten_doc_links(dst: Path) -> None:
+    """把分支首页里的 `../docs/` 改成 `docs/`。
+
+    main 上 docs/ 在仓库根，server/README.md 想链到它只能写 `../docs/x.md`；
+    但 server 分支是「server/ 的内容铺到根 + docs/ 铺到根」，同一个链接会多跳一级变成死链。
+    这条分支是自动生成的，所以在生成时改一次，main 上保持正确路径。
+    """
+    readme = dst / "README.md"
+    if not readme.exists():
+        return
+    text = readme.read_text(encoding="utf-8")
+    fixed = text.replace("](../docs/", "](docs/")
+    if fixed != text:
+        readme.write_text(fixed, encoding="utf-8", newline="")
+
+
 def build_branch(name: str, subdir: str, extras: list[str], dry: bool) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp) / "repo"
@@ -82,6 +98,7 @@ def build_branch(name: str, subdir: str, extras: list[str], dry: bool) -> None:
         copy_contents(ROOT / subdir, tmp)
         for extra in extras:
             copy_tree(ROOT / extra, tmp)
+        flatten_doc_links(tmp)
 
         # 本机版分支补一句「这是分发快照」的说明，避免有人直接在分支上提 PR
         note = tmp / "SNAPSHOT.md"

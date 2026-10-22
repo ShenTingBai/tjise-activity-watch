@@ -2,7 +2,9 @@
 
 | 文档 | 适合谁看 | 内容 |
 |------|----------|------|
-| [../README.md](../README.md) | 第一次接触项目 | 功能、快速开始、目录、常用命令 |
+| [../README.md](../README.md) | 第一次接触项目 | 功能、快速开始、两版怎么选、常见问题 |
+| [FEISHU_BOT.md](FEISHU_BOT.md) | 第一次配飞书 | 群机器人 vs 自建应用、权限、事件订阅、拿 chat_id/open_id、错误码对照 |
+| [CONFIG.md](CONFIG.md) | 要填配置的人 | config.json 全字段、13 个环境变量、三套可抄示例、配置类故障 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 要改代码的人 | 数据流、模块职责、接口清单、去重与推送节奏、告警链路 |
 | [OPERATIONS.md](OPERATIONS.md) | 日常运维 | 服务器布局、systemd、crontab、日志、部署更新、回滚、故障处理、迁移记录 |
 | [LOGIN.md](LOGIN.md) | 处理登录态问题 | token 寿命实测、守护进程续期、验证码 OCR 无人值守登录、凭据管理、人工兜底 |

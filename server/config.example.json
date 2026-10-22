@@ -4,11 +4,6 @@
     "platform": "feishu",
     "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
     "secret": "",
-    "qq": {
-      "api": "http://127.0.0.1:3000",
-      "token": "",
-      "group_id": ""
-    },
     "feishu_app": {
       "app_id": "cli_xxxxxxxxxxxxxxxx",
       "app_secret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",

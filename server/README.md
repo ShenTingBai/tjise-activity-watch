@@ -2,6 +2,8 @@
 
 常驻 Linux 的那一套：定时抓 `xg.tjise.edu.cn` 的活动，推到飞书群和私聊，@ 机器人可查询，私聊点「预报名」到点自动报名，登录态失效时用验证码 OCR 无人值守重登。
 
+> **适用对象**：天津市大学软件学院（天软）**专升本**学生。接口与页面按该校学生端写死，换学校需自行适配。
+
 > 这个目录同时是 GitHub **`server` 分支**的根目录（分发快照）。只想下载部署的话，直接下
 > [Releases](https://github.com/ShenTingBai/tjise-activity-watch/releases) 里的 `tjise-server-*.zip`，
 > 或 `git clone -b server`。改代码请回 `main` 分支。
@@ -27,7 +29,7 @@ server/
 ├── bot/            # 飞书机器人（长连接 + 卡片回调）
 ├── deploy/         # systemd 单元、server_refresh.js、auto_login.py、部署脚本
 ├── tests/          # 离线测试，不碰真实数据
-├── docs/           # 运维文档（服务器版专属，随分支一起发）
+├── docs/           # 运维文档（main 里在仓库根 docs/，分发到 server 分支时铺到根）
 ├── config.example.json
 └── requirements.txt
 ```
@@ -48,7 +50,7 @@ mkdir -p /root/tjise-activity-watch /root/tjise-bot /root/tjise-login
 # 把本分支内容放进去，再按 docs/OPERATIONS.md 装 systemd 单元和 crontab
 ```
 
-完整步骤（三个 systemd 单元、crontab 九条、日志位置、更新与回滚）见 [docs/OPERATIONS.md](docs/OPERATIONS.md)。
+完整步骤（三个 systemd 单元、crontab 九条、日志位置、更新与回滚）见 [docs/OPERATIONS.md](../docs/OPERATIONS.md)。
 
 ## 常用命令
 
@@ -64,17 +66,22 @@ python3 tests/test_endpoints.py              # 站点地址测试（离线）
 ## 配置
 
 复制 `config.example.json` 为 `config.json` 再填，含 webhook / 应用密钥，**不要入库**。
+字段含义、默认值、环境变量与三套可抄示例见 [docs/CONFIG.md](../docs/CONFIG.md)；
+飞书应用怎么建、开哪些权限、订阅什么事件见 [docs/FEISHU_BOT.md](../docs/FEISHU_BOT.md)。
+
 `PRIVATE_OWNER_OPEN_ID` 决定私聊只发给谁，必须与 `bot/data/users.json` 里那条 p2p 记录对得上，否则私聊通道静默关闭。
 
 ## 文档
 
 | 文档 | 内容 |
 |------|------|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 数据流、模块职责、接口清单、去重机制 |
-| [docs/OPERATIONS.md](docs/OPERATIONS.md) | 服务器布局、systemd、crontab、日志、部署更新、回滚 |
-| [docs/LOGIN.md](docs/LOGIN.md) | token 寿命实测、守护续期、验证码 OCR 无人值守登录 |
-| [docs/GRAB.md](docs/GRAB.md) | 预报名状态机、到点抢报名时间线 |
-| [docs/TIMING_AND_DEDUP_ANALYSIS.md](docs/TIMING_AND_DEDUP_ANALYSIS.md) | 推送时点与去重推导、请求量账本 |
+| [docs/FEISHU_BOT.md](../docs/FEISHU_BOT.md) | 机器人创建、权限、事件订阅、拿 chat_id/open_id、错误码排错 |
+| [docs/CONFIG.md](../docs/CONFIG.md) | 配置项与环境变量全表、三套示例 |
+| [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md) | 数据流、模块职责、接口清单、去重机制 |
+| [docs/OPERATIONS.md](../docs/OPERATIONS.md) | 服务器布局、systemd、crontab、日志、部署更新、回滚 |
+| [docs/LOGIN.md](../docs/LOGIN.md) | token 寿命实测、守护续期、验证码 OCR 无人值守登录 |
+| [docs/GRAB.md](../docs/GRAB.md) | 预报名状态机、到点抢报名时间线 |
+| [docs/TIMING_AND_DEDUP_ANALYSIS.md](../docs/TIMING_AND_DEDUP_ANALYSIS.md) | 推送时点与去重推导、请求量账本 |
 
 ## 边界
 
