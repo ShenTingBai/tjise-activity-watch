@@ -28,7 +28,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-SHARED = ["README.md", "CHANGELOG.md", ".gitattributes"]
+# 根 README.md 特意不放进来：两条分支各有自己的首页（local/README.md、server/README.md），
+# 拷根 README 会把它们覆盖成同一份总览。
+SHARED = ["CHANGELOG.md", ".gitattributes"]
 SNAPSHOTS = {
     # 分支名: (要铺到根目录的源目录, 额外单文件)
     "local": ("local", SHARED),

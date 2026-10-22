@@ -1,6 +1,12 @@
 # 校园活动「到点自动报名」—— 本机版
 
-> 只用自己电脑，不需要服务器。服务器版（定时推送、飞书机器人、无人值守重登）在仓库的 `server/` 目录，也可以直接看分支 [`server`](https://github.com/ShenTingBai/tjise-activity-watch/tree/server)。
+> 这个文件同时是 GitHub **`local` 分支**的首页。三条分支的分工：
+> `main` 源码总仓（两版并存）、`local` 本机版快照（就这一份，根目录双击即用）、`server` 服务器版快照。
+>
+> 不想装 Python：下 [Releases](https://github.com/ShenTingBai/tjise-activity-watch/releases) 里的
+> `tjise-grab-portable-*.zip`，解压双击 `启动.bat` 就能用（内置 Python 与浏览器内核）。
+
+只用自己电脑，不需要服务器。服务器版（定时推送、飞书机器人、无人值守重登）在仓库的 `server/` 目录，也可以直接看分支 [`server`](https://github.com/ShenTingBai/tjise-activity-watch/tree/server)。
 
 一个**不需要服务器**的小工具：在你自己的 Windows 电脑上登录一次，之后指定活动的报名开始时间，脚本会在开放瞬间自动点「立即报名 → 确定」。
 

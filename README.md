@@ -69,9 +69,19 @@ python server/scripts/run.py        # 正常跑一轮
 | 想要什么 | 去哪 |
 |---|---|
 | 本机版绿色版（不用装 Python，解压双击 `启动.bat`） | [Releases](https://github.com/ShenTingBai/tjise-activity-watch/releases) 里下 `tjise-grab-portable-*.zip` |
-| 本机版源码（自己装 Python） | 分支 `local`，或仓库里 `local/` 目录 |
-| 服务器版源码（含 `docs/` 运维文档） | 分支 `server`，或 Releases 里的 `tjise-server-*.zip` |
+| 本机版源码（自己装 Python） | 分支 [`local`](https://github.com/ShenTingBai/tjise-activity-watch/tree/local)，或仓库里 `local/` 目录 |
+| 服务器版源码（含 `docs/` 运维文档） | 分支 [`server`](https://github.com/ShenTingBai/tjise-activity-watch/tree/server)，或 Releases 里的 `tjise-server-*.zip` |
 | 两版一起看 / 提改动 | `main`（开发主线，两版都在这） |
+
+## 三条分支各自是什么
+
+三条分支各有一份自己的 `README.md`，打开就写清楚「这份代码跑在哪、怎么用」：
+
+| 分支 | 根目录是什么 | 首页 README 讲什么 |
+|---|---|---|
+| `main` | 两版源码并存（`server/` + `local/` + `docs/` + `tools/`） | 本文件：总览、两版对照、目录结构、发版流程 |
+| [`local`](https://github.com/ShenTingBai/tjise-activity-watch/tree/local) | 本机版成品：`grab.py`、`gui.py`、几个 `.bat`、`config.example.json` 全在根目录 | [local/README.md](local/README.md)：双击装环境、登录、按序号抢活动、图形界面、常见问题 |
+| [`server`](https://github.com/ShenTingBai/tjise-activity-watch/tree/server) | 服务器版成品：`scripts/`、`bot/`、`deploy/`、`tests/`、`docs/` | [server/README.md](server/README.md)：能力清单、部署前置、常用命令、配置、文档索引 |
 
 `local` 与 `server` 是**自动生成的分发快照**：根目录直接就是成品，由 `python tools/split_branches.py` 从 `main` 拆出来强推，所以只读——改代码一律在 `main`，再跑脚本重建。
 
@@ -101,6 +111,7 @@ tjise-activity-watch/
 │   ├── bot/                   # 飞书机器人（长连接，@ 查询 + 私聊按钮回调）
 │   ├── deploy/                # 部署脚本、systemd 单元、server_refresh.js / auto_login.py
 │   ├── tests/                 # 离线测试（不碰真实数据）
+│   ├── README.md              # 服务器版首页（同时是 server 分支的根 README）
 │   ├── config.example.json
 │   └── requirements.txt
 ├── local/                     # 本机版：给同学的单文件工具，不需要服务器
