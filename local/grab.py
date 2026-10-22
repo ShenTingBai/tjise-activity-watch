@@ -236,11 +236,22 @@ def sign_state(act, now=None):
 
 # ---------------------------------------------------------------- 浏览器
 def launch_browser(pw, headless):
-    """优先用本机已装 Chrome（免下载几百 MB），没有就退回 playwright 自带 chromium。"""
+    """按「Chrome → Edge → 自带内核」的顺序找浏览器。
+
+    前两个用本机已装的，免下载几百 MB；Windows 10/11 一定带 Edge，
+    所以绿色版（不打包 chromium）在没装 Chrome 的机器上也能跑。
+    """
+    for channel in ("chrome", "msedge"):
+        try:
+            return pw.chromium.launch(channel=channel, headless=headless)
+        except Exception:
+            continue
     try:
-        return pw.chromium.launch(channel="chrome", headless=headless)
-    except Exception:
         return pw.chromium.launch(headless=headless)
+    except Exception as exc:
+        raise RuntimeError(
+            "没找到可用的浏览器：请先装 Chrome 或 Edge，"
+            "或执行 python -m playwright install chromium 下载自带内核。") from exc
 
 
 def new_context(browser, with_state=True):

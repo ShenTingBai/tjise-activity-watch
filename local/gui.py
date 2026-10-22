@@ -38,6 +38,9 @@ PY = sys.executable or "python"
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 TOKEN_LIFETIME_H = 17.5     # 实测寿命，仅用于显示「约剩几小时」
+LOG_COLLAPSED = 200         # 日志卡常态高度：够看 6 行、不抢活动表
+LOG_EXPANDED = 380          # 展开态：排障时一次看到十几行
+UI_STATE = DATA / "ui.json"  # 记住筛选词 / 只看还能报的 / 日志展开态
 PAREN = re.compile(r"（[^（）]*）$")
 
 # ---- 配色：校园登记簿的冷灰绿纸面 + 校园绿 + 琥珀提醒色 ----
@@ -73,6 +76,27 @@ def run_grab(args: list[str], timeout: int = 90) -> subprocess.CompletedProcess:
         [PY, str(GRAB)] + args, cwd=str(HERE), capture_output=True, text=True,
         encoding="utf-8", errors="replace", env=child_env(),
         creationflags=CREATE_NO_WINDOW, timeout=timeout)
+
+
+def _load_ui() -> dict:
+    """读界面偏好；文件坏了就当没有，绝不因为一个偏好文件打不开界面。"""
+    try:
+        raw = json.loads(UI_STATE.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_ui(data: dict) -> None:
+    """原子写：先写临时文件再替换，避免关机/崩溃留下半截 JSON。"""
+    try:
+        UI_STATE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = UI_STATE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, UI_STATE)
+    except Exception:
+        pass   # 偏好存不下不影响使用
 
 
 def _font(size: int, bold: bool = False) -> tuple:
@@ -304,12 +328,17 @@ class App:
         self._left_cache: dict[str, str] = {}
         self._token_ok: bool | None = None
         self._busy: str = ""
+        self._ui = _load_ui()
+        self._base_h = 0
+        self._log_expanded = bool(self._ui.get("log_expanded"))
+        self._save_job = None
 
         root.title("天软校园活动 · 报名值守台")
         root.configure(bg=BG)
         root.geometry("1120x820")
         root.minsize(960, 720)
         self._center()
+        self._base_h = self.root.winfo_height()
         self._build_style()
         self._build_ui()
         self.root.after(100, self._pump)
@@ -381,13 +410,14 @@ class App:
         bar.pack(fill="x", pady=(18, 12))
         tk.Label(bar, text="活动清单", bg=BG, fg=TEXT,
                  font=_font(10, True)).pack(side="left", padx=(3, 12))
-        self.filter_var = tk.StringVar()
+        self.filter_var = tk.StringVar(value=str(self._ui.get("filter") or ""))
         self.filter_var.trace_add("write", lambda *_a: self._apply_filter())
         self.entry_wrap = RoundEntry(bar, self.filter_var, width=280,
                                      placeholder="活动名关键词")
         self.entry_wrap.pack(side="left")
         self.entry_wrap.entry.bind("<Return>", lambda _e: self._apply_filter())
-        self.only_free = tk.BooleanVar(value=True)
+        self.only_free = tk.BooleanVar(
+            value=bool(self._ui.get("only_free", True)))
         tk.Checkbutton(bar, text="只看还能报的", variable=self.only_free,
                        command=self._apply_filter, bg=BG, fg=TEXT,
                        activebackground=BG, selectcolor=BG, bd=0,
@@ -466,8 +496,10 @@ class App:
         self.btn_open.pack(side="right")
 
         # ---- 日志卡：固定成窄条，保留事件流但不抢活动列表的注意力。
-        logcard = Card(outer, radius=8, padding=(22, 14, 22, 14), height=200,
-                       shadow=False)
+        log_height = LOG_EXPANDED if self._log_expanded else LOG_COLLAPSED
+        logcard = Card(outer, radius=8, padding=(22, 14, 22, 14),
+                       height=log_height, shadow=False)
+        self.logcard = logcard
         logcard.pack(fill="both", pady=(14, 0))
         logcard.pack_propagate(False)
         loghead = tk.Frame(logcard.body, bg=CARD)
@@ -477,6 +509,10 @@ class App:
         self.btn_clear = RoundButton(loghead, "清空", self.clear_log,
                                      width=78, height=30, size=9)
         self.btn_clear.pack(side="right")
+        self.btn_log_toggle = RoundButton(
+            loghead, "收起" if self._log_expanded else "展开", self.toggle_log,
+            width=78, height=30, size=9)
+        self.btn_log_toggle.pack(side="right", padx=(0, 8))
         panel = tk.Frame(logcard.body, bg="#F0F4F1")
         panel.pack(fill="both", expand=True, pady=(8, 0))
         self.logbox = tk.Text(panel, height=7, wrap="none", bd=0,
@@ -488,6 +524,49 @@ class App:
         self.logbox.configure(state="disabled")
 
         self.root.bind("<F5>", lambda _e: self.refresh())
+        if self._log_expanded:
+            self.root.after(60, lambda: self._resize_for_log(True))
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # ------------------------------------------------------- 偏好与日志面板
+    def _save_prefs(self, *_a):
+        """输入框每敲一个字符都会触发，400ms 防抖后再落盘。"""
+        if self._save_job:
+            self.root.after_cancel(self._save_job)
+        self._save_job = self.root.after(400, self._do_save_prefs)
+
+    def _do_save_prefs(self):
+        self._save_job = None
+        _save_ui({"filter": self.filter_var.get(),
+                  "only_free": bool(self.only_free.get()),
+                  "log_expanded": bool(self._log_expanded)})
+
+    def _resize_for_log(self, expanded: bool):
+        """窗高按「基准高度 + 展开增量」算。
+
+        不能拿当前高度做增量：日志卡请求 380 而 pack 只分到 365，
+        一来一回窗口会越缩越矮。基准高度固定，数值就不会漂。
+        """
+        w = self.root.winfo_width() or 1120
+        base = self._base_h or 820
+        target = base + (LOG_EXPANDED - LOG_COLLAPSED if expanded else 0)
+        sh = self.root.winfo_screenheight()
+        self.root.geometry("%dx%d" % (w, max(640, min(target, sh - 80))))
+
+    def toggle_log(self):
+        self._log_expanded = not self._log_expanded
+        height = LOG_EXPANDED if self._log_expanded else LOG_COLLAPSED
+        self.logcard.configure(height=height)
+        self.logcard._redraw()
+        self.btn_log_toggle.set_text("收起" if self._log_expanded else "展开")
+        self._resize_for_log(self._log_expanded)
+        self._do_save_prefs()
+
+    def on_close(self):
+        try:
+            self._do_save_prefs()
+        finally:
+            self.root.destroy()
 
     # ---------------------------------------------------------------- 工具
     def log(self, text: str):
@@ -704,6 +783,7 @@ class App:
                 break
 
     def _apply_filter(self, announce: bool = False):
+        self._save_prefs()
         kw = self.filter_var.get().strip().lower()
         only_free = self.only_free.get()
         rows = []

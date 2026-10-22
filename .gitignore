@@ -18,11 +18,12 @@ server/reports/
 dist/
 server/dist/
 
-# 流程产物：计划与结果 YAML
+# AI 工具的本地配置与流程产物：只对这台机器有意义，一律不入库
+# （Windows 路径大小写不敏感，但 git 在别的系统上按大小写匹配，所以两种写法都写）
 .claude/
-
-# 本机工具配置：Codex 生成，含这台机器的绝对路径与命令，换机器就失效，不入库
+.Claude/
 .Codex/
+.codex/
 
 # 依赖与 Python 字节码
 node_modules/
