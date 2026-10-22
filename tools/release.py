@@ -70,6 +70,9 @@ def zip_server(tag: str) -> Path:
     shutil.copytree(ROOT / "docs", staging / "docs")
     shutil.copy2(ROOT / "README.md", staging / "README.md")
     shutil.copy2(ROOT / "CHANGELOG.md", staging / "CHANGELOG.md")
+    # 协议跟着分发走：没有 LICENSE 的 zip 别人拿到只有"保留所有权利"的默认解释
+    if (ROOT / "LICENSE").exists():
+        shutil.copy2(ROOT / "LICENSE", staging / "LICENSE")
     shutil.make_archive(str(out.with_suffix("")), "zip",
                         root_dir=str(DIST), base_dir=staging.name)
     shutil.rmtree(staging, ignore_errors=True)

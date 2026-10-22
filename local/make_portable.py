@@ -193,6 +193,10 @@ def copy_app(out: Path) -> None:
             log("  跳过（不存在）：%s" % name)
             continue
         shutil.copy2(src, out / name)
+    # 协议跟仓库同源：绿色版也要能看出"能做什么、不能做什么"
+    lic = HERE.parent / "LICENSE"
+    if lic.exists():
+        shutil.copy2(lic, out / "LICENSE")
     (out / "data").mkdir(exist_ok=True)
 
 
