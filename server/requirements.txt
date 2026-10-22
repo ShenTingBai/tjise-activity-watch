@@ -7,3 +7,9 @@
 # 服务器上的无人值守登录用的是 Node 版 playwright（见 deploy/ 与 docs/LOGIN.md），
 # 不依赖本文件。
 playwright>=1.40
+
+# 无人值守登录（deploy/auto_login.py）的验证码识别主引擎，可选但要装：
+# 装上识别率约 95%，没装会静默退回纯 Tesseract（约 70%），表现为「能用，但一夜失手几次」。
+# 纯 CPU 可跑，服务器实测 ddddocr 1.6.1 + onnxruntime 占约 200MB 内存。
+#   python -m pip install ddddocr
+ddddocr>=1.6.1
