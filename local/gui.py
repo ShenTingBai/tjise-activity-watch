@@ -7,7 +7,7 @@ login / grab），界面与命令行共用同一套逻辑，出问题可以对�
 界面与业务进程分在两个线程：UI 线程只管显示，抢报名在子进程里跑，输出通过队列
 回传，避免 playwright 卡住窗口。
 
-视觉上走“报名值守台”：晨雾蓝灰做背景，纸白承载信息，珊瑚色只标记需要行动的时刻。
+视觉上走“报名值守台”：冷灰绿纸面承载活动清单，校园绿标记可执行动作，琥珀色只提醒时间。
 tkinter 自己画不出抗锯齿圆角，所以卡片/按钮/输入框的底图都用 Pillow 以 3 倍超采样
 渲染再缩放——保持轻量，同时让长时间值守时的层级更清楚。
 """
@@ -40,23 +40,22 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 TOKEN_LIFETIME_H = 17.5     # 实测寿命，仅用于显示「约剩几小时」
 PAREN = re.compile(r"（[^（）]*）$")
 
-# ---- 配色：报名值守台的晨雾底色 + 珊瑚行动色 + 青绿色状态色 ----
-BG = "#F2F5F8"
-CARD = "#FFFFFF"
-BORDER = "#DCE5EE"
-TEXT = "#14243A"
-MUTED = "#65758B"
-INK = "#15253D"
-INK_SOFT = "#223653"
-INK_MUTED = "#B7C4D5"
-ACCENT = "#C84B3F"
-ACCENT_DEEP = "#A83A2E"
-ACCENT_SOFT = "#FBEDEA"
-OK = "#0F6B59"
-BAD = "#B32E2E"
-GREY = "#8C98A5"
-ROW_ALT = "#F7F9FB"
-SEL_ROW = "#E8EEF5"
+# ---- 配色：校园登记簿的冷灰绿纸面 + 校园绿 + 琥珀提醒色 ----
+BG = "#E7EEEB"
+CARD = "#FBFCF8"
+BORDER = "#C5D3CE"
+TEXT = "#203038"
+MUTED = "#61726F"
+ACCENT = "#246052"
+ACCENT_DEEP = "#17483D"
+ACCENT_SOFT = "#E6F0EC"
+SIGNAL_DEEP = "#8A5518"
+SIGNAL_SOFT = "#FFF3DF"
+OK = "#246052"
+BAD = "#9E3C32"
+GREY = "#7C8884"
+ROW_ALT = "#F3F6F2"
+SEL_ROW = "#DFEAE7"
 
 FONT = "Microsoft YaHei UI"
 SS = 3                      # 超采样倍数
@@ -129,10 +128,10 @@ IMAGES = _Images()
 
 
 class Card(tk.Canvas):
-    """圆角面板。自身是画布，内容放 body；四边由 padding 留出圆角空间。"""
+    """纸面分区。自身是画布，内容放 body；四边由 padding 留出边线空间。"""
 
-    def __init__(self, parent, radius: int = 16, padding=(22, 18, 22, 18),
-                 shadow: bool = True, fill: str = CARD, outline: str = BORDER,
+    def __init__(self, parent, radius: int = 10, padding=(22, 18, 22, 18),
+                 shadow: bool = False, fill: str = CARD, outline: str = BORDER,
                  **kw):
         super().__init__(parent, bg=BG, highlightthickness=0, bd=0, **kw)
         self.radius = radius
@@ -168,7 +167,7 @@ class Card(tk.Canvas):
 
 
 class RoundButton(tk.Canvas):
-    """圆角按钮：primary 珊瑚、dark 深色面板、ghost 浅灰；状态各换一张底图。"""
+    """圆角按钮：primary 校园绿、ghost 纸面；状态各换一张底图。"""
 
     def __init__(self, parent, text: str, command=None, kind: str = "ghost",
                  width: int | None = None, height: int = 38, bg: str = CARD,
@@ -187,12 +186,6 @@ class RoundButton(tk.Canvas):
         self.bind("<Leave>", lambda _e: self._set_hover(False))
 
     def _palette(self):
-        # 深色面板上的次要按钮：底色必须比面板亮一档，否则只有文字浮在深色上，
-        # 按钮形状看不见（实测 #1C2E49 对 #15253D 只有 1.13:1）。
-        if self._kind == "dark":
-            if not self._enabled:
-                return "#1B2B44", "#8B9CB4"
-            return ("#3A5A80" if self._hovered else "#2E4B6E"), "#F4F7FB"
         if not self._enabled:
             return "#EEF1F4", GREY
         if self._kind == "primary":
@@ -244,13 +237,13 @@ class Pill(tk.Canvas):
         self.configure(width=w, height=30)
         self.delete("all")
         self.create_image(0, 0, anchor="nw",
-                          image=IMAGES.shape(w, 30, fill, 15))
+                          image=IMAGES.shape(w, 30, fill, 6))
         self.create_oval(13, 11, 21, 19, fill=fg, width=0)
         self.create_text(28, 15, text=text, anchor="w", fill=fg, font=self._f)
 
 
 class RoundEntry(tk.Canvas):
-    """圆角输入框：圆角底图 + 无边框 Entry（聚焦时描边变珊瑚）。"""
+    """圆角输入框：圆角底图 + 无边框 Entry（聚焦时描边变校园绿）。"""
 
     def __init__(self, parent, textvariable, width: int = 250,
                  height: int = 36, bg: str = BG, placeholder: str = ""):
@@ -341,15 +334,15 @@ class App:
                         font=_font(10))
         style.layout("App.Treeview", [("App.Treeview.treearea",
                                        {"sticky": "nswe"})])
-        style.configure("App.Treeview.Heading", background="#F5F8FB",
-                        foreground="#587087", relief="flat", borderwidth=0,
+        style.configure("App.Treeview.Heading", background="#EEF3F0",
+                        foreground="#47625A", relief="flat", borderwidth=0,
                         font=_font(9, True), padding=(12, 9))
-        style.map("App.Treeview.Heading", background=[("active", "#EEF1F4")])
+        style.map("App.Treeview.Heading", background=[("active", "#E1EBE7")])
         style.map("App.Treeview",
                   background=[("selected", SEL_ROW)],
                   foreground=[("selected", TEXT)])
-        style.configure("App.Vertical.TScrollbar", background="#D7E1EA",
-                        troughcolor=CARD, bordercolor=CARD, arrowcolor="#7A8B9D",
+        style.configure("App.Vertical.TScrollbar", background="#C8D5D0",
+                        troughcolor=CARD, bordercolor=CARD, arrowcolor="#6B7C76",
                         borderwidth=0, arrowsize=12)
 
     # ---------------------------------------------------------------- 布局
@@ -357,28 +350,30 @@ class App:
         outer = tk.Frame(self.root, bg=BG)
         outer.pack(fill="both", expand=True, padx=24, pady=20)
 
-        # ---- 值守头部：深靛蓝建立工具的主识别面，珊瑚只留给明确动作。
-        head = Card(outer, padding=(28, 19, 26, 19), height=116,
-                    fill=INK, outline=INK, shadow=False)
+        # ---- 值守头部：左侧登记色条是唯一装饰，标题保持纸面上的清晰层级。
+        head = Card(outer, padding=(28, 18, 26, 18), height=104,
+                    fill=CARD, outline=BORDER, shadow=False)
         head.pack(fill="x")
         head.pack_propagate(False)
-        titles = tk.Frame(head.body, bg=INK)
+        marker = tk.Frame(head.body, bg=ACCENT, width=6)
+        marker.pack(side="left", fill="y", padx=(0, 16))
+        titles = tk.Frame(head.body, bg=CARD)
         titles.pack(side="left", fill="y")
-        tk.Label(titles, text="天软校园活动", bg=INK, fg="#F7FAFC",
-                 font=_font(20, True)).pack(anchor="w")
-        tk.Label(titles, text="报名值守台 · 只登录自己的账号，保持电脑唤醒、网络畅通",
-                 bg=INK, fg=INK_MUTED, font=_font(9)).pack(anchor="w", pady=(6, 0))
+        tk.Label(titles, text="天软校园活动", bg=CARD, fg=TEXT,
+                 font=_font(19, True)).pack(anchor="w")
+        tk.Label(titles, text="报名值班簿 · 只登录自己的账号，保持电脑唤醒、网络畅通",
+                 bg=CARD, fg=MUTED, font=_font(9)).pack(anchor="w", pady=(5, 0))
 
-        right = tk.Frame(head.body, bg=INK)
+        right = tk.Frame(head.body, bg=CARD)
         right.pack(side="right")
-        self.pill = Pill(right, bg=INK)
+        self.pill = Pill(right, bg=CARD)
         self.pill.pack(side="left", padx=(0, 14))
         self._pill("未检查", GREY, "#EEF2F4")
         self.btn_refresh = RoundButton(right, "刷新活动  F5", self.refresh,
-                                       kind="dark", bg=INK, height=40)
+                                       bg=CARD, height=40)
         self.btn_refresh.pack(side="left", padx=(0, 8))
         self.btn_login = RoundButton(right, "登录 / 重新登录", self.login,
-                                     kind="primary", bg=INK, height=40)
+                                     kind="primary", bg=CARD, height=40)
         self.btn_login.pack(side="left")
 
         # ---- 筛选条：筛选与数量各占一端，搜索框保持明确的输入焦点。
@@ -403,7 +398,8 @@ class App:
                  font=_font(9)).pack(side="right", padx=(0, 3))
 
         # ---- 活动表：全界面唯一的高密度阅读面，避免每个区域都变成卡片。
-        table = Card(outer, padding=(14, 14, 14, 14), shadow=False)
+        table = Card(outer, radius=8, padding=(14, 14, 14, 14),
+                     shadow=False)
         table.pack(fill="both", expand=True)
         cols = ("index", "left", "sign_start", "state", "name", "place")
         self.tree = ttk.Treeview(table.body, columns=cols, show="headings",
@@ -416,7 +412,8 @@ class App:
         }
         for key, (text, width) in headings.items():
             self.tree.heading(key, text=text)
-            self.tree.column(key, width=width, anchor="w",
+            anchor = "center" if key in ("index", "left", "sign_start", "state") else "w"
+            self.tree.column(key, width=width, anchor=anchor,
                              stretch=(key in ("name", "place")))
         # 整行只给「已报名」上灰；开放/待开放靠「距开放」「状态」两列本身表达，
         # 每行都染强调色会让表格变成一片噪音。
@@ -437,39 +434,39 @@ class App:
         self.tree.bind("<Return>", lambda _e: self.start_grab())
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._update_selected())
 
-        # ---- 操作卡：深色任务面把选中活动与倒计时从列表中提出来。
-        act = Card(outer, padding=(26, 16, 22, 16), height=132,
-                   fill=INK, outline=INK, shadow=False)
+        # ---- 操作卡：像一张被夹在表格下方的值班单，只有这里承载下一步动作。
+        act = Card(outer, radius=8, padding=(26, 16, 22, 16), height=132,
+                   fill=ACCENT_SOFT, outline="#BED2C9", shadow=False)
         act.pack(fill="x", pady=(14, 0))
         act.pack_propagate(False)
         self.selected_var = tk.StringVar(value="未选中活动 · 在上面的列表选择一项")
-        tk.Label(act.body, textvariable=self.selected_var, bg=INK, fg="#F7FAFC",
+        tk.Label(act.body, textvariable=self.selected_var, bg=ACCENT_SOFT, fg=TEXT,
                  font=_font(9), anchor="w").pack(fill="x")
-        line = tk.Frame(act.body, bg=INK)
+        line = tk.Frame(act.body, bg=ACCENT_SOFT)
         line.pack(fill="x", pady=(9, 0))
         self.btn_grab = RoundButton(line, "到点抢选中活动", self.start_grab,
-                                    kind="primary", bg=INK, width=178, height=42,
+                                    kind="primary", bg=ACCENT_SOFT, width=178, height=42,
                                     size=11)
         self.btn_grab.pack(side="left")
-        self.btn_stop = RoundButton(line, "停止", self.stop, kind="dark",
-                                    bg=INK, width=82, height=42)
+        self.btn_stop = RoundButton(line, "停止", self.stop,
+                                    bg=ACCENT_SOFT, width=82, height=42)
         self.btn_stop.pack(side="left", padx=(10, 0))
         self.btn_stop.state(False)
         self.headed_var = tk.BooleanVar(value=False)
         tk.Checkbutton(line, text="显示浏览器窗口（看着它点）",
-                       variable=self.headed_var, bg=INK, fg="#E8EEF5",
-                       activebackground=INK, selectcolor=INK, bd=0,
+                       variable=self.headed_var, bg=ACCENT_SOFT, fg=TEXT,
+                       activebackground=ACCENT_SOFT, selectcolor=CARD, bd=0,
                        highlightthickness=0,
                        font=_font(9)).pack(side="left", padx=(16, 0))
         self.countdown_var = tk.StringVar(value="")
-        tk.Label(line, textvariable=self.countdown_var, bg=INK, fg="#FFB2A9",
+        tk.Label(line, textvariable=self.countdown_var, bg=ACCENT_SOFT, fg=SIGNAL_DEEP,
                  font=("Cascadia Mono", 11, "bold")).pack(side="left", padx=(16, 0))
         self.btn_open = RoundButton(line, "打开数据目录", self.open_data,
-                                    kind="dark", bg=INK, width=132, height=42)
+                                    bg=ACCENT_SOFT, width=132, height=42)
         self.btn_open.pack(side="right")
 
         # ---- 日志卡：固定成窄条，保留事件流但不抢活动列表的注意力。
-        logcard = Card(outer, padding=(22, 14, 22, 14), height=156,
+        logcard = Card(outer, radius=8, padding=(22, 14, 22, 14), height=200,
                        shadow=False)
         logcard.pack(fill="both", pady=(14, 0))
         logcard.pack_propagate(False)
@@ -480,11 +477,11 @@ class App:
         self.btn_clear = RoundButton(loghead, "清空", self.clear_log,
                                      width=78, height=30, size=9)
         self.btn_clear.pack(side="right")
-        panel = tk.Frame(logcard.body, bg="#F5F8FB")
-        panel.pack(fill="both", expand=True, pady=(10, 0))
+        panel = tk.Frame(logcard.body, bg="#F0F4F1")
+        panel.pack(fill="both", expand=True, pady=(8, 0))
         self.logbox = tk.Text(panel, height=7, wrap="none", bd=0,
                               relief="flat", highlightthickness=0,
-                              bg="#F5F8FB", fg="#34465B",
+                              bg="#F0F4F1", fg="#344B45",
                               insertbackground=TEXT, font=("Consolas", 9),
                               padx=12, pady=9)
         self.logbox.pack(fill="both", expand=True)
@@ -516,11 +513,11 @@ class App:
         else:
             left = self._token_hours_left()
             if left is None:
-                self._pill("登录态有效", OK, "#E7F7F1")
+                self._pill("登录态有效", OK, ACCENT_SOFT)
             elif left <= 0:
-                self._pill("有效 · 可能快过期", ACCENT_DEEP, ACCENT_SOFT)
+                self._pill("有效 · 可能快过期", SIGNAL_DEEP, SIGNAL_SOFT)
             else:
-                self._pill("有效 · 约剩 %.0f 小时" % left, OK, "#E7F7F1")
+                self._pill("有效 · 约剩 %.0f 小时" % left, OK, ACCENT_SOFT)
 
     def _token_hours_left(self) -> float | None:
         try:
@@ -536,7 +533,7 @@ class App:
         self.btn_stop.state(busy)
         self._busy = label if busy else ""
         if busy:
-            self._pill("进行中：%s" % label, ACCENT_DEEP, ACCENT_SOFT)
+            self._pill("进行中：%s" % label, SIGNAL_DEEP, SIGNAL_SOFT)
         else:
             self._refresh_pill()
 
