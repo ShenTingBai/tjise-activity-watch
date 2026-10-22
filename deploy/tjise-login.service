@@ -1,0 +1,18 @@
+[Unit]
+Description=TJISE activity login keeper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/tjise-login
+ExecStart=/usr/bin/node /root/tjise-login/server_refresh.js --daemon
+Restart=always
+RestartSec=30
+User=root
+Environment=SCHOOL_ORIGIN=https://xg.tjise.edu.cn
+StandardOutput=append:/root/tjise-login/refresh.log
+StandardError=append:/root/tjise-login/refresh.log
+
+[Install]
+WantedBy=multi-user.target

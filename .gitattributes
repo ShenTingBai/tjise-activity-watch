@@ -1,0 +1,2 @@
+# 统一 LF：仓库要部署到 Linux，CRLF 会在服务器上变成多余差异
+* text=auto eol=lf

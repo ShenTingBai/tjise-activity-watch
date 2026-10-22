@@ -1,0 +1,9 @@
+# 服务器端（fetch / run / notify / 探针）只用 Python 标准库，无需安装任何包。
+#
+# 只有「本机手动登录 / 本机抢报名」这类要开浏览器的场景才需要 Playwright：
+#   python -m pip install -r requirements.txt
+#   python -m playwright install chromium
+#
+# 服务器上的无人值守登录用的是 Node 版 playwright（见 deploy/ 与 docs/LOGIN.md），
+# 不依赖本文件。
+playwright>=1.40

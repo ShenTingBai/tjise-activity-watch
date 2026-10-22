@@ -1,0 +1,13 @@
+{
+  "name": "tjise-activity-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "飞书机器人：群里 @ 一下就抓取最新学生活动",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.31.0"
+  }
+}
