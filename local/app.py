@@ -182,7 +182,7 @@ class Api:
 
     # ---------- 动作 ----------
     def login(self) -> dict:
-        return self._spawn([sys.executable, str(GRAB), "login"], "登录")
+        return self._spawn([sys.executable, str(GRAB), "login"], "登录", kind="login")
 
     def grab(self, activity_id: str, name: str, at: str = "",
              headed: bool = False) -> dict:
@@ -192,7 +192,7 @@ class Api:
             args += ["--at", at]
         if headed:
             args.append("--headed")
-        return self._spawn(args, "等待并抢报名：%s" % name)
+        return self._spawn(args, "等待并抢报名：%s" % name, kind="grab")
 
     def stop(self) -> dict:
         with self._lock:
@@ -238,7 +238,7 @@ class Api:
         out = (res.stdout or "") + (res.stderr or "")
         return {"code": res.returncode, "out": out}
 
-    def _spawn(self, args: list[str], label: str) -> dict:
+    def _spawn(self, args: list[str], label: str, kind: str = "grab") -> dict:
         with self._lock:
             if self._proc and self._proc.poll() is None:
                 return {"ok": False, "text": "已经有一个任务在跑，先等它结束"}
@@ -248,11 +248,11 @@ class Api:
                 env=_env(), creationflags=CREATE_NO_WINDOW)
             proc = self._proc
 
-        threading.Thread(target=self._pump, args=(proc, label),
+        threading.Thread(target=self._pump, args=(proc, label, kind),
                          daemon=True).start()
         return {"ok": True}
 
-    def _pump(self, proc: subprocess.Popen, label: str) -> None:
+    def _pump(self, proc: subprocess.Popen, label: str, kind: str = "grab") -> None:
         self._emit("log", "▶ " + label)
         tail: list[str] = []
         for line in proc.stdout or []:
@@ -263,7 +263,11 @@ class Api:
             del tail[:-40]
             self._emit("log", line)
         proc.wait()
-        ok = proc.returncode == 0 and any("报名成功" in t for t in tail)
+        if kind == "login":
+            # 登录只看退出码：grab.py login 成功时不会打印「报名成功」
+            ok = proc.returncode == 0
+        else:
+            ok = proc.returncode == 0 and any("报名成功" in t for t in tail)
         reason = ""
         if not ok:
             for t in reversed(tail):
@@ -272,7 +276,7 @@ class Api:
                     break
             reason = reason or ("退出码 %s" % proc.returncode)
         self._emit("done", {"ok": ok, "code": proc.returncode,
-                            "reason": reason, "label": label})
+                            "reason": reason, "label": label, "kind": kind})
         with self._lock:
             if self._proc is proc:
                 self._proc = None

@@ -79,6 +79,12 @@ window.onBackend = {
   done(payload) {
     setBusy(false);
     const ok = payload && payload.ok;
+    if (payload && payload.kind === "login") {
+      setResult(ok ? "登录成功，正在刷新活动列表…"
+                   : "登录没有完成：" + (payload.reason || "退出码 " + payload.code), ok);
+      refresh(true);
+      return;
+    }
     setResult(ok ? "报名成功：" + stripLabel(payload.label)
                  : "没抢到：" + (payload.reason || "未知原因"), ok);
     // 结束后重新拉一次列表：已报名的行要变灰
