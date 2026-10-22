@@ -8,7 +8,8 @@
 登录流程：
 1. Playwright Chromium（headless）打开真实登录页，页面自己带请求签名，不逆向接口；
 2. 拦截页面自身发出的 /dr/api/auth/captcha 响应，取 base64 验证码图；
-3. Tesseract 多预处理变体投票识别 4 位验证码（单次约 60%，见 README 说明）；
+3. 识别 4 位验证码：ddddocr（beta 模型）为主，长度不是 4 位时依次回退默认模型、
+   Tesseract 多变体投票（20 张标注样本实测 95% / 80% / 70%，三源串联 20/20）；
 4. 填账号、密码、验证码，勾选隐私协议，点「立即登录」；
 5. 拦截 /dr/api/auth/login 响应判断结果，成功后从 localStorage 读 xgUniToken；
 6. 调 listActivity 校验 token 真被接口接受，再原子写入：
@@ -16,8 +17,10 @@
    - /root/tjise-activity-watch/data/session.json（token/saved_at/name/student_no/gender）
 
 边界与安全：
-- 最多尝试 MAX_ATTEMPTS 次，每次重新加载页面换一张验证码；全失败才私聊 owner 告警；
-- 告警 6 小时内只发一次，避免 cron 反复刷屏；
+- 最多尝试 MAX_ATTEMPTS 次，每次重新加载页面换一张验证码，两次之间隔 RETRY_DELAY_SEC
+  秒（背靠背连打容易撞同一段降质窗口）；全失败才私聊 owner 告警；
+- 告警 30 分钟内只发一次，避免 cron 反复刷屏；5 分钟后下一轮会继续试，
+  避免一次验证码运气不好就断一整晚；
 - 日志与告警只写结果分类和时间，绝不写账号、密码、验证码、token、姓名、学号；
 - 不写 state.json、不动 token_probe 日志、不触发推送，因此不影响业务去重状态；
 - 账号密码只从 credentials.json（权限必须 600）读取。
@@ -72,13 +75,20 @@ ALERT_STATE_FILE = os.path.join(LOGIN_DIR, "auto_login_state.json")
 DRY_RUN_DIR = os.path.join(LOGIN_DIR, "probe", "dryrun")
 PROBE_LOG = os.path.join(APP_DIR, "data", "token_probe.log")
 
-MAX_ATTEMPTS = 3
-ALERT_COOLDOWN_SEC = 6 * 3600
+MAX_ATTEMPTS = 5
+ALERT_COOLDOWN_SEC = 30 * 60
 PROBE_STALE_SEC = 3600
-# token 实测寿命约 17.5 小时。等到 probe 报失效才登录，中间有 15–20 分钟
-# 推送必挂的盲窗（21:30 那条推送就是这么丢的）。--preempt 在用到 16 小时时
-# 主动换新，每天多登录一次，换掉这个盲窗。
-PREEMPT_HOURS = 16.0
+# 两次尝试之间等一会儿：连着打容易撞同一段降质窗口，间隔后换到的是新图
+RETRY_DELAY_SEC = 30
+# 验证码字符集（学校侧就是大写字母 + 数字，4 位）
+CAPTCHA_CHARSET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+# ddddocr 模型按优先级排列：beta（common.onnx）明显强于默认（common_old.onnx）
+DDDDOCR_MODELS = ("beta", "old")
+# token 寿命不稳定：早期样本 17.5 小时，2026-10-22 这次只活了 10 小时 40 分。
+# 等到 probe 报失效才登录，中间有 15–20 分钟推送必挂的盲窗（21:30 那条推送就是
+# 这么丢的）。--preempt 在用到 8 小时时主动换新（最短寿命的约七成），每天多登录
+# 一次，换掉这个盲窗。
+PREEMPT_HOURS = 8.0
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -87,7 +97,8 @@ UA = (
 PAYLOAD = {"pageSize": 1, "pageNum": 1, "hdmc": "", "hdzt": None, "kssj": "", "jssj": ""}
 
 # 7 个预处理变体：饱和度/亮度 × 竖线过滤阈值 × 放大倍数 × psm。
-# 单选一个变体约 40~50%，逐位投票后约 60%（20 张标注样本实测）。
+# 单选一个变体约 40~50%，逐位投票后约 70%（20 张标注样本实测，2026-10-22）。
+# 它现在只做兜底：主引擎是 ddddocr，见 recognize()。
 OCR_VARIANTS = (
     ("sat", 4, 6, 7),
     ("sat", 4, 6, 6),
@@ -219,8 +230,63 @@ def _ocr(img, psm):
     return "".join(c for c in r.stdout.strip() if c.isalnum())
 
 
+# ddddocr 引擎按需加载后缓存在这里；值为 None 表示依赖缺失，已回退 Tesseract
+_DDDD_ENGINES = {}
+
+
+def _clean_code(text):
+    """只做大写字母数字清洗，不做语义纠错：干扰圆环常被认成 O/0，纠了更容易错。"""
+    return "".join(c for c in str(text or "").upper() if c in CAPTCHA_CHARSET)
+
+
+def _ddddocr_engine(which):
+    """按需加载 ddddocr 模型，加载不到就记住 None（回退 Tesseract，不反复抛异常）。"""
+    if which in _DDDD_ENGINES:
+        return _DDDD_ENGINES[which]
+    engine = None
+    try:
+        import ddddocr  # 可选依赖；没装时整条链路仍靠 Tesseract 走通
+
+        # show_ad=False 关掉首次运行的横幅文字，免得混进日志
+        engine = ddddocr.DdddOcr(
+            ocr=True, det=False, beta=(which == "beta"), show_ad=False
+        )
+    except Exception as exc:
+        log("[w] ddddocr(%s) 不可用，回退 Tesseract：%s" % (which, type(exc).__name__))
+    _DDDD_ENGINES[which] = engine
+    return engine
+
+
+def _ddddocr_read(image_b64, which):
+    """单个 ddddocr 模型读一次，返回清洗后的原始输出（可能为空或长度不是 4）。"""
+    engine = _ddddocr_engine(which)
+    if engine is None:
+        return None
+    try:
+        raw = base64.b64decode(image_b64.split(",", 1)[-1])
+        return _clean_code(engine.classification(raw)) or None
+    except Exception as exc:
+        log("[w] ddddocr(%s) 识别异常：%s" % (which, type(exc).__name__))
+        return None
+
+
 def recognize(image_b64):
-    """把验证码 base64 图转成 4 位码；逐位投票后仍凑不齐 4 位就返回 None。"""
+    """把验证码 base64 图转成 4 位码，凑不齐就返回 None。
+
+    主引擎 ddddocr beta（20 张标注样本 19/20）。它有两个坑必须靠长度校验兜住：
+    长度多于 4 位说明把干扰圆环吃成了 O（M483 读成 M4083），少于 4 位说明漏字
+    （DPJS 读成 DJS）；这两种情况依次交给默认模型、Tesseract 多变体投票重读。
+    三源串联在同一批样本上是 20/20。
+    """
+    for which in DDDDOCR_MODELS:
+        code = _ddddocr_read(image_b64, which)
+        if code and len(code) == 4:
+            return code
+    return _tesseract_recognize(image_b64)
+
+
+def _tesseract_recognize(image_b64):
+    """Tesseract 兜底：不同预处理变体逐位投票，仍凑不齐 4 位就返回 None。"""
     raw = base64.b64decode(image_b64.split(",", 1)[-1])
     rgb = np.asarray(Image.open(io.BytesIO(raw)).convert("RGB")).astype(np.float32)
     sat = rgb.max(2) - rgb.min(2)
@@ -358,7 +424,7 @@ def _submit_once(ctx, creds, persist=True, dummy_code=None):
 
 # ------------------------------------------------------------ 告警
 def _alert(reason):
-    """全部尝试失败后的告警：6 小时内只发一次，私聊优先、群通道兜底。"""
+    """全部尝试失败后的告警：30 分钟内只发一次，私聊优先、群通道兜底。"""
     st = _read_json(ALERT_STATE_FILE) or {}
     last = st.get("last_alert_ts") or 0
     if time.time() - float(last) < ALERT_COOLDOWN_SEC:
@@ -447,7 +513,7 @@ def _session_fresh(seconds=600):
 def _clear_alert_state():
     """登录态被确认有效时清掉告警冷却。
 
-    否则一次误报（比如断网被当成失效）会把后续 6 小时的真失效告警一起压掉。
+    否则一次误报（比如断网被当成失效）会把冷却期内的真失效告警一起压掉。
     """
     try:
         st = _read_json(ALERT_STATE_FILE) or {}
@@ -462,7 +528,7 @@ def _fp_age_hours(token):
 
     不能用 session.json 的 saved_at 算寿命：server_refresh.js 每 2 小时校验
     成功后会重写 saved_at，它表示「上次校验时间」而不是「签发时间」，
-    拿它算永远到不了 16 小时，--preempt 就永远不触发。
+    拿它算永远到不了 PREEMPT_HOURS，--preempt 就永远不触发。
     指纹只是 token 的 sha1 前 8 位，不含 token 原文。
     """
     fp = _token_fp(token)
@@ -516,6 +582,7 @@ def dry_run(count, verbose=False):
     out_dir = os.path.join(DRY_RUN_DIR, datetime.now().strftime("%Y%m%d-%H%M%S"))
     os.makedirs(out_dir, mode=0o700, exist_ok=True)
     ok = 0
+    per_engine = dict((which, 0) for which in DDDDOCR_MODELS)
     for i in range(count):
         body = json.dumps({"client": CLIENT, "userType": "2"}).encode("utf-8")
         req = urllib.request.Request(CAPTCHA_API, data=body, method="POST")
@@ -541,12 +608,20 @@ def dry_run(count, verbose=False):
         code = recognize(image)
         if code:
             ok += 1
+        # 顺带统计单引擎表现，方便 A/B 判断回退链是否还必要
+        for which in DDDDOCR_MODELS:
+            got = _ddddocr_read(image, which)
+            if got and len(got) == 4:
+                per_engine[which] += 1
         if verbose:
             print("sample %02d code=%s" % (i, code or "<未识别>"))
     rate = (ok / float(count)) if count else 0.0
     # 注意：这里统计的是「凑齐 4 位」的比例，不等于识别正确率；
-    # 正确率要用有人工标注的样本另算（20 张标注样本实测约 60%）。
-    print("[i] 凑齐 4 位 %d/%d = %.0f%%，样本图片：%s" % (ok, count, rate * 100, out_dir))
+    # 正确率要用有人工标注的样本另算（20 张标注样本实测：融合 100%，单 ddddocr beta 95%）。
+    print("[i] 融合凑齐 4 位 %d/%d = %.0f%%；ddddocr 单独：%s；样本图片：%s"
+          % (ok, count, rate * 100,
+             "，".join("%s %d/%d" % (which, per_engine[which], count) for which in DDDDOCR_MODELS),
+             out_dir))
     return 0
 
 
@@ -704,6 +779,9 @@ def main():
                         atomic_write_json(ALERT_STATE_FILE, {"last_alert_ts": 0}, 0o600)
                         return 0
                     log("[i] 第 %d/%d 次自动登录失败：%s" % (attempt, MAX_ATTEMPTS, reason))
+                    if attempt < MAX_ATTEMPTS:
+                        log("[i] %d 秒后换一张验证码重试" % RETRY_DELAY_SEC)
+                        time.sleep(RETRY_DELAY_SEC)
             finally:
                 browser.close()
 
