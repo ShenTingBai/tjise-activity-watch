@@ -84,6 +84,17 @@ journalctl -u tjise-bot -n 100 --no-pager
 
 日志里**不应出现** token、姓名、学号、密码、验证码；看到这类内容按事故处理。
 
+### 日志轮转
+
+上面所有 `*.log` 都由 `deploy/logrotate/tjise` 统一轮转：每周一次、保留 8 份、超过 5MB 提前切、切后 gzip。
+
+```bash
+sudo install -m 644 deploy/logrotate/tjise /etc/logrotate.d/tjise
+sudo logrotate -d /etc/logrotate.d/tjise   # 只看不切
+```
+
+配置用 `copytruncate` 而不是默认的"改名 + 新建"：cron 和服务都是 `>>` 追加写、不重开文件，改名会让它们继续写进已改名的旧文件，新文件一直是空的。原地截断则不换 inode，追加写自动接上。
+
 ## 5. 日常操作
 
 ```bash
