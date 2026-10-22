@@ -64,6 +64,21 @@ python server/scripts/run.py        # 正常跑一轮
 
 两边的抢报名时序是同一套（提前开详情页 → 开放前 reload → 点「立即报名」→ 读 `signUp` 返回码 → `getJoinInfo` 复核），改一边时要同步另一边。
 
+## 怎么拿
+
+| 想要什么 | 去哪 |
+|---|---|
+| 本机版绿色版（不用装 Python，解压双击 `启动.bat`） | [Releases](https://github.com/ShenTingBai/tjise-activity-watch/releases) 里下 `tjise-grab-portable-*.zip` |
+| 本机版源码（自己装 Python） | 分支 `local`，或仓库里 `local/` 目录 |
+| 服务器版源码（含 `docs/` 运维文档） | 分支 `server`，或 Releases 里的 `tjise-server-*.zip` |
+| 两版一起看 / 提改动 | `main`（开发主线，两版都在这） |
+
+`local` 与 `server` 是**自动生成的分发快照**：根目录直接就是成品，由 `python tools/split_branches.py` 从 `main` 拆出来强推，所以只读——改代码一律在 `main`，再跑脚本重建。
+
+发版一条命令：`python tools/release.py v1.1.0`（构建绿色版 → 打两个 zip → 打 tag → 传 Release → 重建分支）。
+
+`.claude/`、`.Codex/` 这类本机工具配置不入库（见 `.gitignore`），只提交代码与文档。
+
 ## 目录结构
 
 ```
