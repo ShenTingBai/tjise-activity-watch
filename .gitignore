@@ -21,6 +21,9 @@ server/dist/
 # 流程产物：计划与结果 YAML
 .claude/
 
+# 本机工具配置：Codex 生成，含这台机器的绝对路径与命令，换机器就失效，不入库
+.Codex/
+
 # 依赖与 Python 字节码
 node_modules/
 __pycache__/
