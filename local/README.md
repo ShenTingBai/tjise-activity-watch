@@ -121,6 +121,17 @@ python grab.py grab --activity-id 2ae75dd103654543b1a8b97053adf4a6 ^
 
 **注意：保持电脑不睡眠、不断网。** 笔记本合盖会睡，抢不到不是脚本的锅。
 
+### 不想敲命令行？双击 `4-图形界面.bat`
+
+![界面预览](gui-preview.png)
+
+一个窗口搞定：左上角显示登录态，中间是活动表（绿色=未开放、蓝色=开放中、灰色=已报名），
+选一行点「到点抢选中的活动」即可；下方日志会实时显示脚本在干什么，还有开放倒计时。
+勾选「显示浏览器窗口」就能看着它点按钮。
+
+界面只是个壳——它调的仍是 `grab.py` 的子命令，所以命令行能做的事这里都能做，出问题也能对照日志排查。
+界面启动后用的是 `pythonw`，不会再额外留一个黑窗口。
+
 ---
 
 ## 四、常见问题
@@ -131,6 +142,7 @@ python grab.py grab --activity-id 2ae75dd103654543b1a8b97053adf4a6 ^
 | `[X] 没有找到 Python` | 装 Python 时没勾 "Add python.exe to PATH"，重装或手动把 Python 加进 PATH |
 | `[X] 依赖没装好（缺 playwright）` | 双击 `install.bat` |
 | `[X] 登录态已失效` | token 过期（约 17 小时），重做第 1 步 |
+| 界面打不开 / 双击后没反应 | 先用 `install.bat` 自检；或运行 `python gui.py` 看报错（界面用系统自带 tkinter，官方 Python 安装包默认包含） |
 | `[i] 没有可报名（未报名且已公布报名时间）的活动` | 活动还没公布报名时间，或你都已经报了 |
 | `[X] 没抢到：code:xxx ...` | 服务端拒绝：名额已满 / 未到开放时间 / 活动已结束。可以手动打开活动页再试 |
 | `[X] 打不开登录页` | 校园网/代理问题，或需要连学校 VPN |
@@ -143,13 +155,16 @@ python grab.py grab --activity-id 2ae75dd103654543b1a8b97053adf4a6 ^
 ```
 local/
 ├─ install.bat              首次使用双击一次：装依赖 + 内核 + 自检
-├─ _py.bat                  三个 bat 共用的 Python 探测（缺环境时提示去装）
+├─ _py.bat                  四个 bat 共用的 Python 探测（缺环境时提示去装）
 ├─ grab.py                  主脚本（登录 / 查活动 / 抢报名 / 自检）
+├─ gui.py                   图形界面（tkinter，调用 grab.py 子命令）
+├─ gui-preview.png          界面预览图（README 用）
 ├─ requirements.txt         唯一的依赖：playwright
 ├─ config.example.json      可选：飞书群机器人 webhook（复制成 config.json 再填）
 ├─ 1-登录.bat               双击：手动登录一次
 ├─ 2-抢活动.bat             双击：交互式选择并到点抢
 ├─ 3-检查登录和活动.bat     双击：看登录态 + 列活动
+├─ 4-图形界面.bat           双击：打开图形界面
 └─ data/                    运行后自动生成
    ├─ session.json          你的 token 等登录信息（⚠️ 别外传、别提交到 git）
    ├─ storage_state.json    浏览器登录态（cookie + localStorage）

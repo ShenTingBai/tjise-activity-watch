@@ -348,6 +348,13 @@ def cmd_check(args):
 
 
 def cmd_list(args):
+    # 先判登录态：直接拉列表失败只会得到一句「接口异常：HTTPError」，
+    # 图形界面里的用户看不出是没登录还是网络问题。
+    ok, msg = check_token()
+    if not ok:
+        print("[X] %s" % msg)
+        print("    请先运行：python grab.py login（或点界面上的「登录」）")
+        return 2
     try:
         acts = fetch_activities()
     except PermissionError as exc:
@@ -372,15 +379,36 @@ def cmd_list(args):
 
     rows.sort(key=lambda a: (rank(a), a["sign_start"] or "9999", a["name"]))
     if not rows:
+        if getattr(args, "json", False):
+            print("[]")
+            return 0
         print("[i] 近期没有可报名的活动（还没公布报名时间，或都已截止/已报名）。")
         print("    想连历史活动一起看：python grab.py list --all")
+        return 0
+
+    if getattr(args, "json", False):
+        # 给图形界面用：字段固定，界面拿 id 直接把目标钉死，不靠序号对齐
+        out = []
+        for i, act in enumerate(rows, 1):
+            out.append({
+                "index": i,
+                "id": act["id"],
+                "name": act["name"],
+                "sign_start": act["sign_start"],
+                "sign_end": act["sign_end"],
+                "act_start": act["act_start"],
+                "place": act["place"],
+                "signed": bool(act["signed"]),
+                "state": "已报名" if act["signed"] else sign_state(act, now),
+            })
+        print(json.dumps(out, ensure_ascii=False))
         return 0
 
     print("%3s  %s  %s  %s" % ("#", "报名开始", "状态", "活动名"))
     for i, act in enumerate(rows, 1):
         flag = "已报名" if act["signed"] else sign_state(act, now)
         print("%3d  %s  %s  %s" % (i, act["sign_start"] or "-", flag, act["name"]))
-    print("\n提示：双击 2-抢活动.bat 可直接选择并到点抢；命令行用 --activity-id 与 --at。")
+    print("\n提示：双击 2-抢活动.bat 可直接选择并到点抢；也可以双击 4-图形界面.bat 用鼠标点。")
     return 0
 
 
@@ -719,6 +747,7 @@ def main():
 
     p = sub.add_parser("list", help="列出活动与报名开始时间")
     p.add_argument("--all", action="store_true", help="连已报名的也列出来")
+    p.add_argument("--json", action="store_true", help="输出 JSON（给图形界面调用）")
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("grab", help="到点自动报名（不传 --pick/--name/--activity-id 则交互选择）")

@@ -22,4 +22,15 @@ echo [X] 依赖没装好（缺 playwright）。请先双击 install.bat。
 exit /b 1
 
 :run
+rem 第一个参数是 gui 时启动图形界面：用 pythonw 避免多留一个黑窗口
+if /i "%~1"=="gui" goto :rungui
 %PY% "%~dp0grab.py" %*
+exit /b %errorlevel%
+
+:rungui
+set "GUIW="
+where pythonw >nul 2>&1
+if not errorlevel 1 set "GUIW=pythonw"
+if not defined GUIW set "GUIW=%PY%"
+start "" %GUIW% "%~dp0gui.py"
+exit /b 0
