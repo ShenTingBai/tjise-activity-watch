@@ -31,7 +31,7 @@
 | 步骤 | 动作 |
 |---|---|
 | 1 | 检查 Python 版本（没装会提示去哪下、要勾哪个选项） |
-| 2 | 装依赖 `playwright`（默认源失败自动换清华镜像） |
+| 2 | 装依赖 `playwright` + `pillow`（默认源失败自动换清华镜像） |
 | 3 | 下载浏览器内核（失败换国内镜像；再失败就用你电脑上的 Chrome） |
 | 4 | 自检：能不能拉起浏览器、能不能连上学校站点 |
 
@@ -127,7 +127,7 @@ python grab.py grab --activity-id 2ae75dd103654543b1a8b97053adf4a6 ^
 
 一个窗口搞定，打开就会自动检查登录、拉一次活动列表：
 
-- **选活动**：表格按状态着色（🟩 未开放、🟦 开放中、⬜ 已报名），「距开放」列每秒自己走。
+- **选活动**：表格里已报名的行变灰，「距开放」列每秒自己走。
   上方筛选框输关键词可快速找人少的场次；「只看还能报的」默认勾上，已报名的先不显示。
 - **开始抢**：点一行 → 点「到点抢选中的活动」（或直接双击那行、选中后按 Enter）。
 - **看进度**：下方日志是脚本原话，顶部红色倒计时是距离报名开放的时间；想看着它点按钮就勾「显示浏览器窗口」。
@@ -135,6 +135,9 @@ python grab.py grab --activity-id 2ae75dd103654543b1a8b97053adf4a6 ^
 
 界面只是个壳——它调的仍是 `grab.py` 的子命令，所以命令行能做的事这里都能做，出问题也能对照日志排查。
 界面启动后用的是 `pythonw`，不会再额外留一个黑窗口。
+
+圆角卡片是用 Pillow 现场画的（tkinter 自己画不出抗锯齿圆角），所以依赖里多了 `pillow`；
+`install.bat` 会一起装上，已经装过老版本的同学再跑一次 `install.bat` 即可。
 
 ---
 
@@ -145,6 +148,7 @@ python grab.py grab --activity-id 2ae75dd103654543b1a8b97053adf4a6 ^
 | 双击 bat 窗口一闪就没 | 先双击 `install.bat` 跑一遍，它会说明缺什么；也可以 Win+R 输 `cmd`，把 bat 拖进去回车，看完整报错 |
 | `[X] 没有找到 Python` | 装 Python 时没勾 "Add python.exe to PATH"，重装或手动把 Python 加进 PATH |
 | `[X] 依赖没装好（缺 playwright）` | 双击 `install.bat` |
+| 界面报 `ModuleNotFoundError: No module named 'PIL'` | 老版本装过依赖，重跑一次 `install.bat` 补上 pillow |
 | `[X] 登录态已失效` | token 过期（约 17 小时），重做第 1 步 |
 | 界面打不开 / 双击后没反应 | 先用 `install.bat` 自检；或运行 `python gui.py` 看报错（界面用系统自带 tkinter，官方 Python 安装包默认包含） |
 | `[i] 没有可报名（未报名且已公布报名时间）的活动` | 活动还没公布报名时间，或你都已经报了 |
@@ -161,9 +165,9 @@ local/
 ├─ install.bat              首次使用双击一次：装依赖 + 内核 + 自检
 ├─ _py.bat                  四个 bat 共用的 Python 探测（缺环境时提示去装）
 ├─ grab.py                  主脚本（登录 / 查活动 / 抢报名 / 自检）
-├─ gui.py                   图形界面（tkinter，调用 grab.py 子命令）
+├─ gui.py                   图形界面（tkinter + Pillow 圆角，调用 grab.py 子命令）
 ├─ gui-preview.png          界面预览图（README 用）
-├─ requirements.txt         唯一的依赖：playwright
+├─ requirements.txt         依赖清单：playwright + pillow
 ├─ config.example.json      可选：飞书群机器人 webhook（复制成 config.json 再填）
 ├─ 1-登录.bat               双击：手动登录一次
 ├─ 2-抢活动.bat             双击：交互式选择并到点抢

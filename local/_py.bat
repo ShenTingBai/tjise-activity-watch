@@ -28,6 +28,13 @@ if /i "%~1"=="gui" goto :rungui
 exit /b %errorlevel%
 
 :rungui
+rem 界面画圆角要用 Pillow；缺了又用 pythonw 启动，就只会"双击没反应"，所以先查再起
+%PY% -c "import PIL" >nul 2>&1
+if errorlevel 1 (
+  echo [X] 界面缺少 pillow 依赖（圆角绘制用）。请先双击 install.bat 补装。
+  pause
+  exit /b 1
+)
 set "GUIW="
 where pythonw >nul 2>&1
 if not errorlevel 1 set "GUIW=pythonw"
