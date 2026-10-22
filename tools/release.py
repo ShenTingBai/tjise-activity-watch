@@ -61,7 +61,7 @@ def zip_portable(tag: str) -> Path:
 def zip_server(tag: str) -> Path:
     out = DIST / ("tjise-server-%s.zip" % tag)
     out.unlink(missing_ok=True)
-    staging = DIST / (".server-staging-" + tag)
+    staging = DIST / ("tjise-server-" + tag)   # 解压后的顶层目录名，别带点（Windows 会当隐藏目录）
     shutil.rmtree(staging, ignore_errors=True)
     shutil.copytree(
         ROOT / "server", staging,
