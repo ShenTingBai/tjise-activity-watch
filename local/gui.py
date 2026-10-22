@@ -46,6 +46,9 @@ CARD = "#FFFFFF"
 BORDER = "#DCE5EE"
 TEXT = "#14243A"
 MUTED = "#65758B"
+INK = "#15253D"
+INK_SOFT = "#223653"
+INK_MUTED = "#B7C4D5"
 ACCENT = "#C84B3F"
 ACCENT_DEEP = "#A83A2E"
 ACCENT_SOFT = "#FBEDEA"
@@ -106,11 +109,11 @@ class _Images:
         self._cache: dict[tuple, ImageTk.PhotoImage] = {}
 
     def card(self, w: int, h: int, fill: str = CARD, radius: int = 18,
-             shadow: bool = True) -> ImageTk.PhotoImage:
-        key = ("card", w, h, fill, radius, shadow)
+             shadow: bool = True, outline: str = BORDER) -> ImageTk.PhotoImage:
+        key = ("card", w, h, fill, radius, shadow, outline)
         if key not in self._cache:
             self._cache[key] = ImageTk.PhotoImage(
-                _rounded((w, h), radius, fill, BORDER, shadow))
+                _rounded((w, h), radius, fill, outline, shadow))
         return self._cache[key]
 
     def shape(self, w: int, h: int, fill: str, radius: int = 10,
@@ -126,15 +129,18 @@ IMAGES = _Images()
 
 
 class Card(tk.Canvas):
-    """圆角卡片。自身是画布，内容放 body；四边由 padding 留出圆角空间。"""
+    """圆角面板。自身是画布，内容放 body；四边由 padding 留出圆角空间。"""
 
     def __init__(self, parent, radius: int = 16, padding=(22, 18, 22, 18),
-                 shadow: bool = True, **kw):
+                 shadow: bool = True, fill: str = CARD, outline: str = BORDER,
+                 **kw):
         super().__init__(parent, bg=BG, highlightthickness=0, bd=0, **kw)
         self.radius = radius
         self.padding = padding
         self.shadow = shadow
-        self.body = tk.Frame(self, bg=CARD)
+        self.fill = fill
+        self.outline = outline
+        self.body = tk.Frame(self, bg=fill)
         self._win = self.create_window(padding[0], padding[1], anchor="nw",
                                        window=self.body)
         self._job = None
@@ -153,7 +159,8 @@ class Card(tk.Canvas):
         pad_l, pad_t, pad_r, pad_b = self.padding
         self.delete("cardbg")
         self.create_image(0, 0, anchor="nw", tags="cardbg",
-                          image=IMAGES.card(w, h, CARD, self.radius, self.shadow))
+                          image=IMAGES.card(w, h, self.fill, self.radius,
+                                             self.shadow, self.outline))
         self.tag_lower("cardbg")
         self.itemconfigure(self._win, width=max(10, w - pad_l - pad_r),
                            height=max(10, h - pad_t - pad_b))
@@ -161,7 +168,7 @@ class Card(tk.Canvas):
 
 
 class RoundButton(tk.Canvas):
-    """圆角按钮：primary 实心珊瑚、ghost 浅灰；hover / 禁用各换一张底图。"""
+    """圆角按钮：primary 珊瑚、dark 深色面板、ghost 浅灰；状态各换一张底图。"""
 
     def __init__(self, parent, text: str, command=None, kind: str = "ghost",
                  width: int | None = None, height: int = 38, bg: str = CARD,
@@ -180,6 +187,12 @@ class RoundButton(tk.Canvas):
         self.bind("<Leave>", lambda _e: self._set_hover(False))
 
     def _palette(self):
+        # 深色面板上的次要按钮：底色必须比面板亮一档，否则只有文字浮在深色上，
+        # 按钮形状看不见（实测 #1C2E49 对 #15253D 只有 1.13:1）。
+        if self._kind == "dark":
+            if not self._enabled:
+                return "#1B2B44", "#8B9CB4"
+            return ("#3A5A80" if self._hovered else "#2E4B6E"), "#F4F7FB"
         if not self._enabled:
             return "#EEF1F4", GREY
         if self._kind == "primary":
@@ -344,34 +357,35 @@ class App:
         outer = tk.Frame(self.root, bg=BG)
         outer.pack(fill="both", expand=True, padx=24, pady=20)
 
-        # ---- 标题卡：把登录态、刷新和登录动作固定在同一条值守台上沿。
-        head = Card(outer, padding=(28, 19, 26, 19), height=108)
+        # ---- 值守头部：深靛蓝建立工具的主识别面，珊瑚只留给明确动作。
+        head = Card(outer, padding=(28, 19, 26, 19), height=116,
+                    fill=INK, outline=INK, shadow=False)
         head.pack(fill="x")
         head.pack_propagate(False)
-        titles = tk.Frame(head.body, bg=CARD)
+        titles = tk.Frame(head.body, bg=INK)
         titles.pack(side="left", fill="y")
-        tk.Label(titles, text="天软校园活动", bg=CARD, fg=TEXT,
-                 font=_font(19, True)).pack(anchor="w")
+        tk.Label(titles, text="天软校园活动", bg=INK, fg="#F7FAFC",
+                 font=_font(20, True)).pack(anchor="w")
         tk.Label(titles, text="报名值守台 · 只登录自己的账号，保持电脑唤醒、网络畅通",
-                 bg=CARD, fg=MUTED, font=_font(9)).pack(anchor="w", pady=(5, 0))
+                 bg=INK, fg=INK_MUTED, font=_font(9)).pack(anchor="w", pady=(6, 0))
 
-        right = tk.Frame(head.body, bg=CARD)
+        right = tk.Frame(head.body, bg=INK)
         right.pack(side="right")
-        self.pill = Pill(right)
+        self.pill = Pill(right, bg=INK)
         self.pill.pack(side="left", padx=(0, 14))
         self._pill("未检查", GREY, "#EEF2F4")
         self.btn_refresh = RoundButton(right, "刷新活动  F5", self.refresh,
-                                       height=40)
+                                       kind="dark", bg=INK, height=40)
         self.btn_refresh.pack(side="left", padx=(0, 8))
         self.btn_login = RoundButton(right, "登录 / 重新登录", self.login,
-                                     kind="primary", height=40)
+                                     kind="primary", bg=INK, height=40)
         self.btn_login.pack(side="left")
 
         # ---- 筛选条：筛选与数量各占一端，搜索框保持明确的输入焦点。
         bar = tk.Frame(outer, bg=BG)
         bar.pack(fill="x", pady=(18, 12))
-        tk.Label(bar, text="活动筛选", bg=BG, fg=TEXT,
-                 font=_font(9, True)).pack(side="left", padx=(3, 10))
+        tk.Label(bar, text="活动清单", bg=BG, fg=TEXT,
+                 font=_font(10, True)).pack(side="left", padx=(3, 12))
         self.filter_var = tk.StringVar()
         self.filter_var.trace_add("write", lambda *_a: self._apply_filter())
         self.entry_wrap = RoundEntry(bar, self.filter_var, width=280,
@@ -388,8 +402,8 @@ class App:
         tk.Label(bar, textvariable=self.count_var, bg=BG, fg=MUTED,
                  font=_font(9)).pack(side="right", padx=(0, 3))
 
-        # ---- 活动表
-        table = Card(outer, padding=(14, 14, 14, 14))
+        # ---- 活动表：全界面唯一的高密度阅读面，避免每个区域都变成卡片。
+        table = Card(outer, padding=(14, 14, 14, 14), shadow=False)
         table.pack(fill="both", expand=True)
         cols = ("index", "left", "sign_start", "state", "name", "place")
         self.tree = ttk.Treeview(table.body, columns=cols, show="headings",
@@ -423,38 +437,42 @@ class App:
         self.tree.bind("<Return>", lambda _e: self.start_grab())
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._update_selected())
 
-        # ---- 操作卡：选中活动、倒计时和主按钮形成唯一的行动焦点。
-        act = Card(outer, padding=(26, 16, 22, 16), height=124)
+        # ---- 操作卡：深色任务面把选中活动与倒计时从列表中提出来。
+        act = Card(outer, padding=(26, 16, 22, 16), height=132,
+                   fill=INK, outline=INK, shadow=False)
         act.pack(fill="x", pady=(14, 0))
         act.pack_propagate(False)
         self.selected_var = tk.StringVar(value="未选中活动 · 在上面的列表选择一项")
-        tk.Label(act.body, textvariable=self.selected_var, bg=CARD, fg=TEXT,
+        tk.Label(act.body, textvariable=self.selected_var, bg=INK, fg="#F7FAFC",
                  font=_font(9), anchor="w").pack(fill="x")
-        line = tk.Frame(act.body, bg=CARD)
+        line = tk.Frame(act.body, bg=INK)
         line.pack(fill="x", pady=(9, 0))
         self.btn_grab = RoundButton(line, "到点抢选中活动", self.start_grab,
-                                    kind="primary", width=178, height=42,
+                                    kind="primary", bg=INK, width=178, height=42,
                                     size=11)
         self.btn_grab.pack(side="left")
-        self.btn_stop = RoundButton(line, "停止", self.stop, width=82, height=42)
+        self.btn_stop = RoundButton(line, "停止", self.stop, kind="dark",
+                                    bg=INK, width=82, height=42)
         self.btn_stop.pack(side="left", padx=(10, 0))
         self.btn_stop.state(False)
         self.headed_var = tk.BooleanVar(value=False)
         tk.Checkbutton(line, text="显示浏览器窗口（看着它点）",
-                       variable=self.headed_var, bg=CARD, fg=TEXT,
-                       activebackground=CARD, selectcolor=CARD, bd=0,
+                       variable=self.headed_var, bg=INK, fg="#E8EEF5",
+                       activebackground=INK, selectcolor=INK, bd=0,
                        highlightthickness=0,
                        font=_font(9)).pack(side="left", padx=(16, 0))
         self.countdown_var = tk.StringVar(value="")
-        tk.Label(line, textvariable=self.countdown_var, bg=CARD, fg=ACCENT_DEEP,
+        tk.Label(line, textvariable=self.countdown_var, bg=INK, fg="#FFB2A9",
                  font=("Cascadia Mono", 11, "bold")).pack(side="left", padx=(16, 0))
         self.btn_open = RoundButton(line, "打开数据目录", self.open_data,
-                                    width=132, height=42)
+                                    kind="dark", bg=INK, width=132, height=42)
         self.btn_open.pack(side="right")
 
-        # ---- 日志卡
-        logcard = Card(outer, padding=(22, 16, 22, 18))
+        # ---- 日志卡：固定成窄条，保留事件流但不抢活动列表的注意力。
+        logcard = Card(outer, padding=(22, 14, 22, 14), height=156,
+                       shadow=False)
         logcard.pack(fill="both", pady=(14, 0))
+        logcard.pack_propagate(False)
         loghead = tk.Frame(logcard.body, bg=CARD)
         loghead.pack(fill="x")
         tk.Label(loghead, text="运行日志", bg=CARD, fg=TEXT,
