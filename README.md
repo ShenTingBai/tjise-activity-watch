@@ -48,7 +48,7 @@ python server/scripts/run.py --dry  # 只看不推
 python server/scripts/run.py        # 正常跑一轮
 ```
 
-本机不想装环境也行：直接用 [local/](local/) 里的单文件工具（手动登录 + 抢单个活动），见 [local/README.md](local/README.md)。
+本机不想装环境也行：直接用 [local/](local/) 里的工具（双击 `install.bat` 装一次环境，之后双击 bat 手动登录、按序号抢单个活动），见 [local/README.md](local/README.md)。
 
 ## 两个版本
 

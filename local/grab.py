@@ -384,8 +384,11 @@ def cmd_list(args):
     return 0
 
 
-def pick_activity(acts, now=None):
-    """交互式挑活动：只列未报名的，按报名开始时间排序。"""
+def candidates(acts, now=None):
+    """可抢的活动：未报名、有报名开始时间、还没截止；未开放的排最前。
+
+    交互选择与 --pick/--name 非交互选择共用这一份顺序，保证序号一致。
+    """
     now = now or time.time()
     cand = [a for a in acts
             if not a["signed"] and a["sign_start"] and still_relevant(a, now)]
@@ -397,6 +400,12 @@ def pick_activity(acts, now=None):
             return 1
 
     cand.sort(key=lambda a: (rank(a), a["sign_start"]))
+    return cand
+
+
+def pick_activity(acts, now=None):
+    """交互式挑活动：只列未报名的，按报名开始时间排序。"""
+    cand = candidates(acts, now)
     if not cand:
         print("[i] 近期没有可报名的活动（还没公布报名时间，或都已截止/已报名）。")
         return None
@@ -449,6 +458,35 @@ def wait_until(ts):
         time.sleep(min(0.2, left))
 
 
+def _by_index_or_name(cand, args):
+    """非交互挑活动：--pick 序号（与 list / 交互列表一致），或 --name 关键词。
+
+    只在这一步命中一个活动才继续；命中多个就列出来让用户改用序号，避免猜错抢错。
+    """
+    pick = int(getattr(args, "pick", 0) or 0)
+    kw = str(getattr(args, "name", "") or "").strip()
+    if pick:
+        if not 1 <= pick <= len(cand):
+            print("[X] --pick %d 超出范围（当前有 %d 个可抢的活动）" % (pick, len(cand)))
+            print("    运行 python grab.py list 查看序号。")
+            return None
+        return cand[pick - 1]
+    if not kw:
+        return None
+    hits = [a for a in cand if kw.lower() in a["name"].lower()]
+    if not hits:
+        print("[X] 没有名称含「%s」的活动。" % kw)
+        print("    运行 python grab.py list 查看当前可抢的活动。")
+        return None
+    if len(hits) > 1:
+        print("[X] 「%s」匹配到 %d 个活动，请改用 --pick 序号：" % (kw, len(hits)))
+        for i, a in enumerate(cand, 1):
+            if a in hits:
+                print("    %-3d %s  %s" % (i, a["sign_start"], a["name"]))
+        return None
+    return hits[0]
+
+
 def resolve_target(args):
     """确定 activity-id / 报名开始时间 / 活动名。"""
     acts = None
@@ -472,18 +510,29 @@ def resolve_target(args):
     except PermissionError as exc:
         print("[X] 登录态已失效（%s），请先运行 python grab.py login" % exc)
         return None
-    act = pick_activity(acts)
+
+    cand = candidates(acts)
+    if not cand:
+        print("[i] 近期没有可报名的活动（还没公布报名时间，或都已截止/已报名）。")
+        return None
+
+    act = _by_index_or_name(cand, args)
+    if act is None:
+        if getattr(args, "pick", 0) or str(getattr(args, "name", "") or "").strip():
+            return None            # 非交互模式选不出目标就直接结束，不再弹交互
+        act = pick_activity(acts)
     if not act:
         return None
     print("\n已选择：%s" % act["name"])
     print("报名开始：%s   活动时间：%s   地点：%s" %
           (act["sign_start"], act["act_start"], act["place"]))
-    if input("确认到点自动报名？[y/N] ").strip().lower() not in ("y", "yes"):
-        print("[i] 已取消。")
-        return None
-    at = act["sign_start"]
-    name = args.name or act["name"]
-    return {"id": act["id"], "at": at, "name": name}
+    # 用 --pick/--name 指定时视为已确认（脚本/快捷方式调用不该再卡在输入上）
+    if not (getattr(args, "pick", 0) or str(getattr(args, "name", "") or "").strip()):
+        if input("确认到点自动报名？[y/N] ").strip().lower() not in ("y", "yes"):
+            print("[i] 已取消。")
+            return None
+    return {"id": act["id"], "at": act["sign_start"], "name": act["name"]}
+
 
 
 def cmd_grab(args):
@@ -672,10 +721,13 @@ def main():
     p.add_argument("--all", action="store_true", help="连已报名的也列出来")
     p.set_defaults(func=cmd_list)
 
-    p = sub.add_parser("grab", help="到点自动报名（不传 --activity-id 则交互选择）")
-    p.add_argument("--activity-id", default="", help="活动 id（list 里能看到）")
-    p.add_argument("--at", default="", help="报名开始时间，如 2026-10-22 00:59:59")
-    p.add_argument("--name", default="", help="活动名（通知里用）")
+    p = sub.add_parser("grab", help="到点自动报名（不传 --pick/--name/--activity-id 则交互选择）")
+    p.add_argument("--pick", type=int, default=0, metavar="N",
+                   help="按 list 里的序号直接选（与交互列表顺序一致）")
+    p.add_argument("--name", default="",
+                   help="活动名关键词，或配合 --activity-id 作为通知里的名字")
+    p.add_argument("--activity-id", default="", help="活动 id（一般不用手抄，用 --pick 即可）")
+    p.add_argument("--at", default="", help="报名开始时间；不给则自动从活动列表读取")
     p.add_argument("--lead", type=float, default=100, help="提前多少秒打开页面，默认 100")
     p.add_argument("--window", type=float, default=120, help="开放后重试窗口秒数，默认 120")
     p.add_argument("--headed", action="store_true", help="显示浏览器窗口（默认后台运行）")

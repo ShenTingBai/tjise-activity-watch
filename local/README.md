@@ -22,29 +22,33 @@
 
 ---
 
-## 二、准备（只做一次，约 5 分钟）
+## 二、准备（只做一次）
 
 需要 **Windows 10/11** + **Python 3.10 或更高**。
 
-1. 装 Python：<https://www.python.org/downloads/> 下载安装，**安装时勾选 "Add python.exe to PATH"**。
+**双击 `install.bat`** 就行，它会自动做完四件事：
 
-2. 打开命令提示符（Win+R 输入 `cmd` 回车），安装依赖：
+| 步骤 | 动作 |
+|---|---|
+| 1 | 检查 Python 版本（没装会提示去哪下、要勾哪个选项） |
+| 2 | 装依赖 `playwright`（默认源失败自动换清华镜像） |
+| 3 | 下载浏览器内核（失败换国内镜像；再失败就用你电脑上的 Chrome） |
+| 4 | 自检：能不能拉起浏览器、能不能连上学校站点 |
 
-   ```bat
-   cd /d 你的路径\tjise-activity-watch\local
-   python -m pip install -r requirements.txt
-   ```
+看到 `[OK] 打开成功` 和「安装完成」就可以往下走了。
 
-3. 自检（确认能拉起浏览器、能连上学校站点）：
+> 没有 Python？先装：<https://www.python.org/downloads/>，安装第一屏**务必勾选 "Add python.exe to PATH"**，装完重新双击 `install.bat`。
 
-   ```bat
-   python grab.py selftest
-   ```
+<details>
+<summary>安装脚本失败、想手动装（备选）</summary>
 
-   看到 `[OK] 打开成功` 就说明环境没问题。
-
-> 脚本会**优先使用你电脑上已装的 Chrome**，所以通常不需要再下载几百 MB 的浏览器内核。
-> 如果你的电脑没有 Chrome，先运行一次：`python -m playwright install chromium`。
+```bat
+cd /d 你的路径\tjise-activity-watch\local
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+python grab.py selftest
+```
+</details>
 
 ---
 
@@ -87,18 +91,29 @@
 | 失败 | 每 1.5 秒重试一次，最多重试 120 秒（名额满/未开放都会记下原因） |
 | 结束 | 打印成功/失败结论；配了飞书 webhook 的话同时发一张卡片 |
 
-**或者用命令行指定**（适合提前写好、放在后台跑）：
+**或者用命令行指定**（适合提前写好、放在后台跑）。两种都行：
 
 ```bat
+:: 按 list 里的序号（推荐，不用手抄活动 id 和时间）
+python grab.py grab --pick 1
+
+:: 按活动名关键词（只匹配到一个才继续）
+python grab.py grab --name 网络安全
+
+:: 显式指定（老办法，id 和报名时间都自己填）
 python grab.py grab --activity-id 2ae75dd103654543b1a8b97053adf4a6 ^
                     --at "2026-10-22 00:59:59" ^
                     --name "网络安全·数字时代大长城"
 ```
 
+`--pick` / `--name` 与 `3-检查登录和活动.bat` 打印的序号是同一份顺序；用这两种方式时不再二次确认，直接进入等待抢报名。序号对不上时脚本会告诉你当前有几个，匹配到多个重名活动时会列出来让你改用序号——不会瞎猜一个报名。
+
 常用参数：
 
 | 参数 | 作用 | 默认 |
 |---|---|---|
+| `--pick N` | 按 list 的序号直接选 | 不用（则交互选择） |
+| `--name 关键词` | 按活动名挑选；配合 `--activity-id` 时只作通知名 | 空 |
 | `--lead 100` | 提前多少秒打开页面 | 100 |
 | `--window 120` | 开放后最多重试多少秒 | 120 |
 | `--headed` | 显示浏览器窗口（默认后台静默） | 关 |
@@ -112,6 +127,9 @@ python grab.py grab --activity-id 2ae75dd103654543b1a8b97053adf4a6 ^
 
 | 现象 | 原因 / 处理 |
 |---|---|
+| 双击 bat 窗口一闪就没 | 先双击 `install.bat` 跑一遍，它会说明缺什么；也可以 Win+R 输 `cmd`，把 bat 拖进去回车，看完整报错 |
+| `[X] 没有找到 Python` | 装 Python 时没勾 "Add python.exe to PATH"，重装或手动把 Python 加进 PATH |
+| `[X] 依赖没装好（缺 playwright）` | 双击 `install.bat` |
 | `[X] 登录态已失效` | token 过期（约 17 小时），重做第 1 步 |
 | `[i] 没有可报名（未报名且已公布报名时间）的活动` | 活动还没公布报名时间，或你都已经报了 |
 | `[X] 没抢到：code:xxx ...` | 服务端拒绝：名额已满 / 未到开放时间 / 活动已结束。可以手动打开活动页再试 |
@@ -124,16 +142,18 @@ python grab.py grab --activity-id 2ae75dd103654543b1a8b97053adf4a6 ^
 
 ```
 local/
-├─ grab.py                 主脚本（登录 / 查活动 / 抢报名 / 自检）
-├─ requirements.txt        唯一的依赖：playwright
-├─ config.example.json     可选：飞书群机器人 webhook（复制成 config.json 再填）
-├─ 1-登录.bat              双击：手动登录一次
-├─ 2-抢活动.bat            双击：交互式选择并到点抢
-├─ 3-检查登录和活动.bat    双击：看登录态 + 列活动
-└─ data/                   运行后自动生成
-   ├─ session.json         你的 token 等登录信息（⚠️ 别外传、别提交到 git）
-   ├─ storage_state.json   浏览器登录态（cookie + localStorage）
-   └─ grab.log             运行日志（不含密码/验证码/token/姓名/学号）
+├─ install.bat              首次使用双击一次：装依赖 + 内核 + 自检
+├─ _py.bat                  三个 bat 共用的 Python 探测（缺环境时提示去装）
+├─ grab.py                  主脚本（登录 / 查活动 / 抢报名 / 自检）
+├─ requirements.txt         唯一的依赖：playwright
+├─ config.example.json      可选：飞书群机器人 webhook（复制成 config.json 再填）
+├─ 1-登录.bat               双击：手动登录一次
+├─ 2-抢活动.bat             双击：交互式选择并到点抢
+├─ 3-检查登录和活动.bat     双击：看登录态 + 列活动
+└─ data/                    运行后自动生成
+   ├─ session.json          你的 token 等登录信息（⚠️ 别外传、别提交到 git）
+   ├─ storage_state.json    浏览器登录态（cookie + localStorage）
+   └─ grab.log              运行日志（不含密码/验证码/token/姓名/学号）
 ```
 
 ## 六、和服务器版有什么不同
