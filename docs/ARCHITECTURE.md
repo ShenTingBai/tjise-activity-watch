@@ -53,6 +53,9 @@
 | `scripts/watchlist_runner.py` | 每分钟对齐清单，到点 `systemd-run` 拉起抓取 | cron |
 | `scripts/trigger_server.py` | HTTP 一键触发（`/run/<token>`） | 手机浏览器 |
 | `deploy/server_refresh.js` | 常驻守护：每 2h 校验并回写会话 | systemd |
+| `deploy/auto_login.py` | 失效时无人值守重登：验证码 OCR + 页面提交 + 原子写会话 | timer（5 分钟） |
+| `deploy/grab_signup.py` | 到点进详情页点「立即报名」，结果私聊回报 | watchlist_runner |
+| `deploy/set_credentials.py` | 交互写入 `credentials.json`（唯一放账号密码的地方） | 人工一次 |
 | `bot/bot.js` | 飞书长连接：@ 查询、私聊按钮回调 | systemd |
 
 ## 接口清单
