@@ -85,8 +85,10 @@ window.onBackend = {
       refresh(true);
       return;
     }
+    const reason = String(payload.reason || "未知原因")
+      .replace(/^\[X\]\s*/, "").replace(/^没抢到[：:]\s*/, "");
     setResult(ok ? "报名成功：" + stripLabel(payload.label)
-                 : "没抢到：" + (payload.reason || "未知原因"), ok);
+                 : "没抢到：" + reason, ok);
     // 结束后重新拉一次列表：已报名的行要变灰
     refresh(true);
   },
