@@ -37,11 +37,22 @@ SNAPSHOTS = {
 
 
 def run(cmd: list[str], cwd: Path) -> str:
-    res = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
+    # Windows 上 git 的输出是 UTF-8，默认按 GBK 解会抛 UnicodeDecodeError（线程里静默丢掉输出），
+    # 所以显式指定编码并容错——我们要的只是退出码。
+    res = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True,
+                         encoding="utf-8", errors="replace")
     if res.returncode != 0:
         raise SystemExit("命令失败：%s\n%s\n%s"
                          % (" ".join(cmd), res.stdout[-1200:], res.stderr[-1200:]))
     return res.stdout
+
+
+def copy_contents(src: Path, dst: Path) -> None:
+    """把 src 里的东西铺到 dst 根上（成品分支要让内容落在根目录，而不是 src/ 子目录）。"""
+    shutil.copytree(src, dst, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(
+                        "config.json", "data", "dist", "reports",
+                        "__pycache__", "node_modules", "*.pyc"))
 
 
 def copy_tree(src: Path, dst: Path) -> None:
@@ -66,7 +77,7 @@ def build_branch(name: str, subdir: str, extras: list[str], dry: bool) -> None:
             shutil.rmtree(entry, ignore_errors=True) if entry.is_dir() else entry.unlink()
         run(["git", "rm", "-rf", "--quiet", "."], tmp)
 
-        copy_tree(ROOT / subdir, tmp)
+        copy_contents(ROOT / subdir, tmp)
         for extra in extras:
             copy_tree(ROOT / extra, tmp)
 
@@ -88,12 +99,26 @@ def build_branch(name: str, subdir: str, extras: list[str], dry: bool) -> None:
         if dry:
             print("   dry-run，不推送")
             return
-        run(["git", "push", "--quiet", "--force", "origin",
+        # 临时克隆的 origin 指向本地仓库（快、不用网络），但分支要推到 GitHub，
+        # 所以这里显式用真实远端地址，而不是 "origin"。
+        run(["git", "push", "--quiet", "--force", REMOTE,
              "HEAD:refs/heads/%s" % name], tmp)
         print("   已推送 origin/%s" % name)
 
 
+def remote_url() -> str:
+    url = run(["git", "remote", "get-url", "origin"], ROOT).strip()
+    if not url:
+        raise SystemExit("取不到 origin 地址")
+    return url
+
+
+REMOTE = ""
+
+
 def main() -> int:
+    global REMOTE
+    REMOTE = remote_url()
     ap = argparse.ArgumentParser(description="生成服务器版/本机版分发分支")
     ap.add_argument("--dry-run", action="store_true", help="只建不推")
     ap.add_argument("--only", choices=sorted(SNAPSHOTS), help="只处理一条分支")

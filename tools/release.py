@@ -34,7 +34,8 @@ SERVER_EXCLUDE = {"config.json", "data", "dist", "reports",
 
 
 def run(cmd: list[str], cwd: Path = ROOT, env: dict | None = None) -> str:
-    res = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, env=env)
+    res = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, env=env,
+                         encoding="utf-8", errors="replace")
     if res.returncode != 0:
         raise SystemExit("命令失败：%s\n%s\n%s"
                          % (" ".join(cmd), res.stdout[-1500:], res.stderr[-1500:]))
@@ -104,7 +105,8 @@ def release_notes(tag: str) -> str:
 def publish(tag: str, assets: list[Path]) -> None:
     env = dict(os.environ, HTTPS_PROXY=PROXY)
     exists = subprocess.run([str(GH), "release", "view", tag],
-                            capture_output=True, text=True, env=env)
+                            capture_output=True, text=True, env=env,
+                            encoding="utf-8", errors="replace")
     if exists.returncode == 0:
         print("   Release %s 已存在，覆盖附件" % tag)
         run([str(GH), "release", "upload", tag, *[str(a) for a in assets],
