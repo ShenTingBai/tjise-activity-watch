@@ -21,7 +21,7 @@
 
 ### 2.1 守护进程（`tjise-login.service`）
 
-`deploy/server_refresh.js --daemon`：
+`server/deploy/server_refresh.js --daemon`：
 
 - 每 2 小时用当前 token 调一次 `listActivity` 校验；
 - 校验通过 → 原子回写 `storage_state.json` 与 `data/session.json`（`saved_at` 刷新）；
@@ -69,7 +69,7 @@
 按 3 次重试算，一次自动登录的成功率约 `1 - 0.4³ ≈ 93.6%`，剩下的交给告警和人工兜底。
 
 失败过的路线（别再走）：形态学开运算（笔画只有 3~4px，直接毁字）、按颜色抠线（3/20）、
-渲染字体模板匹配（4~6/20）、真实字形 kNN（留一法 1/17）。这些脚本留在 `scripts/dev/` 与服务器的 `probe/` 里备查。
+渲染字体模板匹配（4~6/20）、真实字形 kNN（留一法 1/17）。这些脚本留在 `server/scripts/dev/` 与服务器的 `probe/` 里备查。
 
 ## 4. 凭据管理
 
@@ -90,7 +90,7 @@ cd /root/tjise-login && python3 set_credentials.py
 
 自动重登连续失败时，走人工：
 
-1. 本机 `python scripts/login.py`，在弹出的 Chrome 里登录一次；
+1. 本机 `python server/scripts/login.py`，在弹出的 Chrome 里登录一次；
 2. 导出 `data/storage_state.json`（扁平 `{"xgUniToken": "...", ...}` 或 Playwright 完整 state 都支持）；
 3. `scp` 到服务器 `/root/tjise-login/`，权限 600；
 4. `cd /root/tjise-login && node server_refresh.js`（单跑一次，立刻校验并回写会话）；

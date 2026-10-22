@@ -45,9 +45,9 @@
 命令行：
 
 ```bash
-python3 scripts/watchlist.py list
-python3 scripts/watchlist.py add --id 2ae75dd103654543b1a8b97053adf4a6 --name "活动名" --at "2026-10-30 12:00:00"
-python3 scripts/watchlist.py remove --id 2ae75dd103654543b1a8b97053adf4a6
+python3 server/scripts/watchlist.py list
+python3 server/scripts/watchlist.py add --id 2ae75dd103654543b1a8b97053adf4a6 --name "活动名" --at "2026-10-30 12:00:00"
+python3 server/scripts/watchlist.py remove --id 2ae75dd103654543b1a8b97053adf4a6
 ```
 
 `add` 对同一个 id 幂等（重复 add 覆盖，不会出现两条）。

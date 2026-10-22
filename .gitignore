@@ -1,15 +1,22 @@
-# 配置文件：见 config.example.json；含推送 webhook / 密钥，属于这台机器，不入库
+# 配置文件：见 server/config.example.json；含推送 webhook / 密钥，属于这台机器，不入库
 config.json
+server/config.json
+local/config.json
 
 # 运行时数据：token、会话、浏览器登录态、抓取结果、机器人去重缓存
 data/
+server/data/
+local/data/
 bot/data/
+server/bot/data/
 
-# 生成物：日报和结构化结果跑一次就变，不入库（要留档就放 reports/ 之外）
+# 生成物：日报和结构化结果跑一次就变，不入库
 reports/
+server/reports/
 
 # 构建产物：模板 zip 按需重新打包
 dist/
+server/dist/
 
 # 流程产物：计划与结果 YAML
 .claude/

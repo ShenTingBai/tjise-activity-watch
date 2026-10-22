@@ -17,6 +17,11 @@ import json
 import os
 import subprocess
 import sys
+
+try:  # Windows 控制台默认 GBK，打 ✓/✗ 会直接抛 UnicodeEncodeError；统一按 UTF-8 输出
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent

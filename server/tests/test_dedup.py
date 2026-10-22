@@ -12,8 +12,14 @@
 """
 import json
 import shutil
+import os
 import subprocess
 import sys
+
+try:  # Windows 控制台默认 GBK，打 ✓/✗ 会直接抛 UnicodeEncodeError；统一按 UTF-8 输出
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 from datetime import datetime
 from pathlib import Path
 
@@ -29,7 +35,8 @@ def fetch_pending():
     proc = subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "fetch.py")],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        universal_newlines=True, encoding="utf-8", cwd=str(ROOT))
+        universal_newlines=True, encoding="utf-8", cwd=str(ROOT),
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     out = proc.stdout or ""
     if proc.returncode != 0 or "SUMMARY_JSON_BEGIN" not in out:
         raise RuntimeError("抓取失败：\n" + out[-800:])

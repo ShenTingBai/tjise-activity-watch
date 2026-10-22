@@ -5,7 +5,7 @@
 ## 2026-10-22（本机整理 + 旧机清理）
 
 - **项目结构整理**：README 从 752 行拆成「入口 + 5 篇专题文档」；历史文档移入 `docs/archive/`；
-  一次性排查脚本移入 `scripts/dev/`；离线测试移入 `tests/`；新增 `config.example.json`、`requirements.txt`。
+  一次性排查脚本移入 `server/scripts/dev/`；离线测试移入 `server/tests/`；新增 `config.example.json`、`requirements.txt`。
 - **静默失败修复**：`remind.py` / `scan.py` 在 token 失效、无 token、网络异常时原来直接 `return 2` 不留痕迹，
   现改为各打一行带原因的日志（不新增告警，告警仍由 `run.py` 与探针负责）。
 - **旧服务器清理**：`<旧服务器IP>` 上的应用目录、systemd 单元、crontab 残留行、迁移备份、
