@@ -8,7 +8,7 @@
     python make_portable.py --keep     # 保留上次的 python/ 目录，只换应用文件
 
 做法：官方嵌入式 Python（含 tkinter 的补齐件）+ 在这台机器上 pip 装 playwright/pillow，
-再把 grab.py / gui.py 拷进去。浏览器不打包——Windows 10/11 自带 Edge，
+再把 grab.py / app.py / ui 拷进去。浏览器不打包——Windows 10/11 自带 Edge，
 grab.py 会按 Chrome → Edge → 自带内核的顺序找，省掉 150MB+。
 
 @author LiXinwen
@@ -40,11 +40,13 @@ PIP_PACKAGES = ["playwright>=1.40", "pillow>=9.0"]
 
 # 应用本体：脚本 + 双击入口 + 说明
 APP_FILES = [
-    "grab.py", "gui.py", "install.bat", "_py.bat", "1-登录.bat",
+    "grab.py", "app.py", "install.bat", "_py.bat", "1-登录.bat",
     "2-抢活动.bat", "3-检查登录和活动.bat", "4-图形界面.bat",
     "requirements.txt", "config.example.json", "README.md", "gui-preview.png",
     "启动不了点我.txt",
 ]
+
+UI_DIR = "ui"                    # 界面本体（HTML/CSS/JS）
 
 PY_DIR_NAME = "python"          # 便携解释器放在这里
 LAUNCHER = "启动.bat"
@@ -102,7 +104,7 @@ def write_pth(py: Path) -> None:
     """写 ._pth（复用已有解释器时也要重写一遍）。
 
     必须带 "."：有 ._pth 时 Python 不再自动把当前目录放进 sys.path，
-    而 gui.py 要 import 同目录的 grab.py，启动器又是 cd 到本目录再跑。
+    而 app.py 要 import 同目录的 grab.py，启动器又是 cd 到本目录再跑。
     "import site" 一行也不能少，否则 pip 装的 playwright / PIL 找不到。
     """
     pth = next(py.glob("python*._pth"), None)
@@ -194,6 +196,10 @@ def copy_app(out: Path) -> None:
             log("  跳过（不存在）：%s" % name)
             continue
         shutil.copy2(src, out / name)
+    # ui/ 是界面本体，整目录复制
+    ui_src = HERE / UI_DIR
+    if ui_src.is_dir():
+        shutil.copytree(ui_src, out / UI_DIR, dirs_exist_ok=True)
     # 协议跟仓库同源：绿色版也要能看出"能做什么、不能做什么"
     lic = HERE.parent / "LICENSE"
     if lic.exists():

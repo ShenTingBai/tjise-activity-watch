@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>天软校园活动 · 报名值守台</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="head">
+    <div class="head-brand">
+      <h1>天软校园活动</h1>
+      <p>报名值守台 · 只登录自己的账号，保持电脑唤醒、网络畅通</p>
+    </div>
+    <div class="head-actions">
+      <span id="pill" class="pill" data-state="unknown">登录态未知</span>
+      <button id="btn-help" class="btn">使用说明</button>
+      <button id="btn-refresh" class="btn">刷新</button>
+      <button id="btn-login" class="btn btn-primary">登录 / 重新登录</button>
+    </div>
+  </header>
+
+  <section class="toolbar">
+    <input id="q" class="search" type="search" placeholder="搜索活动名，如「网络安全」">
+    <div class="chips" id="chips" role="tablist">
+      <button class="chip is-on" data-status="all">全部</button>
+      <button class="chip" data-status="free">未报名</button>
+      <button class="chip" data-status="signed">已报名</button>
+    </div>
+    <select id="time" class="select">
+      <option value="all">时间不限</option>
+      <option value="today">今天开放</option>
+      <option value="week">本周开放</option>
+    </select>
+    <select id="sort" class="select">
+      <option value="open">按开放时间</option>
+      <option value="name">按活动名</option>
+    </select>
+    <span id="count" class="count">—</span>
+  </section>
+
+  <section class="table-card">
+    <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th class="c-idx">#</th>
+          <th class="c-left">距开放</th>
+          <th class="c-time">报名开始</th>
+          <th class="c-state">状态</th>
+          <th class="c-name">活动名</th>
+          <th class="c-place">地点</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    </div>
+    <div id="empty" class="empty" hidden>
+      <p class="empty-title">这里还没有活动</p>
+      <p class="empty-text">点右上角「刷新」拉一次列表；如果提示登录态失效，先点「登录」。</p>
+    </div>
+  </section>
+
+  <section class="action">
+    <div class="action-line">
+      <span id="selected" class="selected">未选活动 · 在上面的列表里点一行</span>
+      <label class="check"><input type="checkbox" id="headed"> 显示浏览器窗口（看着它点）</label>
+      <button id="btn-open" class="btn">打开数据目录</button>
+    </div>
+    <div class="action-line">
+      <button id="btn-grab" class="btn btn-primary btn-lg" disabled>到点抢选中的活动</button>
+      <button id="btn-stop" class="btn" disabled>停止</button>
+      <span id="countdown" class="countdown"></span>
+    </div>
+    <p id="result" class="result" hidden></p>
+  </section>
+
+  <section class="log-card">
+    <div class="log-head">
+      <span>运行日志</span>
+      <span class="log-tools">
+        <button id="btn-log-toggle" class="btn btn-mini">展开</button>
+        <button id="btn-log-clear" class="btn btn-mini">清空</button>
+      </span>
+    </div>
+    <pre id="log" class="log"></pre>
+  </section>
+</div>
+
+<dialog id="help" class="modal">
+  <h2 id="help-title">报名值守台</h2>
+  <p id="help-sub" class="modal-sub"></p>
+  <ol id="help-steps" class="steps"></ol>
+  <p id="help-note" class="modal-note"></p>
+  <form method="dialog" class="modal-foot">
+    <button class="btn btn-primary">知道了</button>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>

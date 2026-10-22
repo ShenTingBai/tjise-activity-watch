@@ -165,8 +165,12 @@ python grab.py grab --activity-id 2ae75dd103654543b1a8b97053adf4a6 ^
 界面只是个壳——它调的仍是 `grab.py` 的子命令，所以命令行能做的事这里都能做，出问题也能对照日志排查。
 界面启动后用的是 `pythonw`，不会再额外留一个黑窗口。
 
-圆角卡片是用 Pillow 现场画的（tkinter 自己画不出抗锯齿圆角），所以依赖里多了 `pillow`；
-`install.bat` 会一起装上，已经装过老版本的同学再跑一次 `install.bat` 即可。
+窗口用 **pywebview + WebView2** 渲染（`local/app.py` 起窗，`local/ui/` 下是 HTML/CSS/JS）。
+WebView2 运行时 Windows 10/11 一般自带；万一窗口是空白，装一次
+[WebView2 运行时](https://developer.microsoft.com/microsoft-edge/webview2/) 即可。
+依赖里因此多了 `pywebview`，`install.bat` 会一起装上，已经装过老版本的同学再跑一次 `install.bat`。
+
+想调界面样式又不想登录？在 `local` 目录执行 `python app.py --demo`，会用几条假活动把界面跑起来。
 
 ---
 
@@ -179,7 +183,7 @@ python grab.py grab --activity-id 2ae75dd103654543b1a8b97053adf4a6 ^
 | `[X] 依赖没装好（缺 playwright）` | 双击 `install.bat` |
 | 界面报 `ModuleNotFoundError: No module named 'PIL'` | 老版本装过依赖，重跑一次 `install.bat` 补上 pillow |
 | `[X] 登录态已失效` | token 过期（约 17 小时），重做第 1 步 |
-| 界面打不开 / 双击后没反应 | 先用 `install.bat` 自检；或运行 `python gui.py` 看报错（界面用系统自带 tkinter，官方 Python 安装包默认包含） |
+| 界面打不开 / 双击后没反应 | 先用 `install.bat` 自检；或在 local 目录运行 `python app.py` 看报错；窗口空白多半是缺 WebView2 运行时 |
 | `[i] 没有可报名（未报名且已公布报名时间）的活动` | 活动还没公布报名时间，或你都已经报了 |
 | `[X] 没抢到：code:xxx ...` | 服务端拒绝：名额已满 / 未到开放时间 / 活动已结束。可以手动打开活动页再试 |
 | `[X] 打不开登录页` | 校园网/代理问题，或需要连学校 VPN |
@@ -197,7 +201,9 @@ local/
 ├─ install.bat              首次使用双击一次：装依赖 + 内核 + 自检
 ├─ _py.bat                  四个 bat 共用的 Python 探测（缺环境时提示去装）
 ├─ grab.py                  主脚本（登录 / 查活动 / 抢报名 / 自检）
-├─ gui.py                   图形界面（tkinter + Pillow 圆角，调用 grab.py 子命令）
+├─ app.py                   图形界面外壳（pywebview 起窗 + 把 grab.py 暴露给页面）
+├─ ui/                      界面本体：index.html / styles.css / app.js
+├─ gui.py                   旧版 tkinter 界面（已停用，保留作对照）
 ├─ gui-preview.png          界面预览图（README 用）
 ├─ requirements.txt         依赖清单：playwright + pillow
 ├─ config.example.json      可选：飞书群机器人 webhook（复制成 config.json 再填）
