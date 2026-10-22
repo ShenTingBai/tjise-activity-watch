@@ -316,6 +316,103 @@ class RoundEntry(tk.Canvas):
         self.tag_lower(self._ring)
 
 
+class WelcomeDialog(tk.Toplevel):
+    """首启动的使用说明。
+
+    舍友拿到的是一个 zip，双击后第一眼是空表格——不知道要先登录、
+    也不知道按钮点下去会在到点自动提交。这里用三句话讲完，勾选后可不再弹。
+    """
+
+    STEPS = (
+        ("1", "先登录",
+         "点右上角「登录 / 重新登录」，在弹出的 Chrome 里登录一次。\n"
+         "登录态大约能用 17 小时，过期后点同一个按钮重登即可。"),
+        ("2", "选活动",
+         "在列表里点一行，再点「到点抢选中的活动」。\n"
+         "程序会等到报名开放的那一刻自动提交，不用你盯着屏幕。"),
+        ("3", "保持在线",
+         "电脑别睡眠、别断网；界面可以最小化，但不要关掉。\n"
+         "失败原因会写在下面的运行日志里。"),
+    )
+
+    def __init__(self, root: tk.Tk, on_close):
+        super().__init__(root)
+        self.withdraw()                      # 先摆好位置再显示，避免闪一下
+        self.on_close = on_close
+        self.title("使用说明")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(root)
+
+        card = Card(self, radius=16, padding=(28, 24, 28, 22), shadow=True,
+                    width=640, height=472)
+        card.pack(fill="both", expand=True, padx=16, pady=16)
+        card.pack_propagate(False)
+        body = card.body
+
+        tk.Label(body, text="欢迎使用 · 报名值守台", bg=CARD, fg=TEXT,
+                 font=_font(16, True), anchor="w").pack(fill="x")
+        tk.Label(body, text="天软校园活动 · 本机版　|　只为你自己的账号抢报名",
+                 bg=CARD, fg=MUTED, font=_font(9), anchor="w").pack(
+            fill="x", pady=(4, 16))
+
+        for num, title, detail in self.STEPS:
+            row = tk.Frame(body, bg=CARD)
+            row.pack(fill="x", pady=(0, 12))
+            badge = tk.Canvas(row, width=26, height=26, bg=CARD,
+                              highlightthickness=0)
+            badge.create_image(0, 0, anchor="nw",
+                               image=IMAGES.card(26, 26, ACCENT, radius=9,
+                                                 shadow=False, outline=ACCENT))
+            badge.create_text(13, 13, text=num, fill="#FFFFFF",
+                              font=_font(9, True))
+            badge.pack(side="left", padx=(0, 12))
+            text = tk.Frame(row, bg=CARD)
+            text.pack(side="left", fill="x", expand=True)
+            tk.Label(text, text=title, bg=CARD, fg=TEXT, font=_font(11, True),
+                     anchor="w").pack(fill="x")
+            tk.Label(text, text=detail, bg=CARD, fg=MUTED, font=_font(9),
+                     justify="left", anchor="w").pack(fill="x", pady=(3, 0))
+
+        note = tk.Frame(body, bg=SIGNAL_SOFT)
+        note.pack(fill="x", pady=(6, 14))
+        tk.Label(note, text="只给本人账号使用。不要借别人的账号，也不要同时开多个。",
+                 bg=SIGNAL_SOFT, fg=SIGNAL_DEEP, font=_font(9),
+                 justify="left", anchor="w", wraplength=520,
+                 padx=14, pady=10).pack(fill="x")
+
+        foot = tk.Frame(body, bg=CARD)
+        foot.pack(fill="x", side="bottom")
+        # 默认不勾：新用户第一次该看到说明，勾了才是"别再来烦我"
+        self.no_more = tk.BooleanVar(value=False)
+        tk.Checkbutton(foot, text="下次启动不再显示", variable=self.no_more,
+                       bg=CARD, fg=TEXT, activebackground=CARD, selectcolor=CARD,
+                       bd=0, highlightthickness=0, font=_font(9)).pack(side="left")
+        RoundButton(foot, "知道了，开始用", self._done, kind="primary",
+                    width=132, height=38).pack(side="right")
+
+        self._center_on(root)
+        self.deiconify()
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._done)
+        self.bind("<Escape>", lambda _e: self._done())
+        self.bind("<Return>", lambda _e: self._done())
+        self.after(120, self.focus_force)
+
+    def _center_on(self, root: tk.Tk):
+        self.update_idletasks()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        x = root.winfo_rootx() + max((root.winfo_width() - w) // 2, 0)
+        y = root.winfo_rooty() + max((root.winfo_height() - h) // 3, 0)
+        self.geometry("%dx%d+%d+%d" % (w, h, max(x, 0), max(y, 0)))
+
+    def _done(self):
+        try:
+            self.on_close(self.no_more.get())
+        finally:
+            self.destroy()
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -343,6 +440,19 @@ class App:
         self._build_ui()
         self.root.after(100, self._pump)
         self.root.after(400, self.refresh, True)
+        # 说明弹窗排在自检之后：先让表格和状态栏有内容，弹窗背后不是一片空
+        self.root.after(700, self._maybe_welcome)
+
+    def _maybe_welcome(self):
+        if self._ui.get("welcome_seen"):
+            return
+        WelcomeDialog(self.root, self._welcome_done)
+
+    def _welcome_done(self, never_again: bool):
+        self.root.focus_force()
+        if never_again:
+            self._ui["welcome_seen"] = True
+            _save_ui(self._ui)
 
     def _center(self):
         self.root.update_idletasks()
@@ -537,9 +647,12 @@ class App:
 
     def _do_save_prefs(self):
         self._save_job = None
-        _save_ui({"filter": self.filter_var.get(),
-                  "only_free": bool(self.only_free.get()),
-                  "log_expanded": bool(self._log_expanded)})
+        # 合并写：ui.json 里还有 welcome_seen 之类不归这里管的键，
+        # 整份覆盖会把它们抹掉，弹窗就又开始每次都弹。
+        self._ui.update({"filter": self.filter_var.get(),
+                         "only_free": bool(self.only_free.get()),
+                         "log_expanded": bool(self._log_expanded)})
+        _save_ui(self._ui)
 
     def _resize_for_log(self, expanded: bool):
         """窗高按「基准高度 + 展开增量」算。

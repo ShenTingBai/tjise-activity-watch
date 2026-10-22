@@ -3,3 +3,6 @@
 # 例外：Windows 批处理必须是 CRLF，cmd.exe 解析 LF-only 的 goto/label 会出错
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# Windows 用户双击打开的文本：CRLF，否则旧记事本会挤成一行
+*.txt text eol=crlf

@@ -43,6 +43,7 @@ APP_FILES = [
     "grab.py", "gui.py", "install.bat", "_py.bat", "1-登录.bat",
     "2-抢活动.bat", "3-检查登录和活动.bat", "4-图形界面.bat",
     "requirements.txt", "config.example.json", "README.md", "gui-preview.png",
+    "启动不了点我.txt",
 ]
 
 PY_DIR_NAME = "python"          # 便携解释器放在这里

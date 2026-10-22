@@ -12,6 +12,7 @@ if not errorlevel 1 set "PY=python"
 if defined PY goto :check_dep
 
 echo [X] 没有找到 Python。请先双击 install.bat 完成安装。
+echo     打不开界面时看同目录的 启动不了点我.txt。
 exit /b 1
 
 :check_dep
@@ -19,6 +20,7 @@ exit /b 1
 if not errorlevel 1 goto :run
 
 echo [X] 依赖没装好（缺 playwright）。请先双击 install.bat。
+echo     打不开界面时看同目录的 启动不了点我.txt。
 exit /b 1
 
 :run
