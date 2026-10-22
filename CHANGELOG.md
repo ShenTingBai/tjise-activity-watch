@@ -2,6 +2,16 @@
 
 按时间倒序。只记"改了什么、为什么"，不逐文件列清单。
 
+## 2026-10-22（仓库拆成两套用法 + 入库）
+
+- **结构**：仓库根分成 `server/`（部署到 Linux 的那套，保持服务器目录形状）与 `local/`（免服务器的单文件工具）；
+  README 顶部新增两版对照表，说明各自跑在哪、能力、依赖与适用场景。
+- **登录脚本入库**：`auto_login.py` / `grab_signup.py` / `set_credentials.py` 原先只存在于 `D:/@Temp`（会被周清理删掉）
+  和服务器上，现按服务器落点归入 `server/deploy/`，并补 `server/deploy/README.md` 落点对照表。
+- **口令清理**：`deploy/legacy/` 两个安装脚本里硬编码的 TRIGGER_TOKEN 改为读环境变量，归档 README 里的带 token 链接改为占位符。
+- **测试跨平台**：离线测试在 Windows GBK 控制台下打 `✓` 会抛 UnicodeEncodeError，现统一把 stdout 重配为 UTF-8，
+  子进程补 `PYTHONIOENCODING=utf-8`。
+
 ## 2026-10-22（本机整理 + 旧机清理）
 
 - **项目结构整理**：README 从 752 行拆成「入口 + 5 篇专题文档」；历史文档移入 `docs/archive/`；
