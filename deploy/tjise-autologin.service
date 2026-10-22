@@ -1,0 +1,12 @@
+[Unit]
+Description=tjise 无人值守重新登录（token_probe 判失败才动作）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/tjise-login
+# 告警私聊 owner 需要 open_id，与 tjise-bot 保持一致
+Environment=PRIVATE_OWNER_OPEN_ID=__OWNER_OPEN_ID__
+ExecStart=/usr/bin/python3 /root/tjise-login/auto_login.py
+TimeoutStartSec=300

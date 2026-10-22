@@ -1,0 +1,18 @@
+{
+  "notify": {
+    "channel": "飞书群",
+    "platform": "feishu",
+    "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "secret": "",
+    "feishu_app": {
+      "app_id": "cli_xxxxxxxxxxxxxxxx",
+      "app_secret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "api_base": "https://open.feishu.cn/open-apis"
+    },
+    "users_file": "bot/data/users.json",
+    "private_chat_id": "oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  },
+  "filter": {
+    "keyword_blocklist": []
+  }
+}
