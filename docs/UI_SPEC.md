@@ -1,19 +1,21 @@
 # 本机版界面重做任务书（给 Codex）
 
-这份文档是「界面该怎么长、怎么接」的权威说明。**实现契约在 §5，照着写就行；
-`local/app.py` 和 `local/grab.py` 一行都不要改。**
+这份文档是「界面该怎么长、怎么接」的权威说明。**实现契约在 §5，照着写就行。**
+本轮同时扩展本机多活动计划：`local/app.py` 负责计划协调，`local/grab.py` 保持单活动报名流程，
+并把活动结束时间透传给界面。
 
 ---
 
 ## 1. 范围
 
-| 可以重写 | 绝对不能动 |
+| 可以重写 | 本轮仍不能动 |
 |---|---|
-| `local/ui/index.html` | `local/app.py`（方法名、参数、返回结构、事件名） |
-| `local/ui/styles.css` | `local/grab.py`（登录、拉列表、抢报名的业务） |
-| `local/ui/app.js` | `local/requirements.txt`、启动 bat |
+| `local/ui/index.html` | `local/requirements.txt`、启动 bat |
+| `local/ui/styles.css` | `server/**`、`local/data/**` |
+| `local/ui/app.js` | 学校站点请求方式、登录与单活动页面操作 |
 
-界面可以完全推翻重做，只要 §5 的接口调用和 §6 的文案信息量不丢。
+界面可以完全推翻重做，只要 §5 的接口调用和 §6 的文案信息量不丢。单活动 `grab()` 保留兼容，
+新的多活动入口使用 `start_plan()`；不能通过开多个应用实例代替计划协调。
 
 ## 2. 用户与场景
 
@@ -25,9 +27,10 @@
 
 优先级：
 1. 一眼看出现在什么状态（登录有没有过期、有多少能报、下一个还有多久开放）
-2. 三步完成一次抢报名：选活动 → 点按钮 → 等结果
-3. 失败看得懂（名额满 / 页面没放开 / 登录失效 / 断网）
-4. 气质克制、干净，不像后台管理系统
+2. 可以把多场活动加入一个计划；相同报名开放时刻的任务同时提交，不同批次分别等待
+3. 选择前能看出活动举办时段冲突；冲突覆盖整个计划，不只检查同一开放批次
+4. 失败看得懂（名额满 / 页面没放开 / 登录失效 / 断网）且单项失败不覆盖其他任务
+5. 气质克制、干净，不像后台管理系统
 
 ## 3. 真实场景清单（设计必须覆盖）
 
@@ -40,6 +43,9 @@
 | 开放那一刻 | 忙碌态清晰（按钮禁用 + 进度感），别让人以为卡死 |
 | 抢成功 | 强反馈（绿）+ 提示去活动页确认一眼 |
 | 没抢到 | 强反馈（红）+ 具体原因 + 下一步建议 |
+| 同一报名开放时刻的多场活动 | 按活动举办起止时间判断：不重叠可同时加入；重叠时提示只能选其中一场 |
+| 不同报名开放时刻的多场活动 | 可以提前加入计划，按各自开放时刻依次等待；举办时段冲突仍要阻止 |
+| 计划部分成功 | 每场保留自己的成功、失败、已报名或取消状态，计划显示部分完成 |
 | 锁屏/最小化回来 | 状态仍准确，不能停在「正在抢」的假象 |
 | 断网 | 说清是网络问题，不要笼统写「失败」 |
 
@@ -53,9 +59,9 @@
 ├────────────────────────────────────────────────────────────┤
 │ #  │ 距开放 │ 报名开始 │ 状态 │ 活动名        │ 地点       │
 ├────────────────────────────────────────────────────────────┤
-│ 已选：xxx  □显示浏览器窗口                    [打开数据目录] │
-│ [到点抢选中的活动] [停止]           距离开放 00:12:31        │
-│ ✓/✗ 结果条                                                  │
+│ 报名计划：3 场 · 18:47 同时提交 2 场 · 明天 09:00 等待 1 场    │
+│ [开始计划] [停止计划] [清空计划]          □显示浏览器窗口     │
+│ 逐场状态：等待 / 提交中 / 成功 / 失败 / 已取消                 │
 ├────────────────────────────────────────────────────────────┤
 │ 运行日志                                     [展开] [清空]  │
 └────────────────────────────────────────────────────────────┘
@@ -70,10 +76,12 @@
 | 组件 | 状态 |
 |---|---|
 | 状态胶囊 | 未登录(灰) / 有效·约剩 N 小时(绿) / 临近过期(橙,<2h) / 失效(红) / 进行中(蓝) |
-| 主按钮 | 默认 / hover / active / disabled(未选或忙碌) / busy |
-| 表格行 | 默认 / hover / 选中 / 已报名(灰) / 空列表 |
+| 主按钮 | 默认 / hover / active / disabled(无有效计划或忙碌) / busy |
+| 表格行 | 默认 / hover / 计划中 / 活动时段冲突 / 已报名(灰) / 空列表 |
 | 筛选胶囊 | 选中 / 未选中 / hover |
-| 结果条 | 成功(绿) / 失败(红) / 隐藏 |
+| 计划条 | 空 / 已选 / 有冲突 / 运行中 / 部分完成 / 完成 / 已停止 |
+| 任务条 | 等待开放 / 提交中 / 成功 / 已报名 / 失败 / 已取消 |
+| 结果条 | 成功(绿) / 失败(红) / 部分完成(橙) / 隐藏 |
 | 日志 | 收起(6 行) / 展开(十几行) / 空 |
 
 ## 5. 接口契约（权威，按此实现）
@@ -92,7 +100,10 @@
 | `list_activities()` | — | `{ok:true, queued:true}` | `onBackend.activities` |
 | `login()` | — | `{ok:true}` 或 `{ok:false, text}` | `onBackend.done`（`kind:"login"`） |
 | `grab(activity_id, name, at, headed)` | `at` = `YYYY-MM-DD HH:MM:SS` 或空串；`headed` = bool | 同上 | `onBackend.done`（`kind:"grab"`） |
-| `stop()` | — | `{ok:bool, text?}` | 直接返回 |
+| `start_plan(items, headed)` | `items` 为活动对象数组，至少含 `id/name/sign_start/act_start/act_end`；`headed` = bool | `{ok:true, queued:true, plan_id}` 或 `{ok:false,text,conflicts?}` | `onBackend.plan`、`onBackend.task`、`onBackend.plan_done` |
+| `cancel_task(plan_id, task_id)` | 两个字符串 | `{ok:bool, text?}` | `onBackend.task` |
+| `stop_plan(plan_id)` | 计划 id | `{ok:bool, text?}` | `onBackend.task`、`onBackend.plan_done` |
+| `stop()` | — | `{ok:bool, text?}` | 兼容旧 UI：停止当前计划或单活动任务 |
 | `open_data()` | — | `{ok:true}` | 直接返回 |
 | `save_prefs(patch)` | 对象，浅合并写 `data/ui.json` | `{ok:true}` | 直接返回 |
 
@@ -106,11 +117,20 @@
 | `onBackend.activities(payload)` | `{ok:true, items:[...]}` 或 `{ok:false, text, items:[]}` |
 | `onBackend.check(payload)` | `{ok, hours_left, text}` |
 | `onBackend.done(payload)` | `{ok, code, reason, label, kind}`，`kind` 是 `"login"` 或 `"grab"` |
+| `onBackend.plan(payload)` | `{plan_id, status, tasks:[{task_id,activity_id,name,sign_start,act_start,act_end,status}]}` |
+| `onBackend.task(payload)` | `{plan_id, task_id, activity_id, name, sign_start, status, ok?, code?, reason?, detail?}` |
+| `onBackend.plan_done(payload)` | `{plan_id, status, ok, summary}`；`status` 为 `completed` / `partial` / `failed` / `stopped` |
 
 约定：
 - `grab` 的 `ok` 由后端从输出里判断（含「报名成功」且退出码 0），`reason` 已去掉 `[X]` 前缀的来源行。
 - `login` 的 `ok` 只看退出码；成功后**前端自己调一次 `list_activities()`** 刷新列表。
 - `reason` 里可能已经带「没抢到：」这种前缀，展示前请去重（`^\[X\]\s*`、`^没抢到[：:]`）。
+- `start_plan` 在后端再次校验活动 id、报名开放时间、活动举办区间和重复项；前端预检只用于即时提示，不能代替后端校验。
+- `sign_start` 只决定提交批次：完整时间戳相同的任务归为同一批并发启动；不同批次按时间顺序等待。
+- `act_start` / `act_end` 只决定活动举办冲突。按半开区间 `[act_start, act_end)` 比较：
+  `a.start < b.end && b.start < a.end` 才算重叠；起止相接暂不算重叠。字段缺失、非法或结束不晚于开始时，活动不能进入可执行计划。
+- 冲突检查覆盖整个计划，不因活动属于不同报名开放批次而跳过；冲突时保留已有选择并返回冲突双方，不能自动替换。
+- 每个任务都有稳定 `task_id`；单项失败、已报名或取消只更新该任务，其他任务继续。停止计划只取消尚未提交的任务。
 
 ### 5.3 活动项字段
 
@@ -121,18 +141,32 @@
 | `name` | string | 活动名，可能 20+ 字 |
 | `place` | string | 地点，可能为空 |
 | `sign_start` / `sign_end` | string | `YYYY-MM-DD HH:MM:SS`，可能为空 |
-| `act_start` | string | 活动开始时间 |
+| `act_start` / `act_end` | string | 活动举办起止时间；完整本地日期时间，任一缺失或非法都不能通过计划校验 |
 | `signed` | bool | 是否已报名 |
+| `checkin_required` / `checkout_required` | bool \| null | 活动是否要求签到/签退；接口字段未识别或无法归一化时为 `null`，不得当作无需 |
 | `state` | string | 后端给的中文状态：`未开放` / `开放中` / `已报名` |
 | `seconds_to_open` | int \| null | 距报名开放秒数；正数=未开放，≤0=已开放，null=时间未知 |
 
-### 5.4 本地偏好（`data/ui.json`）
+### 5.4 计划和任务状态
+
+计划状态：`ready`（已校验）/ `running`（至少一个任务等待或提交）/ `partial`（有成功也有失败或取消）/
+`completed`（全部结束且无失败）/ `failed`（全部任务失败）/ `stopped`（用户停止，未提交任务已取消）。
+
+任务状态：`queued`（排队）/ `waiting`（等待报名开放）/ `submitting`（提交中）/ `success`（报名成功）/
+`already_signed`（已经报过）/ `failed`（报名失败）/ `canceled`（已取消）。
+
+活动可以同时满足“报名开放批次相同”和“举办时段不重叠”；前者允许并发，后者决定是否允许共存。
+二者不能互相替代。
+
+### 5.5 本地偏好（`data/ui.json`）
 
 | 键 | 含义 |
 |---|---|
 | `welcome_seen` | 首次说明弹窗是否已看过 |
-| `filter` | `{q, status:"all"\|"free"\|"signed", time:"all"\|"today"\|"week", sort:"open"\|"name"}` |
+| `filter` | `{q, status:"all"\|"free"\|"signed", time:"all"\|"today"\|"week", sort:"open"\|"name", checkin:"all"\|"yes"\|"no", checkout:"all"\|"yes"\|"no"}` |
 | `log_open` | 日志是否展开 |
+| `headed` | 计划内任务是否显示浏览器窗口 |
+| `sound` | 计划结束时是否播放提示音 |
 
 ## 6. 文案要求
 
@@ -173,15 +207,21 @@
 ## 9. 验收清单
 
 - [ ] 未登录 / 拉取失败 / 列表为空 三种状态都有明确引导
-- [ ] 选行 → 主按钮可用；不选禁用；忙碌时按钮状态正确，能停止
+- [ ] 多选活动后，举办时段重叠项被明确提示并阻止启动；不重叠项可保留
+- [ ] 同一 `sign_start` 的非冲突活动同时提交；不同 `sign_start` 的批次依次等待
+- [ ] 冲突检查覆盖不同开放批次；缺失/非法活动时段不能静默进入计划
+- [ ] 计划启动前后端都做校验，返回稳定 `plan_id/task_id`
+- [ ] 单项成功、失败、已报名、取消不会覆盖其他任务；计划能显示部分完成
+- [ ] 计划停止只取消尚未提交任务，已提交任务保留真实状态
 - [ ] 「距开放」每秒更新，且不重排整表、不闪烁
+- [ ] 可按活动是否需要签到、签退筛选；未知字段只在「全部」中保留，不误判为无需
 - [ ] 抢报名成功/失败 结果条颜色+文案正确，一眼可见
 - [ ] 登录成功后自动刷新列表，且不误报「没抢到」
 - [ ] 使用说明可反复打开（不是只弹一次）
 - [ ] 日志展开/收起正常，长日志不撑破布局
 - [ ] 980×700 与 1120×800、100%/150% 缩放均无横向滚动条
 - [ ] DevTools Network 只有本地文件，没有外部请求
-- [ ] `python app.py --demo` 下所有状态都能看到（假数据覆盖 已报名/开放中/未开放）
+- [ ] `python app.py --demo` 下能看到已报名/开放中/未开放、同批非冲突并发、同批冲突、跨批次冲突、部分成功和停止
 
 ## 10. 怎么跑、怎么看
 
@@ -194,5 +234,5 @@ python app.py --demo     :: 假数据，调样式用
 - 截图：`Win+Shift+S`，或用脚本 `ImageGrab.grab(bbox=窗口矩形)` 抓窗口本身。
 - 想看 DevTools：把 `app.py` 里 `webview.start(debug=False)` 临时改成 `debug=True`
   （这是唯一允许你碰 `app.py` 的情形——改完记得改回去）。
-- 改完至少跑一遍：`python -m py_compile app.py`、`node --check ui/app.js`，
+- 改完至少跑一遍：`python -m py_compile app.py grab.py signup_plan.py`、`node --check ui/app.js`，
   再用 `--demo` 截图自查一遍 §9。

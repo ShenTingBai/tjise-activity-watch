@@ -39,7 +39,7 @@ REFERER = BASE + "/stu/"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 DATA = HERE / "data"
 STATE_FILE = DATA / "storage_state.json"
 SESSION_FILE = DATA / "session.json"
@@ -159,6 +159,38 @@ def clock_skew():
 
 
 # ---------------------------------------------------------------- 活动查询
+def _tri_state(value):
+    """把接口里的签到/签退要求归一化；无法确认时保留 None，禁止猜成无需。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y", "是", "需要", "有"}:
+        return True
+    if text in {"0", "false", "no", "n", "否", "无需", "无"}:
+        return False
+    return None
+
+
+def _activity_flag(raw, names):
+    """只读取明确的布尔字段别名；未命中时返回 None，等待真实接口字段确认。"""
+    for name in names:
+        if name in raw and raw.get(name) not in (None, ""):
+            return _tri_state(raw.get(name))
+    return None
+
+
+CHECKIN_FLAG_NAMES = (
+    "checkin_required", "checkInRequired", "need_checkin", "needCheckIn",
+    "isCheckInRequired", "sfdq", "sfqd", "qiandao", "签到",
+)
+CHECKOUT_FLAG_NAMES = (
+    "checkout_required", "checkOutRequired", "need_checkout", "needCheckOut",
+    "isCheckOutRequired", "sfqt", "sfqtd", "qiantui", "签退",
+)
+
+
 def fetch_activities():
     """分页拉活动列表；返回本地字段结构（字段名已换成好读的名字）。"""
     out, page, total = [], 1, None
@@ -186,6 +218,8 @@ def fetch_activities():
                 "act_start": raw.get("hdkssj") or "",
                 "act_end": raw.get("hdjssj") or "",
                 "signed": raw.get("bmzt") == 1,
+                "checkin_required": _activity_flag(raw, CHECKIN_FLAG_NAMES),
+                "checkout_required": _activity_flag(raw, CHECKOUT_FLAG_NAMES),
             })
         if not chunk or len(out) >= total:
             break
@@ -408,8 +442,11 @@ def cmd_list(args):
                 "sign_start": act["sign_start"],
                 "sign_end": act["sign_end"],
                 "act_start": act["act_start"],
+                "act_end": act["act_end"],
                 "place": act["place"],
                 "signed": bool(act["signed"]),
+                "checkin_required": act.get("checkin_required"),
+                "checkout_required": act.get("checkout_required"),
                 "state": "已报名" if act["signed"] else sign_state(act, now),
             })
         print(json.dumps(out, ensure_ascii=False))

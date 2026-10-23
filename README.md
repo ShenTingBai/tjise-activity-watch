@@ -57,13 +57,15 @@ git clone -b local https://github.com/ShenTingBai/tjise-activity-watch.git
 cd tjise-activity-watch
 ```
 
-1. 双击 `install.bat`：装 Playwright 与 Chromium（只第一次，约 3 分钟）
-2. 双击 `1-登录.bat`：弹出真实 Chrome，手动登录一次，token 存本地
-3. 双击 `4-图形界面.bat`：选中要抢的活动 → 点「到点抢选中的活动」
-4. 等结果，控制台/飞书卡片会告诉你抢到没抢到
+1. 双击 `install.bat`：安装 Playwright、Pillow、pywebview，并准备浏览器（只第一次）
+2. 双击 `1-登录.bat` 或在图形界面点「登录」：弹出真实 Chrome，手动登录一次，登录态存本地
+3. 双击 `4-图形界面.bat`：筛选活动并勾选多场，点「开始报名计划」
+4. 计划按报名开放时间分批执行；同一开放时刻的非冲突活动并发提交，每场结果独立显示
 
 > 登录只做一次，token 大约能撑 17 小时；失效了再点一次「登录 · 重新登录」。
 > 工具只有命令行和 GUI，没有密码落盘，也不会动你浏览器里的账号。
+
+本机 GUI 现在是一张报名时间队列：可以按关键词、报名状态、开放时间、排序方式以及“是否要求签到/签退”筛选。活动的报名开放时间只决定提交批次，活动举办起止时间独立用于冲突检查；缺少签到/签退字段时显示为未知，不会误判成无需。
 
 ## 快速开始 · 服务器版（15 分钟）
 
@@ -105,6 +107,7 @@ python3 scripts/run.py --force        # 真推一次
 | 私人提醒 | cron 07:05 | 只发 owner 私聊：今天要参加的活动 |
 | 预报名 | 私聊卡片按钮 | 点一下排队，可再点「取消预报名」 |
 | 到点抢报名 | watchlist_runner（每分钟） | 到开放时刻自动点「立即报名」并私聊回报 |
+| 本机多活动计划 | `local/app.py` 图形界面 | 多选活动、跨批次等待、同批非冲突并发、逐场取消和整计划停止 |
 | 登录态续期 | tjise-login 守护进程 | 每 2 小时校验一次，成功即刷新会话文件 |
 | 失效重登 | tjise-autologin.timer（每 5 分钟） | 探针判失效才动作；用满 8h 主动换新；验证码 OCR（ddddocr 主 + Tesseract 兜底），最多 5 次、间隔 30 秒 |
 | 监控告警 | token 探针 / 出网自检 | 连续 2 次失败才私聊告警，同一失效周期只提醒一次 |
@@ -115,7 +118,7 @@ python3 scripts/run.py --force        # 真推一次
 |---|---|---|
 | 跑在哪 | 一台常驻 Linux（systemd + cron） | 自己电脑，用的时候才开 |
 | 登录 | 无人值守：探针判失效 → 验证码 OCR 重登，5 次失败私聊告警（30 分钟后下一轮继续试） | 手动弹真实 Chrome 登录一次，token 存本地 |
-| 能力 | 定时日报、群 @ 查询、私聊预报名、到点自动报名、失效重登、断网自检 | 查活动列表、指定单个活动到点抓报名、图形界面 |
+| 能力 | 定时日报、群 @ 查询、私聊预报名、到点自动报名、失效重登、断网自检 | 多活动报名计划、活动时段冲突检查、签到/签退要求筛选、图形界面 |
 | 依赖 | Python + Node 20 + Chromium + ddddocr + Tesseract + cron | Python + Playwright（或本机 Chrome） |
 | 适合 | 7×24 盯着，群里同学都能看 | 只想抢某一两场，不想维护服务器 |
 
@@ -164,7 +167,7 @@ cp server/config.example.json server/config.json   # 再填 webhook / 应用凭�
 ```
 tjise-activity-watch/
 ├── server/        # 服务器版：scripts/（生产脚本）bot/（飞书机器人）deploy/（systemd、登录）tests/
-├── local/         # 本机版：grab.py + gui.py + 几个 .bat（双击即用）
+├── local/         # 本机版：app.py + grab.py + signup_plan.py + ui/ + 打包入口
 ├── docs/          # 架构、运维、登录、抢报名、时点推导、飞书机器人、配置
 ├── tools/         # 发版工具（拆分支、打 zip、发 Release）
 └── README.md / CHANGELOG.md / LICENSE

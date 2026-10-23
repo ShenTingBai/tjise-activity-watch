@@ -36,11 +36,11 @@ EMBED_SOURCES = [
 ]
 GET_PIP = "https://bootstrap.pypa.io/get-pip.py"
 PIP_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
-PIP_PACKAGES = ["playwright>=1.40", "pillow>=9.0"]
+PIP_PACKAGES = ["playwright>=1.40", "pillow>=9.0", "pywebview>=5.0"]
 
 # 应用本体：脚本 + 双击入口 + 说明
 APP_FILES = [
-    "grab.py", "app.py", "install.bat", "_py.bat", "1-登录.bat",
+    "grab.py", "app.py", "signup_plan.py", "install.bat", "_py.bat", "1-登录.bat",
     "2-抢活动.bat", "3-检查登录和活动.bat", "4-图形界面.bat",
     "requirements.txt", "config.example.json", "README.md", "gui-preview.png",
     "启动不了点我.txt",
@@ -212,7 +212,7 @@ def write_launcher(out: Path) -> None:
 chcp 65001 >nul
 cd /d "%~dp0"
 if exist "%~dp0python\\pythonw.exe" (
-    start "" "%~dp0python\\pythonw.exe" "%~dp0gui.py"
+    start "" "%~dp0python\\pythonw.exe" "%~dp0app.py"
 ) else (
     echo 便携版解释器缺失，请重新解压整个目录。
     pause
