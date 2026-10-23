@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>准点 · 高保真原型</title>
+<link rel="stylesheet" href="app/app.css">
+<link rel="stylesheet" href="proto/sheet.css">
+</head>
+<body class="sheet">
+<div class="sh">
+  <header class="sh-hero">
+    <div>
+      <h1>
+        <svg viewBox="0 0 28 28" aria-hidden="true"><rect width="28" height="28" rx="7" fill="#2A302B"/><circle cx="14" cy="9.5" r="2.6" fill="#FFB020"/><circle cx="14" cy="18.5" r="2.6" fill="#FFB020"/></svg>
+        准点 · 高保真原型
+      </h1>
+      <p>天软活动报名本机版的界面，从零重新设计。整个窗口是一个候车厅：下面是按开放时间排的时刻表，上面是一块 LED 大屏。大屏一次只亮一场，和脚本「同一时间只跑一个任务」的规矩一致。</p>
+    </div>
+    <div class="led-wrap" id="hero-led" data-tone="amber"></div>
+    <div class="acts">
+      <a class="bb bb-primary" href="play.html">打开交互原型</a>
+      <a class="bb bb-ghost" href="components.html">组件与规范</a>
+      <a class="bb bb-ghost" href="../README.md">设计文档</a>
+      <span class="meta">2026-10-22 · 基线 main@a66016a · 不改 app.py / grab.py</span>
+    </div>
+  </header>
+
+  <section class="card">
+    <h3 style="margin-top:0">怎么看</h3>
+    <p style="margin:0 0 6px">「打开交互原型」是一个 1120×800 的窗口加一个控制台。控制台不属于界面：用它切场景、快进时间、指定下一次报名的结果、断网、拨慢时钟。</p>
+    <p style="margin:0 0 6px">原型的后端是 <code>proto/mock-backend.js</code>，方法名、事件、日志原话、时序都照抄 <code>local/app.py</code> 和 <code>local/grab.py</code>。换成真后端时，删掉 <code>app.html</code> 里那一行 <code>&lt;script&gt;</code> 就行。</p>
+    <p style="margin:0">下面每张截图都是原型跑出来的真实状态（<code>proto/shoot.py</code> 生成），点开就在原型里打开同一个场景。</p>
+  </section>
+
+  <div id="gallery"></div>
+
+  <p class="sh-foot">示例活动名、地点、时间都是虚构的。原型可以直接双击打开（file://），不请求任何外部资源。</p>
+</div>
+
+<script src="app/led.js"></script>
+<script>
+(function () {
+  "use strict";
+  const GROUPS = [
+    ["日常", "打开就能看到的样子", [
+      ["ready", "01-ready", "打开就是这样", "登录有效。时刻表按开放时间排，「现在」线把已开放和未开放隔开；大屏挂着下一场。"],
+      ["all", "14-all", "全部视图", "已报名、刚截止、时间待公布各成一组。"],
+    ]],
+    ["第一次", "从没登录到能用", [
+      ["first-run", "02-first-run", "第一次打开", "先弹三步说明；大屏和列表都只引导一件事：登录。"],
+      ["logging-in", "03-logging-in", "正在登录", "登录也占着唯一的任务位。大屏显示三步和最多还能等多久。"],
+      ["login-ok", "21-login-ok", "登录好了", "转绿，给出估算的到期时间，接着自动拉活动列表。"],
+      ["login-fail", "22-login-fail", "登录没完成", "窗口被关掉、超时、打不开登录页各有说法。"],
+    ]],
+    ["挑一场", "选中以后、动手之前", [
+      ["preview", "04-preview", "选中一场", "这一场上了大屏。底栏先做检查：登录撑不撑得到开放、时钟准不准。"],
+      ["preview-warn", "05-preview-warn", "登录撑不到开放", "主按钮换成「先重新登录」，旁边留「照样到点报名」。"],
+      ["preview-open", "06-preview-open", "已经开放的场次", "按钮变成「立即替我报名」，从现在起试 2 分钟。"],
+      ["clock-skew", "16-clock-skew", "本机时钟慢 6 秒", "顶栏时钟标黄，检查条提醒，并告诉去哪里同步。"],
+      ["no-match", "23-no-match", "筛选没结果", "说清一共有多少场，给「清除筛选」。"],
+    ]],
+    ["等开放", "大屏点亮之后", [
+      ["armed", "07-armed", "等开放", "琥珀色倒计时 + 线路图。每一站都是脚本里真有动作的时刻。"],
+      ["final", "08-final", "开放前 5 秒", "开始每 0.3 秒找一次「立即报名」，数字转红。"],
+      ["submitting", "09-submitting", "正在提交", "前两次学校回「未到报名时间」，还在 2 分钟窗口里接着试。"],
+      ["switch", "13-switch", "想换一场", "一次只能等一场：选别的行会提示「换成这一场」。"],
+      ["sleep", "24-sleep", "电脑睡过一觉", "心跳断了 25 分钟，提醒可能错过开放。"],
+    ]],
+    ["结果", "大屏上的结论，点「知道了」才收起", [
+      ["success", "10-success", "报名成功", "转绿：活动名、去活动页确认一眼、不想去就尽快取消。"],
+      ["fail-full", "11-fail-full", "没抢到：名额已满", "按钮 2 分钟里一直没出现。说原因，给下一步。"],
+      ["fail-login", "12-fail-login", "没抢到：登录中途失效", "脚本只看到按钮没出现；界面顺手复查，指出真原因。"],
+      ["already", "20-already", "已经报过", "脚本打开活动页发现已报名，直接收手。"],
+      ["stopped", "19-stopped", "已停止", "主动停下不算失败，给「重新开始等」。"],
+    ]],
+    ["出状况", "说清是什么问题、现在能做什么", [
+      ["expired", "17-expired", "登录态失效", "胶囊变红，大屏和列表都只给一个动作：重新登录。"],
+      ["offline", "15-offline", "断网", "说清是网络问题，不让人白白去重新登录。"],
+      ["empty", "18-empty", "列表是空的", "这里还没有活动：点「刷新」拉一次。"],
+    ]],
+    ["最小窗口", "980×700", [
+      ["armed", "25-armed-980", "等开放 · 980×700", "大屏压到 190px，时刻表照样能滚。"],
+      ["preview", "26-preview-980", "选中一场 · 980×700", "副标题收起，「显示浏览器」缩成「看着它点」。"],
+      ["preview-warn", "27-preview-warn-746", "150% 缩放没换算时 · 746×512", "兜底：大屏变矮、点阵缩小，时刻表照样留出几行，不出横向滚动条。"],
+    ]],
+  ];
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  document.getElementById("gallery").innerHTML = GROUPS.map(([g, sub, items]) =>
+    `<section class="gal-group"><h3>${g}<small>${sub}</small></h3><div class="gal">${items.map(([id, shot, title, desc]) =>
+      `<a class="shot" href="play.html?scene=${id}${/980|746/.test(shot) ? "&size=min" : ""}"><img src="../shots/${shot}.png" alt="${esc(title)}"><div><b>${esc(title)}</b><span>${esc(desc)}</span><em>在原型里打开</em></div></a>`).join("")}</div></section>`).join("");
+
+  const led = LED.mount(document.getElementById("hero-led"));
+  const pad = (n) => String(n).padStart(2, "0");
+  function tick() {
+    const d = new Date();
+    led.set(`${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`, "amber");
+    setTimeout(tick, 1000 - (Date.now() % 1000) + 8);
+  }
+  tick();
+})();
+</script>
+</body>
+</html>

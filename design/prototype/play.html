@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>准点 · 交互原型</title>
+<link rel="stylesheet" href="proto/play.css">
+</head>
+<body>
+<main class="desk" id="desk">
+  <div class="stage-wrap" id="stage-wrap">
+    <div class="stage" id="stage">
+      <!-- 应用窗口：1120×800（标题栏 32 + 内容 768），和 app.py create_window 的尺寸一致 -->
+      <div class="win" id="win">
+        <div class="win-bar">
+          <svg class="win-ico" viewBox="0 0 28 28" aria-hidden="true"><rect width="28" height="28" rx="7" fill="#121513"/><circle cx="14" cy="9.5" r="2.6" fill="#FFB020"/><circle cx="14" cy="18.5" r="2.6" fill="#FFB020"/></svg>
+          <span class="win-title">准点 · 天软活动报名</span>
+          <span class="win-ctl" aria-hidden="true"><i>&#xE921;</i><i>&#xE922;</i><i class="x">&#xE8BB;</i></span>
+        </div>
+        <iframe id="app" title="准点 · 界面原型"></iframe>
+      </div>
+
+      <!-- 模拟的 Chrome 登录窗口：真实情况下是 grab.py login 弹出的 Chrome -->
+      <div class="cw" id="chrome" hidden>
+        <div class="cw-bar">
+          <span class="cw-tab"><i class="cw-fav"></i>学生登录</span>
+          <span class="win-ctl" aria-hidden="true"><i>&#xE921;</i><i>&#xE922;</i></span>
+          <button class="cw-close" id="cw-close" type="button" title="关掉这个窗口（模拟「窗口被关掉了」）">&#xE8BB;</button>
+        </div>
+        <div class="cw-url"><span class="cw-lock"></span>xg.tjise.edu.cn/stu/#/mainPages/login?userType=2</div>
+        <div class="cw-page">
+          <p class="cw-note">原型示意：真实情况下，这是「登录」弹出的 Chrome 窗口，打开的是学校的学生登录页。</p>
+          <form class="cw-form" id="cw-form" autocomplete="off">
+            <h3>学生登录</h3>
+            <label>学号<input type="text" value="2024XXXXXX" aria-label="学号"></label>
+            <label>密码<input type="password" value="password" aria-label="密码"></label>
+            <label class="cw-cap">验证码<input type="text" value="7K3P" aria-label="验证码"><span class="cw-captcha" aria-hidden="true">7K3P</span></label>
+            <button type="submit">立即登录</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="taskbar">
+    <span class="tb-start" aria-hidden="true"></span>
+    <span class="tb-app is-on" title="准点"><svg viewBox="0 0 28 28" aria-hidden="true"><rect width="28" height="28" rx="7" fill="#121513"/><circle cx="14" cy="9.5" r="2.6" fill="#FFB020"/><circle cx="14" cy="18.5" r="2.6" fill="#FFB020"/></svg></span>
+    <span class="tb-app tb-chrome" id="tb-chrome" title="Chrome" hidden><i></i></span>
+    <span class="tb-clock" id="tb-clock">--:--</span>
+  </div>
+  <div class="note" id="note" hidden></div>
+</main>
+
+<aside class="console" id="console" aria-label="原型控制台">
+  <header class="cs-head">
+    <div>
+      <b>原型控制台</b>
+      <span>不属于界面，只用来切场景、快进时间、指定结果</span>
+    </div>
+    <button class="cs-fold" id="cs-fold" type="button" title="收起控制台（快捷键 `）">收起</button>
+  </header>
+
+  <section class="cs-sec">
+    <h4>场景</h4>
+    <div class="cs-scenes" id="cs-scenes"></div>
+    <p class="cs-desc" id="cs-desc"></p>
+  </section>
+
+  <section class="cs-sec">
+    <h4>时间</h4>
+    <div class="cs-time"><span id="cs-now">--:--:--</span><em id="cs-paused" hidden>已暂停</em></div>
+    <div class="cs-slot" id="cs-slot">任务位：空闲</div>
+    <div class="cs-row">
+      <button type="button" data-clock="toggle" id="cs-pause">暂停</button>
+      <button type="button" data-shift="60000">+1 分钟</button>
+      <button type="button" data-shift="600000">+10 分钟</button>
+      <button type="button" data-shift="3600000">+1 小时</button>
+    </div>
+    <div class="cs-row">
+      <button type="button" data-jump="-15000" class="needs-grab">跳到开放前 15 秒</button>
+      <button type="button" data-jump="110000" class="needs-grab">跳到开放后 1 分 50 秒</button>
+    </div>
+  </section>
+
+  <section class="cs-sec">
+    <h4>下一次报名的结果</h4>
+    <div class="cs-opts" data-key="grabOutcome">
+      <label><input type="radio" name="go" value="success">一次就成功</label>
+      <label><input type="radio" name="go" value="late">第 3 次才成功</label>
+      <label><input type="radio" name="go" value="full">名额已满（按钮一直不出现）</label>
+      <label><input type="radio" name="go" value="not-open">学校一直回「报名尚未开始」</label>
+      <label><input type="radio" name="go" value="no-response">学校不回应</label>
+      <label><input type="radio" name="go" value="token-expire">等的时候登录态失效</label>
+      <label><input type="radio" name="go" value="network">开放那一刻断网</label>
+      <label><input type="radio" name="go" value="already">其实已经报过</label>
+      <label><input type="radio" name="go" value="no-browser">电脑上没有浏览器</label>
+    </div>
+  </section>
+
+  <section class="cs-sec">
+    <h4>下一次登录的结果</h4>
+    <div class="cs-opts" data-key="loginMode">
+      <label><input type="radio" name="lm" value="window">在弹出的窗口里操作</label>
+      <label><input type="radio" name="lm" value="auto">自动成功</label>
+      <label><input type="radio" name="lm" value="closed">关掉窗口</label>
+      <label><input type="radio" name="lm" value="timeout">超时（10 分钟）</label>
+      <label><input type="radio" name="lm" value="unreachable">打不开登录页</label>
+      <label><input type="radio" name="lm" value="verify">登录后校验失败</label>
+    </div>
+  </section>
+
+  <section class="cs-sec">
+    <h4>环境</h4>
+    <div class="cs-kv">
+      <span>网络</span>
+      <div class="cs-seg" data-env="net"><button type="button" data-v="on">在线</button><button type="button" data-v="off">断网</button></div>
+      <span>本机时钟</span>
+      <div class="cs-seg" data-env="skew"><button type="button" data-v="0">准</button><button type="button" data-v="6">慢 6 秒</button><button type="button" data-v="-5">快 5 秒</button></div>
+      <span>登录态</span>
+      <div class="cs-seg" data-env="session"><button type="button" data-v="fresh">有效</button><button type="button" data-v="short">快过期</button><button type="button" data-v="expired">失效</button><button type="button" data-v="none">没登录</button></div>
+      <span>飞书通知</span>
+      <div class="cs-seg" data-env="feishu"><button type="button" data-v="0">没配</button><button type="button" data-v="1">配了</button></div>
+    </div>
+    <div class="cs-row"><button type="button" id="cs-sleep">模拟电脑睡了 25 分钟</button></div>
+  </section>
+
+  <section class="cs-sec">
+    <h4>窗口</h4>
+    <div class="cs-seg" data-env="size"><button type="button" data-v="default">1120×800 默认</button><button type="button" data-v="min">980×700 最小</button></div>
+  </section>
+
+  <footer class="cs-links">
+    <a href="index.html">原型总览</a>
+    <a href="components.html">组件与规范</a>
+    <a href="../README.md">设计文档</a>
+  </footer>
+</aside>
+<button class="cs-open" id="cs-open" type="button" hidden>原型控制台</button>
+
+<script src="proto/play.js"></script>
+</body>
+</html>

@@ -1,0 +1,152 @@
+/* 交互原型的外壳：桌面、窗口框、模拟 Chrome、任务栏、控制台。不属于界面本身。 */
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  font-size: 13px;
+  color: #1A1F24;
+  background: #1C2733;
+  overflow: hidden;
+  display: flex;
+}
+button { font: inherit; cursor: pointer; }
+
+/* ------------------------------------------------ 桌面 */
+.desk {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 100vh;
+  background:
+    radial-gradient(1100px 700px at 22% 18%, rgba(118, 152, 196, .55), transparent 62%),
+    radial-gradient(900px 640px at 85% 95%, rgba(52, 86, 125, .7), transparent 60%),
+    linear-gradient(160deg, #2A3A4D, #18222E);
+}
+.stage-wrap { position: absolute; inset: 0 0 48px 0; display: grid; place-items: center; overflow: hidden; }
+.stage { position: relative; transform-origin: center center; }
+
+.win {
+  width: var(--w, 1120px);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #E8ECEF;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .14), 0 26px 70px rgba(4, 10, 18, .55);
+}
+.win-bar {
+  height: 32px; display: flex; align-items: center; gap: 8px; padding-left: 12px;
+  background: #F3F3F3; color: #1A1A1A; font-size: 12px;
+  border-bottom: 1px solid #E2E2E2;
+}
+.win-ico { width: 16px; height: 16px; }
+.win-title { flex: 1; }
+.win-ctl { display: flex; height: 100%; font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets"; font-size: 10px; font-style: normal; }
+.win-ctl i { width: 46px; display: grid; place-items: center; font-style: normal; color: #333; }
+.win-ctl i.x:hover { background: #C42B1C; color: #fff; }
+#app { display: block; width: var(--w, 1120px); height: var(--h, 768px); border: 0; background: #E8ECEF; }
+
+/* ------------------------------------------------ 模拟 Chrome */
+.cw {
+  position: absolute; z-index: 5;
+  right: -40px; top: 236px; width: 520px;   /* 别挡住大屏上的倒数 */
+  border-radius: 8px; overflow: hidden;
+  background: #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .18), 0 24px 60px rgba(4, 10, 18, .5);
+  animation: pop .22s ease-out;
+}
+.cw[hidden] { display: none; }
+@keyframes pop { from { opacity: 0; transform: translateY(10px) scale(.98); } to { opacity: 1; transform: none; } }
+.cw-bar { height: 36px; display: flex; align-items: flex-end; background: #DEE1E6; padding-left: 8px; }
+.cw-tab {
+  display: inline-flex; align-items: center; gap: 8px; height: 30px; padding: 0 14px;
+  border-radius: 8px 8px 0 0; background: #fff; font-size: 12px; margin-right: auto;
+}
+.cw-fav { width: 14px; height: 14px; border-radius: 3px; background: #1E5A8C; }
+.cw-bar .win-ctl { height: 36px; }
+.cw-bar .win-ctl i { width: 40px; }
+.cw-close { width: 44px; height: 36px; border: 0; background: transparent; font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets"; font-size: 10px; }
+.cw-close:hover { background: #C42B1C; color: #fff; }
+.cw-url {
+  display: flex; align-items: center; gap: 8px; margin: 6px 8px; height: 30px; padding: 0 12px;
+  border-radius: 15px; background: #F1F3F4; color: #3C4043; font-size: 12px;
+}
+.cw-lock { width: 10px; height: 12px; border: 1.6px solid #5F6368; border-radius: 2px; position: relative; top: 1px; }
+.cw-page { padding: 16px 28px 26px; background: linear-gradient(180deg, #EAF2FB, #fff 60%); }
+.cw-note { margin: 0 0 14px; padding: 8px 10px; border-radius: 6px; background: #FFF6DE; color: #6B4A00; font-size: 12px; }
+.cw-form { width: 300px; margin: 0 auto; padding: 18px 20px 20px; border-radius: 10px; background: #fff; box-shadow: 0 4px 18px rgba(30, 90, 140, .12); }
+.cw-form h3 { margin: 0 0 12px; font-size: 16px; text-align: center; color: #1E5A8C; }
+.cw-form label { display: block; margin-bottom: 10px; font-size: 12px; color: #5A6470; }
+.cw-form input { display: block; width: 100%; height: 32px; margin-top: 4px; padding: 0 10px; border: 1px solid #D0D7DE; border-radius: 6px; font: inherit; font-size: 13px; }
+.cw-cap { position: relative; }
+.cw-cap input { width: 150px; }
+.cw-captcha {
+  position: absolute; right: 0; bottom: 0; width: 92px; height: 32px; border-radius: 6px;
+  display: grid; place-items: center; font: italic 700 18px/1 Georgia, serif; letter-spacing: 3px; color: #2B5D8C;
+  background: repeating-linear-gradient(35deg, #E9EEF5 0 4px, #DDE6F0 4px 7px);
+  text-decoration: line-through; text-decoration-color: rgba(200, 60, 60, .55);
+}
+.cw-form button { width: 100%; height: 36px; margin-top: 4px; border: 0; border-radius: 6px; background: #1E5A8C; color: #fff; font-weight: 700; }
+.cw-form button:hover { background: #174A75; }
+
+/* ------------------------------------------------ 任务栏 */
+.taskbar {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 48px;
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  background: rgba(32, 36, 42, .82); backdrop-filter: blur(18px);
+  border-top: 1px solid rgba(255, 255, 255, .08);
+}
+.tb-start { width: 20px; height: 20px; margin-right: 6px; background:
+  linear-gradient(#4FB3FF, #4FB3FF) 0 0 / 9px 9px no-repeat, linear-gradient(#4FB3FF, #4FB3FF) 11px 0 / 9px 9px no-repeat,
+  linear-gradient(#4FB3FF, #4FB3FF) 0 11px / 9px 9px no-repeat, linear-gradient(#4FB3FF, #4FB3FF) 11px 11px / 9px 9px no-repeat; }
+.tb-app { position: relative; width: 40px; height: 40px; border-radius: 6px; display: grid; place-items: center; }
+.tb-app.is-on, .tb-chrome { background: rgba(255, 255, 255, .08); }
+.tb-app svg { width: 24px; height: 24px; }
+.tb-app::after { content: ""; position: absolute; bottom: 2px; left: 50%; width: 6px; height: 3px; border-radius: 2px; background: #9AA4AE; transform: translateX(-50%); }
+.tb-app.is-on::after { width: 16px; background: #5FB6FF; }
+.tb-chrome i { width: 22px; height: 22px; border-radius: 50%; background: conic-gradient(#DB4437 0 33%, #F4B400 0 66%, #0F9D58 0); box-shadow: inset 0 0 0 5px transparent; position: relative; }
+.tb-chrome i::after { content: ""; position: absolute; inset: 6px; border-radius: 50%; background: #4285F4; box-shadow: 0 0 0 2px #fff; }
+.tb-chrome[hidden] { display: none; }
+.tb-clock { position: absolute; right: 16px; color: #E6E9ED; font-family: "Bahnschrift", "Segoe UI", sans-serif; font-size: 13px; }
+.note {
+  position: absolute; left: 50%; bottom: 64px; transform: translateX(-50%);
+  padding: 8px 14px; border-radius: 8px; background: rgba(15, 20, 26, .9); color: #fff; font-size: 12px;
+}
+
+/* ------------------------------------------------ 控制台 */
+.console {
+  width: 300px; flex: none; height: 100vh; overflow-y: auto;
+  background: #F6F7F9; border-left: 1px solid #D6DCE2;
+  padding: 0 14px 18px;
+}
+.console[hidden] { display: none; }
+.cs-head { position: sticky; top: 0; z-index: 2; display: flex; align-items: flex-start; gap: 8px; padding: 14px 0 10px; background: #F6F7F9; border-bottom: 1px solid #E1E6EA; }
+.cs-head b { display: block; font-size: 14px; }
+.cs-head span { display: block; margin-top: 2px; color: #5A6470; font-size: 12px; }
+.cs-fold { margin-left: auto; flex: none; height: 26px; padding: 0 8px; border: 0; border-radius: 6px; background: #E6EAEE; }
+.cs-open { position: fixed; right: 12px; top: 12px; z-index: 10; height: 30px; padding: 0 12px; border: 0; border-radius: 8px; background: #F6F7F9; box-shadow: 0 4px 14px rgba(0, 0, 0, .3); }
+.cs-sec { padding: 12px 0; border-bottom: 1px solid #E1E6EA; }
+.cs-sec h4 { margin: 0 0 8px; font-size: 12px; color: #5A6470; font-weight: 700; }
+.cs-scenes { display: flex; flex-direction: column; gap: 8px; }
+.cs-group { display: flex; flex-wrap: wrap; gap: 4px; }
+.cs-group > span { width: 100%; font-size: 11px; color: #7A848E; }
+.cs-scenes button, .cs-row button, .cs-seg button {
+  height: 26px; padding: 0 8px; border: 0; border-radius: 6px; background: #fff; color: #1A1F24;
+  box-shadow: inset 0 0 0 1px #D2D9DF; font-size: 12px; white-space: nowrap;
+}
+.cs-scenes button:hover, .cs-row button:hover:not(:disabled), .cs-seg button:hover { box-shadow: inset 0 0 0 1px #8D98A3; }
+.cs-scenes button[aria-current="true"] { background: #121513; color: #FFB020; box-shadow: none; font-weight: 700; }
+.cs-row button:disabled { opacity: .45; cursor: not-allowed; }
+.cs-desc { margin: 10px 0 0; padding: 8px 10px; border-radius: 8px; background: #fff; box-shadow: inset 0 0 0 1px #E1E6EA; color: #3E4852; font-size: 12px; line-height: 1.55; }
+.cs-desc:empty { display: none; }
+.cs-time { display: flex; align-items: baseline; gap: 8px; }
+.cs-time span { font-family: "Bahnschrift", "Segoe UI", sans-serif; font-size: 26px; font-variant-numeric: tabular-nums; }
+.cs-time em { font-style: normal; font-size: 12px; color: #8F5600; background: #FFF0D4; padding: 1px 6px; border-radius: 4px; }
+.cs-slot { margin: 2px 0 8px; color: #4E5964; font-size: 12px; }
+.cs-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.cs-opts { display: flex; flex-direction: column; gap: 2px; }
+.cs-opts label { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+.cs-opts label:hover { background: #ECEFF2; }
+.cs-kv { display: grid; grid-template-columns: 56px 1fr; gap: 6px 8px; align-items: center; font-size: 12px; color: #4E5964; }
+.cs-seg { display: flex; flex-wrap: wrap; gap: 4px; }
+.cs-seg button[aria-pressed="true"] { background: #1A1F24; color: #fff; box-shadow: none; }
+.cs-links { display: flex; gap: 14px; padding-top: 12px; font-size: 12px; }
+.cs-links a { color: #1E5A8C; }

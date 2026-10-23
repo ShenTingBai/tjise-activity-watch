@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>准点 · 组件与规范</title>
+<link rel="stylesheet" href="app/app.css">
+<link rel="stylesheet" href="proto/sheet.css">
+</head>
+<body class="sheet">
+<div class="sh">
+  <header class="sh-hero">
+    <div>
+      <h1>
+        <svg viewBox="0 0 28 28" aria-hidden="true"><rect width="28" height="28" rx="7" fill="#2A302B"/><circle cx="14" cy="9.5" r="2.6" fill="#FFB020"/><circle cx="14" cy="18.5" r="2.6" fill="#FFB020"/></svg>
+        组件与规范
+      </h1>
+      <p>下面的组件都是用界面自己的 <code style="background:none;box-shadow:none;color:inherit">app.css</code> 渲染的，不是截图，改样式这里会跟着变。只有「大屏状态」一节用的是原型跑出来的截图。</p>
+    </div>
+    <div class="led-wrap" id="hero-led" data-tone="amber"></div>
+    <div class="acts">
+      <a class="bb bb-ghost" href="index.html">原型总览</a>
+      <a class="bb bb-ghost" href="play.html">打开交互原型</a>
+      <a class="bb bb-ghost" href="../README.md">设计文档</a>
+    </div>
+  </header>
+
+  <ul class="toc">
+    <li><a href="#color">色彩</a></li><li><a href="#type">字体</a></li><li><a href="#led">点阵屏</a></li>
+    <li><a href="#boards">大屏状态</a></li><li><a href="#top">顶栏</a></li><li><a href="#buttons">按钮</a></li>
+    <li><a href="#rows">时刻表行</a></li><li><a href="#route">线路图与检查条</a></li><li><a href="#alerts">横幅与提示</a></li>
+    <li><a href="#log">运行记录</a></li><li><a href="#motion">动效</a></li><li><a href="#space">尺寸</a></li>
+  </ul>
+
+  <!-- ============================================================ 色彩 -->
+  <h2 id="color">色彩</h2>
+  <p class="lead">两套底：浅灰的「厅」放时刻表，近黑的「屏」只给大屏。琥珀只出现在屏上，是「正在等的那一场」的颜色；铁路蓝只表示「能点、已选中」。对比度按 WCAG AA，括号里是在各自底色上的对比度。</p>
+  <h3>厅</h3>
+  <div class="sw-grid">
+    <div class="sw"><i style="background:#E8ECEF"></i><div><b>厅 hall</b><code>#E8ECEF</code><br>窗口底色</div></div>
+    <div class="sw"><i style="background:#FFFFFF;box-shadow:inset 0 -1px 0 #DDE3E8"></i><div><b>纸 paper</b><code>#FFFFFF</code><br>时刻表、运行记录、弹窗</div></div>
+    <div class="sw"><i style="background:#F4F6F8"></i><div><b>纸 2 paper-2</b><code>#F4F6F8</code><br>分组条、输入框、分段控件</div></div>
+    <div class="sw"><i style="background:#1A1F24"></i><div><b>墨 ink</b><code>#1A1F24</code><br>正文、标题（白底 16.6）</div></div>
+    <div class="sw"><i style="background:#4E5964"></i><div><b>墨 2 ink-2</b><code>#4E5964</code><br>副信息、地点（白底 7.2）</div></div>
+    <div class="sw"><i style="background:#616C76"></i><div><b>墨 3 ink-3</b><code>#616C76</code><br>表头、计数、占位（所有浅底 ≥4.5）</div></div>
+    <div class="sw"><i style="background:#DDE3E8"></i><div><b>线 line</b><code>#DDE3E8</code><br>行线、卡片描边</div></div>
+    <div class="sw"><i style="background:#1E5A8C"></i><div><b>铁路蓝 blue</b><code>#1E5A8C</code><br>选中行竖条、焦点环、链接（白字 7.3）</div></div>
+    <div class="sw"><i style="background:#E3EDF6"></i><div><b>选中底 blue-tint</b><code>#E3EDF6</code><br>选中行底色</div></div>
+  </div>
+  <h3>屏</h3>
+  <div class="sw-grid">
+    <div class="sw"><i style="background:#121513"></i><div><b>屏 board</b><code>#121513</code><br>大屏底色，带 6px 点阵纹理</div></div>
+    <div class="sw"><i style="background:#ECEFEA"></i><div><b>屏上字 on-board</b><code>#ECEFEA</code><br>大屏标题（15.9）</div></div>
+    <div class="sw"><i style="background:#A7AFA9"></i><div><b>屏上字 2</b><code>#A7AFA9</code><br>大屏说明文字（8.2）</div></div>
+    <div class="sw"><i style="background:#7E8781"></i><div><b>屏上字 3</b><code>#7E8781</code><br>未到的站名、时刻（5.0）</div></div>
+    <div class="sw"><i style="background:#FFB020"></i><div><b>琥珀 led-amber</b><code>#FFB020</code><br>正在等、主按钮（屏上 10.1）</div></div>
+    <div class="sw"><i style="background:#B98319"></i><div><b>暗琥珀 led-dim</b><code>#B98319</code><br>还没开始等的倒计时（5.5）</div></div>
+    <div class="sw"><i style="background:#FF5B48"></i><div><b>信号红 led-red</b><code>#FF5B48</code><br>最后 10 秒、提交中、没抢到（6.0）</div></div>
+    <div class="sw"><i style="background:#45DC8A"></i><div><b>信号绿 led-green</b><code>#45DC8A</code><br>报名成功、登录好了（10.4）</div></div>
+    <div class="sw"><i style="background:#232823"></i><div><b>灭灯 led-off</b><code>#232823</code><br>灭着的点也画出来</div></div>
+  </div>
+  <h3>浅底上的状态色</h3>
+  <div class="sw-grid">
+    <div class="sw"><i style="background:#E1F3E9;box-shadow:inset 0 0 0 999px #E1F3E9, inset 6px 0 0 #146C43"></i><div><b>成功 ok</b><code>#146C43 / #E1F3E9</code><br>已报名、登录有效（5.6）</div></div>
+    <div class="sw"><i style="background:#FBE6E3;box-shadow:inset 6px 0 0 #B63227"></i><div><b>失败 bad</b><code>#B63227 / #FBE6E3</code><br>登录失效、断网（5.1）</div></div>
+    <div class="sw"><i style="background:#FFF0D4;box-shadow:inset 6px 0 0 #8F5600"></i><div><b>提醒 warn</b><code>#8F5600 / #FFF0D4</code><br>开放中、快过期、时钟偏差（5.3）</div></div>
+  </div>
+
+  <!-- ============================================================ 字体 -->
+  <h2 id="type">字体</h2>
+  <p class="lead">只用 Windows 自带的三套字，不引外部字体。数字统一用 Bahnschrift：它源自德国铁路标识字 DIN，等宽数字，倒计时跳秒时不晃。</p>
+  <div class="card">
+    <div class="type-row"><div><b>微软雅黑 UI</b><small>界面文字 · 12–21px</small></div><div style="font-size:21px;font-weight:700">网络安全·数字时代大长城</div></div>
+    <div class="type-row"><div><b>Bahnschrift</b><small>时刻、倒计时、计数</small></div><div class="num" style="font-size:30px;font-weight:600">21:09<span style="font-size:14px;color:var(--ink-2)">:59</span> &nbsp; <span style="font-size:22px">2 时 14 分</span></div></div>
+    <div class="type-row"><div><b>Cascadia Mono / Consolas</b><small>运行记录（脚本原话）</small></div><div style="font-family:var(--font-log);font-size:12px">21:05:25 [i] 第 2 次提交：code:0 未到报名时间</div></div>
+    <div class="type-row"><div><b>字号</b><small>文字只用这几级；数字另见上一行</small></div><div style="display:flex;align-items:baseline;gap:18px;flex-wrap:wrap"><span style="font-size:21px;font-weight:700">21 大屏标题</span><span style="font-size:20px;font-weight:700">20 弹窗标题</span><span style="font-size:18px;font-weight:800">18 品牌</span><span style="font-size:16px;font-weight:700">16 空状态标题</span><span style="font-size:14px;font-weight:600">14 活动名</span><span style="font-size:13px">13 正文</span><span style="font-size:12px;color:var(--ink-2)">12 辅助</span></div></div>
+  </div>
+
+  <!-- ============================================================ 点阵屏 -->
+  <h2 id="led">点阵屏</h2>
+  <p class="lead">5×7 点阵，点半径是点距的 0.36。灭着的点也画出来（暗色），所以数字变化时不跳版，看上去像一块真屏。只画倒计时用得到的字，外加 ✓ / ✕ 两个结果图标。</p>
+  <div class="demo dark">
+    <span class="demo-cap">字库</span>
+    <div class="glyphs" id="glyphs"></div>
+  </div>
+  <div class="demo dark" style="margin-top:12px">
+    <span class="demo-cap">五种色调</span>
+    <div class="tones" id="tones"></div>
+  </div>
+
+  <!-- ============================================================ 大屏状态 -->
+  <h2 id="boards">大屏状态</h2>
+  <p class="lead">大屏是界面里唯一的「任务位」，对应 app.py 同一时间只跑一个子进程的锁。谁占着位置就显示谁；任务结束后结论留在屏上，点「知道了」或选别的行才收起。完整状态机见设计文档 §5。</p>
+  <div class="boards" id="boards-grid"></div>
+
+  <!-- ============================================================ 顶栏 -->
+  <h2 id="top">顶栏</h2>
+  <p class="lead">登录胶囊回答「登录还能用多久」。剩余时间按登录时刻加 17.5 小时估算（app.py 的算法），所以写「约剩」。点胶囊看预计到期时刻和重新登录入口。</p>
+  <div class="demo">
+    <span class="demo-cap">登录胶囊：有效 / 快过期（不到 2 小时）/ 失效 / 还没登录 / 正在登录 / 连不上</span>
+    <button class="pill" type="button" data-st="ok"><i class="dot"></i><b>登录有效</b><span class="sub">约剩 14 小时</span></button>
+    <button class="pill" type="button" data-st="warn"><i class="dot"></i><b>登录快过期</b><span class="sub">约剩 1 时 53 分</span></button>
+    <button class="pill" type="button" data-st="bad"><i class="dot"></i><b>登录已失效</b><span class="sub"></span></button>
+    <button class="pill" type="button" data-st="off"><i class="dot"></i><b>还没登录</b><span class="sub"></span></button>
+    <button class="pill" type="button" data-st="busy"><i class="dot"></i><b>正在登录</b><span class="sub"></span></button>
+    <button class="pill" type="button" data-st="warn"><i class="dot"></i><b>连不上学校站点</b><span class="sub"></span></button>
+  </div>
+  <div class="demo" style="margin-top:12px">
+    <span class="demo-cap">本机时钟：和学校差 3 秒以上才标出来（grab.py 的门槛）</span>
+    <button class="clock" type="button"><span class="clock-time">21:01:43</span></button>
+    <button class="clock" type="button"><span class="clock-time">21:06:14</span><span class="clock-skew">本机慢 6 秒</span></button>
+    <button class="clock" type="button"><span class="clock-time">21:06:14</span><span class="clock-skew">本机快 5 秒</span></button>
+  </div>
+
+  <!-- ============================================================ 按钮 -->
+  <h2 id="buttons">按钮</h2>
+  <p class="lead">屏上的主按钮用琥珀实底，一块屏上最多一个；它的文字永远说清会发生什么：「到点自动报名」「立即替我报名」「先重新登录」「再试一次」。</p>
+  <div class="demo dark">
+    <span class="demo-cap">屏上：主要 / 悬停 / 不可用 · 次要 · 文字链</span>
+    <button class="bb bb-primary" type="button"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l10-6.5z"/></svg>到点自动报名</button>
+    <button class="bb bb-primary force-hover" type="button"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l10-6.5z"/></svg>到点自动报名</button>
+    <button class="bb bb-primary" type="button" disabled>到点自动报名</button>
+    <button class="bb bb-ghost" type="button"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="1.5"/></svg>停止</button>
+    <button class="bb-link" type="button">照样到点报名</button>
+  </div>
+  <div class="demo" style="margin-top:12px">
+    <span class="demo-cap">厅里：实心（需要马上做的那一步，例如还没登录时的「登录」）/ 描边 / 透明 / 刷新中</span>
+    <button class="btn btn-solid" type="button"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/><path d="M10 16l4-4-4-4"/><path d="M14 12H4"/></svg>登录</button>
+    <button class="btn btn-line" type="button"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/><path d="M10 16l4-4-4-4"/><path d="M14 12H4"/></svg>重新登录</button>
+    <button class="btn btn-ghost" type="button"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>刷新</button>
+    <button class="btn btn-ghost is-busy" type="button" disabled><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg><svg class="i spin" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9"/></svg>刷新</button>
+    <button class="btn btn-line" type="button" disabled>重新登录</button>
+    <div class="seg"><button type="button" aria-pressed="true">可报名<span class="n"> 11</span></button><button type="button" aria-pressed="false">已报名<span class="n"> 3</span></button><button type="button" aria-pressed="false">全部<span class="n"> 15</span></button></div>
+  </div>
+
+  <!-- ============================================================ 时刻表行 -->
+  <h2 id="rows">时刻表行</h2>
+  <p class="lead">左边是开放时刻（大号 Bahnschrift，学校爱用的 :59 秒写成上标），右边一格回答「还要等多久 / 现在能不能报」。每秒只改右边那格文字；开放、截止这种跨界才整表重画。</p>
+  <div class="rows-demo">
+    <div class="colhead"><span>开放时间</span><span>活动</span><span>地点</span><span>距开放</span></div>
+    <div class="cap">未开放 · 下一场</div>
+    <div class="row" data-st="waiting" aria-selected="false"><div class="c-time"><span class="t">21:09</span></div><div class="c-main"><div class="name">网络安全·数字时代大长城</div><div class="sub"><span>活动 后天 14:00</span></div></div><div class="c-place">教学楼 A301</div><div class="c-state"><span class="left">7 分 16 秒</span><span class="tag" data-k="next">下一场</span></div></div>
+    <div class="cap">未开放 · 选中（带秒的开放时刻）</div>
+    <div class="row" data-st="waiting" aria-selected="true"><div class="c-time"><span class="t">00:59</span><span class="s">:59</span></div><div class="c-main"><div class="name">Python 数据分析入门</div><div class="sub"><span>活动 10月26日 周日 14:00</span></div></div><div class="c-place">实训楼 C305</div><div class="c-state"><span class="left">1 天 3 时</span></div></div>
+    <div class="cap">选中 · 但大屏正在等别的场次</div>
+    <div class="row" data-st="waiting" aria-selected="true"><div class="c-time"><span class="t">00:00</span></div><div class="c-main"><div class="name">程序设计实验室开放日</div><div class="sub"><span>活动 10月25日 周日 09:30</span></div></div><div class="c-place">实训楼 B204</div><div class="c-state"><span class="left">2 时 53 分</span></div>
+      <div class="row-extra"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg><span class="grow">大屏正在等「<b>网络安全·数字时代大长城</b>」。一次只能等一场。</span><button class="btn btn-line" type="button"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h12l-3-3M17 17H5l3 3"/></svg>换成这一场</button></div></div>
+    <div class="cap">正在等（左边黑色竖条）/ 正在提交</div>
+    <div class="row is-armed" data-st="waiting" aria-selected="false"><div class="c-time"><span class="t">23:16</span><span class="s">:25</span></div><div class="c-main"><div class="name">网络安全·数字时代大长城</div><div class="sub"><span>活动 后天 14:00</span></div></div><div class="c-place">教学楼 A301</div><div class="c-state"><span class="left">2 时 14 分</span><span class="tag" data-k="armed"><i class="dot"></i>等开放</span></div></div>
+    <div class="row is-armed" data-st="open" aria-selected="false"><div class="c-time"><span class="t">21:05</span><span class="s">:23</span></div><div class="c-main"><div class="name">网络安全·数字时代大长城</div><div class="sub"><span>报名截止 明天 00:05:23</span><span>活动 后天 14:00</span></div></div><div class="c-place">教学楼 A301</div><div class="c-state"><span class="tag" data-k="armed"><i class="dot"></i>提交中</span><span class="small">已开放 不到 1 分钟</span></div></div>
+    <div class="cap">开放中</div>
+    <div class="row" data-st="open" aria-selected="false"><div class="c-time"><span class="t">20:38</span></div><div class="c-main"><div class="name">专升本学习经验交流会</div><div class="sub"><span>报名截止 明天 00:38</span><span>活动 明天 19:00</span></div></div><div class="c-place">求是楼 201</div><div class="c-state"><span class="tag" data-k="open">开放中</span><span class="small">已开放 23 分钟</span></div></div>
+    <div class="cap">刚报上（本次抢到，列表还没刷新）/ 已报名 / 已截止 / 时间待公布。不按天分组的行，开放时刻下面补一行日期</div>
+    <div class="row" data-st="signed" aria-selected="false"><div class="c-time"><span class="t">21:09</span></div><div class="c-main"><div class="name">网络安全·数字时代大长城</div><div class="sub"><span>活动 后天 14:00</span></div></div><div class="c-place">教学楼 A301</div><div class="c-state"><span class="tag" data-k="ok"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>刚报上</span></div></div>
+    <div class="row" data-st="signed" aria-selected="false"><div class="c-time"><span class="t">16:00</span><span class="d">昨天</span></div><div class="c-main"><div class="name">我与学生面对面（天软信息化发展之路）</div><div class="sub"><span>活动 明天 14:00</span></div></div><div class="c-place">报告厅</div><div class="c-state"><span class="tag" data-k="signed"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>已报名</span></div></div>
+    <div class="row" data-st="closed" aria-selected="false"><div class="c-time"><span class="t">19:00</span><span class="d">昨天</span></div><div class="c-main"><div class="name">职业生涯规划讲座</div><div class="sub"><span>活动 明天 15:00</span></div></div><div class="c-place">报告厅</div><div class="c-state"><span class="tag" data-k="closed">已截止</span></div></div>
+    <div class="row" data-st="unknown" aria-selected="false"><div class="c-time"><span class="t">--:--</span></div><div class="c-main"><div class="name">宿舍文化节摄影征集</div><div class="sub"><span>活动 10月31日 周五 00:00</span></div></div><div class="c-place">线上</div><div class="c-state"><span class="tag" data-k="unknown">待公布</span></div></div>
+  </div>
+  <div class="rows-demo" style="margin-top:12px">
+    <div class="gsec" data-g="open"><div class="grp" style="position:static"><b>正在开放</b><span>现在就能报</span><span class="count">1 场</span></div></div>
+    <div class="nowline"><span class="nowline-chip">现在 <b>21:01</b></span></div>
+    <div class="gsec"><div class="grp" style="position:static"><b>今天</b><span>10月22日 周四</span><span class="count">1 场</span></div></div>
+    <div class="gsec" data-g="signed"><div class="grp" style="position:static"><b>已报名</b><span class="count">3 场</span></div></div>
+    <div class="cap" style="border-top:1px solid var(--line)">分组顺序：正在开放 → 「现在」线 → 按天（今天 / 明天 / 后天 / 日期）→ 报名时间待公布 → 刚截止 → 已报名。分组条吸顶。</div>
+  </div>
+
+  <!-- ============================================================ 线路图与检查条 -->
+  <h2 id="route">线路图与检查条</h2>
+  <p class="lead">线路图只画脚本里真有动作的时刻：一开始就打开活动页，开放前 5 秒开始盯按钮，开放后最多试到第 120 秒。走过的站变白，当前站琥珀，进入最后几秒变红。</p>
+  <div class="demo dark">
+    <span class="demo-cap">等开放（当前在「活动页已打开」）</span>
+    <div class="route-demo"><div class="route" style="--n:5">
+      <div class="stn" data-s="done"><i class="stn-dot"></i><span class="stn-name">开始等待</span><span class="stn-time">21:01:48</span></div>
+      <div class="stn" data-s="now"><i class="stn-dot"></i><span class="stn-name">活动页已打开</span><span class="stn-time">21:01:51</span></div>
+      <div class="stn" data-s="todo"><i class="stn-dot"></i><span class="stn-name">盯按钮</span><span class="stn-time">23:16:20</span></div>
+      <div class="stn" data-s="todo"><i class="stn-dot"></i><span class="stn-name">开放</span><span class="stn-time">23:16:25</span></div>
+      <div class="stn" data-s="todo"><i class="stn-dot"></i><span class="stn-name">最晚到这里</span><span class="stn-time">23:18:25</span></div>
+    </div></div>
+  </div>
+  <div class="demo dark" style="margin-top:12px">
+    <span class="demo-cap">正在提交（当前在「开放」，红色）</span>
+    <div class="route-demo"><div class="route" style="--n:5">
+      <div class="stn" data-s="done"><i class="stn-dot"></i><span class="stn-name">开始等待</span><span class="stn-time">21:05:16</span></div>
+      <div class="stn" data-s="done"><i class="stn-dot"></i><span class="stn-name">活动页已打开</span><span class="stn-time">21:05:19</span></div>
+      <div class="stn" data-s="done"><i class="stn-dot"></i><span class="stn-name">盯按钮</span><span class="stn-time">21:05:19</span></div>
+      <div class="stn" data-s="hot"><i class="stn-dot"></i><span class="stn-name">开放</span><span class="stn-time">21:05:23</span></div>
+      <div class="stn" data-s="todo"><i class="stn-dot"></i><span class="stn-name">最晚到这里</span><span class="stn-time">21:07:23</span></div>
+    </div></div>
+  </div>
+  <div class="demo dark" style="margin-top:12px">
+    <span class="demo-cap">挂之前的检查：通过 / 提醒 / 不行</span>
+    <span class="chk" data-tone="ok"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>登录撑得到开放</span>
+    <span class="chk" data-tone="ok"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>时钟准</span>
+    <span class="chk" data-tone="warn"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg>登录约 22:58:53 过期</span>
+    <span class="chk" data-tone="warn"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg>本机慢 6 秒</span>
+    <span class="chk" data-tone="warn"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg>开放在 24 小时以后</span>
+    <span class="chk" data-tone="bad"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>网络断开了</span>
+    <label class="tg"><input type="checkbox" checked><span class="box"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></span>看着它点（显示浏览器）</label>
+    <label class="tg"><input type="checkbox"><span class="box"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></span>结束响一声</label>
+  </div>
+
+  <!-- ============================================================ 横幅与提示 -->
+  <h2 id="alerts">横幅与提示</h2>
+  <p class="lead">横幅只给两种会让这次报名白等的情况：断网、电脑睡过一觉。其余的反馈都在大屏上，不弹窗打断。轻提示只确认一个刚做完的动作。</p>
+  <div class="demo" style="flex-direction:column;align-items:stretch">
+    <div class="banner" data-tone="bad"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18"/><path d="M8.5 16.4a5 5 0 0 1 7 0M5 12.9a10 10 0 0 1 4.8-2.6M19 12.9a10 10 0 0 0-2.3-1.6M2 9.4a15 15 0 0 1 4.3-2.7M22 9.4A15 15 0 0 0 11 5.8"/><path d="M12 20h.01"/></svg><span class="grow"><b>网络断开了。</b>到点时还没恢复，这次报名会失败。恢复以后看一眼大屏。</span></div>
+    <div class="banner" data-tone="warn"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z"/></svg><span class="grow"><b>刚才有 25 分钟界面没动静，电脑可能睡眠了。</b>要是睡过了开放时间，就赶不上了。看看大屏和运行记录。</span><button class="btn btn-ghost" type="button">知道了</button></div>
+    <div style="display:flex;flex-wrap:wrap;gap:10px">
+      <div class="toast static-toast" data-tone="ok"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg><span>运行记录已复制</span></div>
+      <div class="toast static-toast" data-tone="info"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg><span>已停止，不会再替你报名「网络安全·数字时代大长城」</span></div>
+      <div class="toast static-toast" data-tone="warn"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg><span>正在等开放，先停止才能重新登录。</span></div>
+    </div>
+  </div>
+
+  <!-- ============================================================ 运行记录 -->
+  <h2 id="log">运行记录</h2>
+  <p class="lead">脚本原话一字不改，只按前缀上色：<code>[OK]</code> 绿、<code>[X]</code> 红、<code>[!]</code> 橙、<code>▶</code> 蓝，Traceback 灰。平时收成一行，只显示最新一句；展开后可以复制全部、清空、打开数据目录。</p>
+  <div class="log-demo">
+    <div class="lg" data-k="start"><span class="lt">21:05:16</span><span class="tx">▶ 等待并抢报名：网络安全·数字时代大长城</span></div>
+    <div class="lg" data-k="info"><span class="lt">21:05:16</span><span class="tx">[i] 报名开始：2026-10-22 21:05:23；提前 100 秒打开页面；失败重试窗口 120 秒</span></div>
+    <div class="lg" data-k="info"><span class="lt">21:05:19</span><span class="tx">[i] 详情页已加载</span></div>
+    <div class="lg" data-k="warn"><span class="lt">21:05:19</span><span class="tx">[!] 本机时钟与服务器相差 +6 秒，建议校准系统时间后再抢。</span></div>
+    <div class="lg" data-k="info"><span class="lt">21:05:25</span><span class="tx">[i] 第 2 次提交：code:0 未到报名时间</span></div>
+    <div class="lg" data-k="ok"><span class="lt">21:05:28</span><span class="tx">[OK] 报名成功：网络安全·数字时代大长城</span></div>
+    <div class="lg" data-k="bad"><span class="lt">21:07:45</span><span class="tx">[X] 没抢到：名额已满／页面未放开</span></div>
+    <div class="lg" data-k="cont"><span class="lt">21:07:45</span><span class="tx">    建议手动打开活动页确认，必要时再试一次。</span></div>
+    <div class="lg" data-k="trace"><span class="lt">21:07:46</span><span class="tx">playwright._impl._errors.Error: Page.reload: net::ERR_INTERNET_DISCONNECTED</span></div>
+  </div>
+
+  <!-- ============================================================ 动效 -->
+  <h2 id="motion">动效</h2>
+  <p class="lead">只有一个刻意安排的动效：点「到点自动报名」那一下，点阵屏闪着亮起来，像车站换牌。其余都是对状态的提示。系统开了「减少动态效果」时全部关掉。</p>
+  <table class="spec">
+    <tr><th>动效</th><th>什么时候</th><th>时长</th><th>说明</th></tr>
+    <tr><td>点阵屏闪亮</td><td>点「到点自动报名」「立即替我报名」</td><td class="num">420ms</td><td>只这一次；之后每秒跳字不带动画</td></tr>
+    <tr><td>呼吸点</td><td>「等开放」「正在登录」「提交中」标签上的小圆点</td><td class="num">1.4s 循环</td><td>告诉人程序没卡死；最后几秒的站点 1s 循环</td></tr>
+    <tr><td>大屏换状态</td><td>大屏内容整体换掉时</td><td class="num">160ms 淡入</td><td>每秒的数字更新不触发</td></tr>
+    <tr><td>弹窗、轻提示</td><td>打开时</td><td class="num">140–180ms</td><td>上移 6px + 淡入</td></tr>
+    <tr><td>刷新中</td><td>拉列表时</td><td class="num">0.9s 循环</td><td>刷新图标转圈；列表顶上一条 2px 扫光</td></tr>
+  </table>
+
+  <!-- ============================================================ 尺寸 -->
+  <h2 id="space">尺寸</h2>
+  <table class="spec">
+    <tr><th>项</th><th>值</th><th>说明</th></tr>
+    <tr><td>栅格</td><td class="num">8px（细调 2/4/6）</td><td>页边距 16，980 宽时 12</td></tr>
+    <tr><td>圆角</td><td class="num">14 / 10 / 8 / 6 / 4 / 999</td><td>大屏 / 卡片 / 按钮 / 小控件 / 标签 / 胶囊</td></tr>
+    <tr><td>阴影</td><td class="num">只给浮层</td><td>弹窗、轻提示、浮层卡片；页面里的卡片只用 1px 描边</td></tr>
+    <tr><td>顶栏</td><td class="num">56（高不足 720 时 50）</td><td></td></tr>
+    <tr><td>大屏</td><td class="num">212（高不足 720 时 190）</td><td>宽不足 860 时退成上下排，高度自适应</td></tr>
+    <tr><td>时刻表行</td><td class="num">最低 56（52）</td><td>列：76 开放时刻 / 弹性 活动 / 156 地点 / 132 状态</td></tr>
+    <tr><td>点阵数字</td><td class="num">72px 高（60 / 56）</td><td>每字 5×7 点，冒号 1×7</td></tr>
+    <tr><td>运行记录</td><td class="num">收起 38 / 展开 +196</td><td>展开高度不足 720 时 150</td></tr>
+  </table>
+
+  <p class="sh-foot">准点 · 组件与规范 · 2026-10-22</p>
+</div>
+
+<script src="app/led.js"></script>
+<script>
+(function () {
+  "use strict";
+  const g = document.getElementById("glyphs");
+  ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ":", "-", "✓", "✕"].forEach((ch) => {
+    const f = document.createElement("figure");
+    const w = document.createElement("div");
+    w.className = "led-wrap";
+    f.appendChild(w);
+    const c = document.createElement("figcaption");
+    c.textContent = ch;
+    f.appendChild(c);
+    g.appendChild(f);
+    LED.mount(w).set(ch, ch === "✓" ? "green" : ch === "✕" ? "red" : "amber");
+  });
+  const t = document.getElementById("tones");
+  [["amber", "02:14:37", "正在等"], ["dim", "00:07:16", "还没开始等"], ["red", "00:00:04", "最后 10 秒"], ["green", "✓", "成功"], ["off", "--:--:--", "停止、待公布"]].forEach(([tone, text, cap]) => {
+    const f = document.createElement("figure");
+    const w = document.createElement("div");
+    w.className = "led-wrap";
+    f.appendChild(w);
+    const c = document.createElement("figcaption");
+    c.textContent = `${tone} · ${cap}`;
+    f.appendChild(c);
+    t.appendChild(f);
+    LED.mount(w).set(text, tone);
+  });
+
+  const BOARDS = [
+    ["01-ready", "空闲 · 下一场", "没选东西时，大屏挂着全局的下一场。"],
+    ["04-preview", "预览 · 未开放", "选中一场：检查条 + 两个开关 + 主按钮。"],
+    ["05-preview-warn", "预览 · 登录撑不到开放", "主按钮换成「先重新登录」。"],
+    ["06-preview-open", "预览 · 开放中", "倒计时改成距报名截止。"],
+    ["16-clock-skew", "预览 · 时钟偏差", "说清偏多少、往哪偏、去哪同步。"],
+    ["07-armed", "等开放", "琥珀倒计时 + 线路图。"],
+    ["08-final", "马上开放", "最后几秒转红。"],
+    ["09-submitting", "正在提交", "倒计时改成「还能试到」。"],
+    ["10-success", "报名成功", "绿 ✓。"],
+    ["11-fail-full", "没抢到 · 名额已满", "红 ✕，给原因和下一步。"],
+    ["12-fail-login", "没抢到 · 登录中途失效", "复查以后改口，指出真原因。"],
+    ["20-already", "已经报过", ""],
+    ["19-stopped", "已停止", "灭灯。"],
+    ["03-logging-in", "正在登录", "三步 + 最多还能等多久。"],
+    ["21-login-ok", "登录好了", ""],
+    ["22-login-fail", "登录没完成", ""],
+    ["02-first-run", "还没登录", "（截图里叠着首次说明弹窗）"],
+    ["17-expired", "登录已失效", ""],
+    ["15-offline", "连不上学校站点", ""],
+    ["18-empty", "近期没有要开放的活动", ""],
+  ];
+  document.getElementById("boards-grid").innerHTML = BOARDS.map(([f, title, cap]) =>
+    `<figure><img src="../shots/board/${f}.png" alt="${title}"><figcaption><b>${title}</b>${cap ? "　" + cap : ""}</figcaption></figure>`).join("");
+
+  const led = LED.mount(document.getElementById("hero-led"));
+  const pad = (n) => String(n).padStart(2, "0");
+  (function tick() {
+    const d = new Date();
+    led.set(`${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`, "amber");
+    setTimeout(tick, 1000 - (Date.now() % 1000) + 8);
+  })();
+})();
+</script>
+</body>
+</html>
