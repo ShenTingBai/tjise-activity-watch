@@ -2,115 +2,74 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>天软活动报名</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>准点 · 天软活动报名</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <div class="app-shell">
-    <header class="topbar">
-      <div class="brand-lockup">
-        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
-        <div>
-          <p class="brand-kicker">报名时间队列</p>
-          <h1>天软活动报名</h1>
-          <p class="brand-subtitle">选好多场活动，开放时按批次自动提交。</p>
-        </div>
+  <div class="zd" id="zd">
+    <header class="top">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 28 28" aria-hidden="true"><rect width="28" height="28" rx="7" fill="#121513"/><circle cx="14" cy="9.5" r="2.6" fill="#FFB020"/><circle cx="14" cy="18.5" r="2.6" fill="#FFB020"/></svg>
+        <div class="brand-text"><span class="brand-name">准点</span><span class="brand-desc">天软活动，到点替你报名</span></div>
       </div>
-      <div class="top-actions">
-        <div class="status-block">
-          <span id="pill" class="pill" data-state="unknown"><i aria-hidden="true"></i>登录态未知</span>
-          <span id="status-detail" class="status-detail">正在读取本机状态</span>
-        </div>
-        <button id="btn-help" class="btn btn-quiet" type="button">使用说明</button>
-        <button id="btn-refresh" class="btn btn-quiet" type="button" title="刷新活动列表（F5）">刷新</button>
-        <button id="btn-login" class="btn btn-primary" type="button">登录 / 重新登录</button>
+      <div class="top-right">
+        <button class="clock" id="clock" type="button" aria-label="本机时间"><span class="clock-time" id="clock-time">--:--:--</span></button>
+        <button class="pill" id="pill" type="button" data-state="unknown"><i aria-hidden="true"></i><b>登录态未知</b></button>
+        <span id="status-detail" class="sr-only"></span>
+        <span class="top-sep" aria-hidden="true"></span>
+        <button class="btn btn-ghost" id="btn-help" type="button"><span class="icon">?</span><span class="lbl">说明</span></button>
+        <button class="btn btn-ghost" id="btn-refresh" type="button" title="刷新登录状态和活动列表（F5）"><span class="icon">↻</span><span class="lbl">刷新</span></button>
+        <button class="btn btn-line" id="btn-login" type="button"><span class="icon">↪</span><span class="lbl">登录</span></button>
       </div>
     </header>
 
-    <section class="signal-rail" aria-label="值守摘要">
-      <div class="rail-lead">
-        <span class="rail-dot" aria-hidden="true"></span>
-        <span class="rail-label">报名计划</span>
-        <strong id="rail-message">先选活动，系统会检查举办时间冲突。</strong>
-      </div>
-      <div class="rail-metric"><span>列表</span><strong id="metric-total">—</strong></div>
-      <div class="rail-metric"><span>可报名</span><strong id="metric-free">—</strong></div>
-      <div class="rail-metric rail-next"><span>下一个开放</span><strong id="metric-next">—</strong></div>
-    </section>
+    <div class="banners" id="banners"></div>
 
-    <main class="workspace">
-      <div class="left-stack">
-        <section class="activity-panel" aria-labelledby="activity-title">
-          <div class="panel-heading">
-            <div><p class="eyebrow">活动清单</p><h2 id="activity-title">加入报名计划</h2></div>
-            <span id="count" class="count">—</span>
-          </div>
-          <div class="toolbar">
-            <label class="search-wrap">
-              <span class="search-icon" aria-hidden="true"></span>
-              <span class="sr-only">搜索活动</span>
-              <input id="q" class="search" type="search" placeholder="搜索活动名或地点" autocomplete="off">
-            </label>
-            <div class="chips" id="chips" role="tablist" aria-label="活动状态">
-              <button class="chip is-on" type="button" data-status="all" role="tab" aria-selected="true">全部</button>
-              <button class="chip" type="button" data-status="free" role="tab" aria-selected="false">未报名</button>
-              <button class="chip" type="button" data-status="signed" role="tab" aria-selected="false">已报名</button>
-            </div>
-            <label class="select-wrap"><span class="sr-only">时间筛选</span><select id="time" class="select"><option value="all">时间不限</option><option value="today">今天开放</option><option value="week">七天内开放</option></select></label>
-            <label class="select-wrap"><span class="sr-only">排序方式</span><select id="sort" class="select"><option value="open">按开放时间</option><option value="name">按活动名</option></select></label>
-            <label class="select-wrap"><span class="sr-only">签到要求</span><select id="checkin" class="select"><option value="all">签到：全部</option><option value="yes">签到：需要</option><option value="no">签到：无需</option></select></label>
-            <label class="select-wrap"><span class="sr-only">签退要求</span><select id="checkout" class="select"><option value="all">签退：全部</option><option value="yes">签退：需要</option><option value="no">签退：无需</option></select></label>
-          </div>
-          <div class="table-frame">
-            <div class="table-scroll">
-              <table>
-                <caption class="sr-only">可报名活动列表</caption>
-                <thead><tr><th class="c-select">选</th><th class="c-left">距开放</th><th class="c-time">报名开始</th><th class="c-state">状态</th><th class="c-name">活动 / 举办时间</th><th class="c-place">地点</th></tr></thead>
-                <tbody id="rows"></tbody>
-              </table>
-            </div>
-            <div id="empty" class="empty" hidden>
-              <div class="empty-mark" aria-hidden="true">⌁</div>
-              <p id="empty-title" class="empty-title">这里还没有活动</p>
-              <p id="empty-text" class="empty-text">点「刷新」拉一次；提示登录态失效就先点「登录」。</p>
-              <button id="empty-action" class="btn btn-mini empty-action" type="button" hidden>刷新</button>
-            </div>
-          </div>
-        </section>
-
-        <section class="log-card" aria-labelledby="log-title">
-          <div class="log-head">
-            <div><p class="eyebrow">现场记录</p><h2 id="log-title">运行日志</h2></div>
-            <span class="log-state">只显示本机脚本原话</span>
-            <span class="log-tools"><button id="btn-log-toggle" class="btn btn-mini" type="button">展开</button><button id="btn-log-clear" class="btn btn-mini btn-quiet" type="button">清空</button></span>
-          </div>
-          <pre id="log" class="log" aria-live="polite"></pre>
-        </section>
-      </div>
-
-      <aside class="action-panel" aria-labelledby="action-title">
-        <div class="action-heading"><div><p class="eyebrow">报名计划</p><h2 id="action-title">选好后一次安排</h2></div><span class="action-key" aria-hidden="true">Enter</span></div>
-        <div id="selected" class="selected-empty">还没选活动<span>在左侧勾选一场或多场</span></div>
-        <div class="countdown-box"><span class="countdown-label">最近开放批次</span><strong id="countdown">待选</strong></div>
+    <section class="board" id="board" aria-label="报名计划" aria-live="polite">
+      <div class="b-main">
+        <div class="b-tags"><span class="b-tag" data-tone="amber"><i></i>报名计划</span><span class="b-note" id="rail-message">先选活动，系统会检查举办时间冲突。</span></div>
+        <h2 class="b-title" id="selected">还没选活动<span>在下方时刻表勾选一场或多场</span></h2>
+        <div class="b-sub"><span><b>最近开放</b><strong class="num" id="countdown">待选</strong></span><span><b>列表</b><strong id="metric-total">—</strong></span><span><b>可报名</b><strong id="metric-free">—</strong></span></div>
         <div id="plan-conflicts" class="plan-conflicts" role="alert" hidden></div>
         <div id="plan-tasks" class="plan-tasks" aria-live="polite"></div>
-        <label class="headed-option"><input type="checkbox" id="headed"><span>显示浏览器窗口</span><small>每场任务都使用这个选项</small></label>
-        <div class="action-buttons"><button id="btn-plan" class="btn btn-primary btn-action" type="button" disabled>开始报名计划</button><button id="btn-stop" class="btn btn-stop" type="button" disabled>停止计划</button><button id="btn-clear-plan" class="btn btn-mini btn-clear-plan" type="button">清空选择</button></div>
-        <p id="result" class="result" role="status" aria-live="polite" hidden></p>
+        <p id="result" class="result" role="status" aria-live="assertive" hidden></p>
+      </div>
+      <aside class="b-side">
+        <span class="b-side-label">下一场开放</span><strong class="b-next num" id="metric-next">待公布</strong>
+        <label class="headed-option"><input type="checkbox" id="headed"><span>显示浏览器窗口</span></label>
+        <div class="b-actions"><button id="btn-plan" class="btn btn-blue btn-action" type="button" disabled>开始报名计划</button><button id="btn-stop" class="btn btn-stop" type="button" disabled>停止</button></div>
+        <button id="btn-clear-plan" class="btn btn-ghost btn-clear-plan" type="button">清空选择</button>
         <button id="btn-open" class="link-button" type="button">打开数据目录</button>
-        <p class="action-note">电脑保持唤醒、网络保持畅通。窗口可以最小化。</p>
       </aside>
-    </main>
+    </section>
+
+    <section class="table" aria-label="活动时刻表">
+      <div class="filters">
+        <label class="search"><span class="search-icon" aria-hidden="true">⌕</span><input id="q" type="search" placeholder="搜活动名或地点" autocomplete="off" aria-label="搜活动名或地点"></label>
+        <div class="seg" id="chips" role="group" aria-label="报名状态"><button class="chip" type="button" data-status="free" aria-selected="false">可报名</button><button class="chip" type="button" data-status="signed" aria-selected="false">已报名</button><button class="chip" type="button" data-status="all" aria-selected="true">全部</button></div>
+        <label class="filter-select"><span>开放</span><select id="time" aria-label="开放时间"><option value="all">不限</option><option value="today">今天</option><option value="week">7 天内</option></select></label>
+        <label class="filter-select"><span>排序</span><select id="sort" aria-label="排序方式"><option value="open">按开放时间</option><option value="name">按活动名</option></select></label>
+        <label class="filter-select"><span>签到</span><select id="checkin" aria-label="签到要求"><option value="all">全部</option><option value="yes">需要</option><option value="no">无需</option></select></label>
+        <label class="filter-select"><span>签退</span><select id="checkout" aria-label="签退要求"><option value="all">全部</option><option value="yes">需要</option><option value="no">无需</option></select></label>
+        <span class="meta" id="count">—</span>
+      </div>
+      <div class="list" id="list" tabindex="0">
+        <table class="activity-table"><thead><tr><th class="c-select">选</th><th class="c-left">距开放</th><th class="c-time">报名开始</th><th class="c-state">状态</th><th class="c-name">活动 / 举办时间</th><th class="c-place">地点</th></tr></thead><tbody id="rows"></tbody></table>
+        <div id="empty" class="empty" hidden><div class="empty-mark">⌁</div><p id="empty-title">这里还没有活动</p><p id="empty-text">点「刷新」拉一次；提示登录态失效就先点「登录」。</p><button id="empty-action" class="btn btn-line btn-mini" type="button" hidden>刷新</button></div>
+      </div>
+    </section>
+
+    <footer class="logbar log-card" id="logbar" data-open="false">
+      <div class="logbar-head"><span class="logbar-title">运行记录</span><span class="logbar-last">只显示本机脚本原话</span><div class="logbar-tools"><button class="btn btn-ghost" type="button" id="btn-log-clear">清空</button><button class="btn btn-ghost" type="button" id="btn-log-toggle" aria-expanded="false">展开</button></div></div>
+      <pre class="logbody log" id="log" role="log" aria-label="运行记录"></pre>
+    </footer>
   </div>
 
-  <dialog id="help" class="modal">
-    <div class="modal-topline"><span class="modal-mark" aria-hidden="true">●</span><span>三步开始值守</span></div>
-    <h2 id="help-title">报名值守台</h2>
-    <p id="help-sub" class="modal-sub"></p>
-    <ol id="help-steps" class="steps"></ol>
-    <p id="help-note" class="modal-note"></p>
-    <form method="dialog" class="modal-foot"><button class="btn btn-primary" type="submit">知道了</button></form>
+  <dialog class="dlg" id="help" aria-labelledby="help-title">
+    <div class="dlg-head"><h2 id="help-title">准点怎么用</h2><p id="help-sub">登录一次，选好活动，开放时按计划提交。</p></div>
+    <div class="dlg-body"><ol class="steps" id="help-steps"></ol><p class="rules" id="help-note"></p></div>
+    <div class="dlg-foot"><span class="grow"></span><form method="dialog"><button class="btn btn-solid" type="submit">知道了</button></form></div>
   </dialog>
   <script src="app.js"></script>
 </body>

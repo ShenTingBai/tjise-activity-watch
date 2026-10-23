@@ -794,6 +794,8 @@ function activityTimeText(item) {
 }
 
 function tick() {
+  const clock = $("#clock-time");
+  if (clock) clock.textContent = new Date().toTimeString().slice(0, 8);
   S.rowEls.forEach((els, id) => {
     const item = findItem(id);
     if (!item || !els.left) return;
