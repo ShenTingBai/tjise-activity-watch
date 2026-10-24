@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -105,9 +106,10 @@ def build_branch(name: str, subdir: str, extras: list[str], dry: bool) -> None:
         note.write_text(
             "# 这是自动生成的分发快照\n\n"
             "内容由 main 分支的 `%s/` 目录拆出，每次发布重建一次并强制推送。\n"
+            "来源：main@%s；生成时间：%s。\n"
             "**不要在这条分支上改代码**——改动会在下次发布时被覆盖。\n"
             "改代码请提到 main，再运行 `python tools/split_branches.py`。\n"
-            % subdir, encoding="utf-8")
+            % (subdir, SOURCE_COMMIT, datetime.now().isoformat(timespec="seconds")), encoding="utf-8")
 
         run(["git", "add", "-A"], tmp)
         if run(["git", "status", "--porcelain"], tmp).strip():
@@ -133,11 +135,24 @@ def remote_url() -> str:
 
 
 REMOTE = ""
+SOURCE_COMMIT = ""
+
+
+def source_state() -> str:
+    """分发快照只能从干净 main 生成，避免覆盖远端快照为半成品。"""
+    branch = run(["git", "branch", "--show-current"], ROOT).strip()
+    dirty = run(["git", "status", "--porcelain"], ROOT).strip()
+    if branch != "main":
+        raise SystemExit("分发快照必须从 main 生成，当前分支是 %s" % (branch or "（分离 HEAD）"))
+    if dirty:
+        raise SystemExit("分发快照要求工作区干净，请先提交或清理改动：\n%s" % dirty)
+    return run(["git", "rev-parse", "--short", "HEAD"], ROOT).strip()
 
 
 def main() -> int:
-    global REMOTE
+    global REMOTE, SOURCE_COMMIT
     REMOTE = remote_url()
+    SOURCE_COMMIT = source_state()
     ap = argparse.ArgumentParser(description="生成服务器版/本机版分发分支")
     ap.add_argument("--dry-run", action="store_true", help="只建不推")
     ap.add_argument("--only", choices=sorted(SNAPSHOTS), help="只处理一条分支")

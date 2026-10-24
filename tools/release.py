@@ -33,6 +33,17 @@ SERVER_EXCLUDE = {"config.json", "data", "dist", "reports",
                   "__pycache__", "node_modules"}
 
 
+def source_commit() -> str:
+    """Release 只能从干净 main 读取，避免把设计分支或半成品发布出去。"""
+    branch = run(["git", "branch", "--show-current"]).strip()
+    dirty = run(["git", "status", "--porcelain"]).strip()
+    if branch != "main":
+        raise SystemExit("Release 必须从 main 运行，当前分支是 %s" % (branch or "（分离 HEAD）"))
+    if dirty:
+        raise SystemExit("Release 要求工作区干净，请先提交或清理改动：\n%s" % dirty)
+    return run(["git", "rev-parse", "--short", "HEAD"]).strip()
+
+
 def run(cmd: list[str], cwd: Path = ROOT, env: dict | None = None) -> str:
     res = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, env=env,
                          encoding="utf-8", errors="replace")
@@ -129,8 +140,13 @@ def main() -> int:
     ap.add_argument("tag", help="例如 v1.0.0")
     ap.add_argument("--skip-portable", action="store_true", help="复用已有绿色版目录")
     ap.add_argument("--no-branches", action="store_true", help="不更新 local/server 分发分支")
+    ap.add_argument("--dry-run", action="store_true", help="只检查来源分支并打印 commit，不构建、不打 tag、不上传")
     args = ap.parse_args()
     tag = args.tag if args.tag.startswith("v") else "v" + args.tag
+    commit = source_commit()
+    if args.dry_run:
+        print("[dry-run] 来源：main@%s；目标 tag：%s；不会构建、打 tag 或上传" % (commit, tag))
+        return 0
 
     if args.skip_portable:
         print("[1/4] 跳过绿色版构建")

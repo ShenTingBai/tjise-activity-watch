@@ -182,6 +182,18 @@ tjise-activity-watch/
 
 运行时生成 `server/data/`（会话、状态、日志）与 `reports/`，不入库；本机版开发/bat 运行在 `local/data/`，EXE 版在 `%LOCALAPPDATA%\TianSoftActivityPreRegistration\data`（重建 EXE 不会删除登录态）。
 
+## Git 分支与发布边界
+
+| 分支 | 角色 | 能不能直接改 | 来源/更新方式 |
+|---|---|---|---|
+| `main` | 唯一开发、评审和发布真源 | ✅ 可以 | 所有代码、docs、design 改动先进入这里 |
+| `design` | 短期设计工作分支 | ⚠️ 只在设计评审期间使用 | 设计确认后合并回 `main` 并删除 |
+| `local` | 本机版根目录分发快照 | ❌ 不要直接改 | `tools/split_branches.py` 从 `main` 自动生成并强制刷新 |
+| `server` | 服务器版根目录部署快照 | ❌ 不要直接改 | `tools/split_branches.py` 从 `main` 自动生成并强制刷新 |
+
+`local` / `server` 可能落后于 `main`，它们只在 Release 流程中刷新；下载前看 GitHub Release 的版本和日期。
+开发时始终切到 `main`（或从 `main` 开出的短期 feature 分支），不要在分发快照上提 PR。发布脚本会拒绝从非 `main` 或有未提交改动的工作区生成快照。
+
 ## 文档
 
 | 文档 | 内容 |
