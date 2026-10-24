@@ -19,6 +19,13 @@ from typing import Callable, Iterable
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 TERMINAL_TASK_STATES = {"success", "already_signed", "failed", "canceled"}
 
+# 报名模式三分类：预报名 / 立即报名（抢名额）/ 已截止，都是正式产品模式
+SIGNUP_MODES = ("pre_register", "instant_signup", "closed")
+
+# 一次性运行时 checkpoint：第一次写入后固定，迟到/重放事件不得改写；
+# attempts/last_reason 是进度字段，跟随最新一次提交。
+CHECKPOINT_FIELDS = ("run_started_at", "page_opened_at", "watch_started_at", "retry_deadline")
+
 
 def parse_timestamp(value: object) -> datetime | None:
     """解析学校返回的本地时间；缺失、非法值都返回 None，不猜当前日期。"""
@@ -30,6 +37,27 @@ def parse_timestamp(value: object) -> datetime | None:
         return None
 
 
+def classify_signup_mode(sign_start: str, sign_end: str,
+                         now: float | None = None) -> str:
+    """按报名窗口把活动分成三种执行模式（前后端共用的唯一口径）。
+
+    - sign_end 能解析且已过去 → closed：报名资格已结束，只读查看；
+    - sign_start 在未来 → pre_register：预报名，等学校原定开放时刻提交；
+    - 其余（已开放，含 sign_end 缺失/非法）→ instant_signup：
+      立即报名/抢名额，从本次启动立即执行。
+    截止缺失沿用 worker 的安全回退，不误当成已截止；
+    活动举办时间 act_start/act_end 不参与分类——它只用于冲突检查。
+    """
+    now = time.time() if now is None else now
+    end = parse_timestamp(sign_end)
+    if end is not None and end.timestamp() <= now:
+        return "closed"
+    start = parse_timestamp(sign_start)
+    if start is not None and start.timestamp() > now:
+        return "pre_register"
+    return "instant_signup"
+
+
 def intervals_overlap(start_a: datetime, end_a: datetime,
                       start_b: datetime, end_b: datetime) -> bool:
     """按半开区间判断举办时间是否重叠，首尾相接不算冲突。"""
@@ -38,7 +66,11 @@ def intervals_overlap(start_a: datetime, end_a: datetime,
 
 @dataclass(frozen=True)
 class TaskSpec:
-    """协调器需要的最小活动快照，避免后续列表刷新改变任务目标。"""
+    """协调器需要的最小活动快照，避免后续列表刷新改变任务目标。
+
+    sign_end / retry_for_s / max_attempts 是计划级重试策略：
+    同一计划里每场共用策略，sign_end 仍按活动各自的截止时间截断。
+    """
 
     task_id: str
     activity_id: str
@@ -47,9 +79,19 @@ class TaskSpec:
     act_start: str
     act_end: str
     headed: bool = False
+    sign_end: str = ""
+    retry_for_s: int = 120
+    max_attempts: int = 0
+    # 报名模式在计划创建时定格：之后时间推移不改写快照里的模式与文案
+    signup_mode: str = ""
+    # 预报名提前准备窗口（秒）：协调器在 sign_start-lead_s 启动 worker，
+    # worker 先打开详情页、开放前 5 秒进入盯按钮；快照携带，重载不丢
+    lead_s: int = 100
 
     @classmethod
-    def from_activity(cls, activity: dict, task_id: str, headed: bool = False) -> "TaskSpec":
+    def from_activity(cls, activity: dict, task_id: str, headed: bool = False,
+                      retry_for_s: int = 120, max_attempts: int = 0,
+                      now: float | None = None, lead_s: int = 100) -> "TaskSpec":
         return cls(
             task_id=str(task_id),
             activity_id=str(activity.get("id") or ""),
@@ -58,6 +100,12 @@ class TaskSpec:
             act_start=str(activity.get("act_start") or ""),
             act_end=str(activity.get("act_end") or ""),
             headed=bool(headed),
+            sign_end=str(activity.get("sign_end") or ""),
+            retry_for_s=int(retry_for_s),
+            max_attempts=int(max_attempts),
+            signup_mode=classify_signup_mode(str(activity.get("sign_start") or ""),
+                                             str(activity.get("sign_end") or ""), now),
+            lead_s=int(lead_s),
         )
 
     def as_dict(self) -> dict:
@@ -69,12 +117,22 @@ class TaskSpec:
             "act_start": self.act_start,
             "act_end": self.act_end,
             "headed": self.headed,
+            "sign_end": self.sign_end,
+            "retry_for_s": self.retry_for_s,
+            "max_attempts": self.max_attempts,
+            "signup_mode": self.signup_mode,
+            "lead_s": self.lead_s,
         }
 
 
-def validate_plan(activities: Iterable[dict]) -> dict:
-    """校验计划并返回冲突双方；结果可直接序列化给 UI。"""
+def validate_plan(activities: Iterable[dict], now: float | None = None) -> dict:
+    """校验计划并返回冲突双方；结果可直接序列化给 UI。
+
+    报名截止 sign_end 已过的活动报 sign_end_passed：报名资格看报名截止，
+    活动举办时间只用于冲突与完整性检查，不因举办时间已开始/结束而拦截。
+    """
     rows = list(activities or [])
+    now_ts = time.time() if now is None else now
     errors: list[dict] = []
     conflicts: list[dict] = []
     specs: list[TaskSpec] = []
@@ -93,10 +151,14 @@ def validate_plan(activities: Iterable[dict]) -> dict:
         if bool(activity.get("signed")):
             errors.append({"kind": "already_signed", "activity_id": aid, "name": name})
         sign_start = str(activity.get("sign_start") or "")
+        sign_end = str(activity.get("sign_end") or "")
         act_start = str(activity.get("act_start") or "")
         act_end = str(activity.get("act_end") or "")
         if parse_timestamp(sign_start) is None:
             errors.append({"kind": "invalid_sign_start", "activity_id": aid, "name": name})
+        if classify_signup_mode(sign_start, sign_end, now_ts) == "closed":
+            errors.append({"kind": "sign_end_passed", "activity_id": aid,
+                           "name": name, "sign_end": sign_end})
         start = parse_timestamp(act_start)
         end = parse_timestamp(act_end)
         if start is None or end is None:
@@ -163,6 +225,10 @@ class PlanCoordinator:
         self._lock = threading.RLock()
         self._events = {spec.task_id: threading.Event() for spec in self.specs}
         self._states = {spec.task_id: "queued" for spec in self.specs}
+        # 运行时 checkpoint（本次启动/页面打开/盯按钮/重试截止）：worker 事件
+        # 到达时写入，页面重载后从 plan snapshot 恢复真实节点，不用当前时间
+        # 伪造历史。checkpoint 先到先得；attempts/last_reason 跟随最新提交。
+        self._details: dict[str, dict] = {}
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -201,39 +267,62 @@ class PlanCoordinator:
             return self._plan_payload(self._plan_status())
 
     def _run(self) -> None:
-        for group in group_by_sign_start(self.specs):
+        # 每场按自己的准备时刻调度：instant_signup 在计划启动后立即拉起
+        # worker，pre_register 在原定开放前 lead_s 秒拉起（提前打开详情页，
+        # 开放前 5 秒进入盯按钮）；同一准备时刻的任务仍同时启动。
+        # 不再「按 sign_start 分组阻塞等待 + join 整批」——那会让 --lead 失效，
+        # 也会让第一场的重试把后面所有批次推迟过自己的准备时刻。
+        self._started_at = self.now()
+        pending = [spec for spec in self.specs
+                   if self._states.get(spec.task_id) not in TERMINAL_TASK_STATES]
+        for spec in pending:
+            self._set_state(spec.task_id, "waiting")
+        pending.sort(key=self._prepare_ts)
+        threads: list[threading.Thread] = []
+        index = 0
+        while index < len(pending) and not self._stop.is_set():
+            prepare_ts = self._prepare_ts(pending[index])
+            while self.now() < prepare_ts and not self._stop.is_set():
+                if all(self._events[s.task_id].is_set() for s in pending[index:]):
+                    break                     # 剩余任务全部取消：不再等这个时刻
+                self.sleep(min(0.2, max(0.01, prepare_ts - self.now())))
             if self._stop.is_set():
                 break
-            active = [spec for spec in group if self._states.get(spec.task_id) not in TERMINAL_TASK_STATES]
-            if not active:
-                continue
-            for spec in active:
-                self._set_state(spec.task_id, "waiting")
-            target = parse_timestamp(active[0].sign_start)
-            if target is not None:
-                target_ts = target.timestamp()
-                while self.now() < target_ts and not self._stop.is_set():
-                    if all(self._events[s.task_id].is_set() for s in active):
-                        break
-                    self.sleep(min(0.2, max(0.01, target_ts - self.now())))
-            threads = []
-            for spec in active:
+            while index < len(pending) and self._prepare_ts(pending[index]) == prepare_ts:
+                spec = pending[index]
+                index += 1
                 if self._events[spec.task_id].is_set():
-                    if self._states.get(spec.task_id) not in TERMINAL_TASK_STATES:
-                        self._set_state(spec.task_id, "canceled", {"reason": "用户取消了这一场"})
-                    continue
+                    continue                  # 已取消/停止：cancel 路径已置终态
                 thread = threading.Thread(target=self._run_one, args=(spec,),
                                           name="signup-task-%s" % spec.task_id, daemon=True)
                 threads.append(thread)
                 thread.start()
-            for thread in threads:
-                thread.join()
+        # 不在批次间 join：任务线程独立跑完（重试中的场次不阻塞后续调度）；
+        # 收尾统一等待全部落定，再发唯一一次 plan_done。
+        for thread in threads:
+            thread.join()
         self.emit("plan_done", {
             "plan_id": self.plan_id,
             "status": self._plan_status(),
             "ok": self._plan_status() == "completed",
             "summary": self._summary(),
         })
+
+    def _prepare_ts(self, spec: TaskSpec) -> float:
+        """任务的 worker 启动时刻（支持注入 now 的 fake clock）。
+
+        instant_signup → 计划启动时刻（立即执行，不等历史 sign_start）；
+        pre_register → 原定开放前 lead_s 秒（提前准备窗口）；
+        模式未指定（旧快照/直接构造）沿用旧行为等到 sign_start；
+        开放时刻缺失/非法退回计划启动时刻，可执行性由校验层保证。
+        """
+        if spec.signup_mode == "instant_signup":
+            return self._started_at
+        start = parse_timestamp(spec.sign_start)
+        if start is None:
+            return self._started_at
+        lead = max(0, int(spec.lead_s or 0)) if spec.signup_mode == "pre_register" else 0
+        return start.timestamp() - lead
 
     def _run_one(self, spec: TaskSpec) -> None:
         self._set_state(spec.task_id, "submitting")
@@ -257,16 +346,29 @@ class PlanCoordinator:
             spec = next((item for item in self.specs if item.task_id == task_id), None)
             if not spec:
                 return
+            # detail 合并进运行时快照：checkpoint 字段先到先得（重放/迟到的
+            # 同名字段不得改写已发生的节点，空值不落库）；其余字段跟随最新。
+            merged = self._details.setdefault(task_id, {})
+            for key, value in (detail or {}).items():
+                if key == "status":
+                    continue
+                if key in CHECKPOINT_FIELDS and (value in (None, "", 0, False)
+                                                 or merged.get(key) is not None):
+                    continue
+                merged[key] = value
             payload = {
                 "plan_id": self.plan_id,
                 "task_id": task_id,
                 "activity_id": spec.activity_id,
                 "name": spec.name,
                 "sign_start": spec.sign_start,
+                "sign_end": spec.sign_end,
+                "signup_mode": spec.signup_mode,
+                "retry_for_s": spec.retry_for_s,
+                "max_attempts": spec.max_attempts,
                 "status": status,
             }
-            if detail:
-                payload.update({k: v for k, v in detail.items() if k not in {"status"}})
+            payload.update(merged)
             self.emit("task", payload)
 
     def _plan_status(self) -> str:
@@ -288,11 +390,15 @@ class PlanCoordinator:
         return {"total": len(self._states), "counts": counts}
 
     def _plan_payload(self, status: str) -> dict:
+        # 静态 TaskSpec + 动态 timeline detail 一起输出：页面重载恢复时
+        # 拿得到完整运行时数据（checkpoint/模式/策略），不退回估算时间。
+        # detail 在合并序里靠后，与 task 事件「payload.update(detail)」同序。
         return {
             "plan_id": self.plan_id,
             "status": status,
             "tasks": [
-                dict(spec.as_dict(), status=self._states.get(spec.task_id, "queued"))
+                dict(spec.as_dict(), status=self._states.get(spec.task_id, "queued"),
+                     **self._details.get(spec.task_id, {}))
                 for spec in self.specs
             ],
         }

@@ -9,6 +9,7 @@
 | [OPERATIONS.md](OPERATIONS.md) | 日常运维 | 服务器布局、systemd、crontab、日志、部署更新、回滚、故障处理、迁移记录 |
 | [LOGIN.md](LOGIN.md) | 处理登录态问题 | token 寿命实测、守护进程续期、验证码 OCR 无人值守登录、凭据管理、人工兜底 |
 | [GRAB.md](GRAB.md) | 预报名/抢报名 | 状态机、时间线、卡片快照、边界 |
+| [RETRY_POLICY_GUIDE.md](RETRY_POLICY_GUIDE.md) | 普通使用者（图解） | 报名截止硬上限、重试时长/次数怎么选、「第 N 次提交」计数、八种终态，Mermaid 时间线一看就懂 |
 | [TIMING_AND_DEDUP_ANALYSIS.md](TIMING_AND_DEDUP_ANALYSIS.md) | 想理解"为什么是这个时点/这套去重" | 完整推导与请求量账本 |
 
 ## archive/
