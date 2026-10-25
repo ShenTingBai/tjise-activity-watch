@@ -59,7 +59,7 @@
 > 独立 EXE 与四成员 ZIP 形态自 v1.1.0 起生效；该版本正式发布前，Release 页现有资产的
 > 形态以资产内启动说明为准，请以实际下载到的资产为准阅读。
 
-右上角分两个入口：**「说明」**给三步快速帮助（确认登录 / 选活动并开始 / 看进度与结果）并带一个「重看引导」；**「更多」**放重看六步引导、当前版本与「查看发布页」、打开本机数据目录。当前版本号以 [VERSION](VERSION) 文件为准（只在「更多」显示，不会自动联网检查），最新发布看 [releases/latest](https://github.com/ShenTingBai/tjise-activity-watch/releases/latest)。
+右上角 **「帮助」** 集中三步使用说明、重看六步引导、当前版本和本机数据目录。点「检查更新」才会查询 GitHub 最新正式版并比较版本；失败会显示原因与重试入口，当前候选比正式版新时明确提示「当前为预览版本」。检查结果附检查时间，不自动下载或安装；「查看发布页」用系统浏览器打开 [最新发布](https://github.com/ShenTingBai/tjise-activity-watch/releases/latest)。当前版本以 [VERSION](VERSION) 为准。
 
 **装了 Python**：
 

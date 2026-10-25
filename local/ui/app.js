@@ -11,14 +11,14 @@
 const $ = (selector) => document.querySelector(selector);
 
 const DEFAULT_HELP = {
-  title: "天软活动预报名工具怎么用",
-  subtitle: "确认登录，选活动并开始，再看每场结果。",
+  title: "使用帮助",
+  subtitle: "使用说明、版本更新与本机数据",
   steps: [
     { no: 1, title: "确认登录", text: "首次点「登录」，在浏览器里完成登录。重开会自动检查；仅在提示失效时重新登录，暂时无法确认就刷新。" },
     { no: 2, title: "选活动并开始", text: "勾选不冲突的活动，设置重试时长和最多次数，再点「开始报名计划」。未来场次等开放，已开放场次立即尝试。" },
     { no: 3, title: "看进度与结果", text: "电脑保持唤醒和联网，窗口可最小化。逐场看结果；停止会结束本机任务，不会撤销学校报名。" },
   ],
-  note: "仅操作本人账号；选中活动还没有开始，报名结果以学校活动页为准。",
+  note: "仅操作本人账号，报名结果以学校活动页为准。",
 };
 
 /* 与 grab.py / app.py 对齐的常量 */
@@ -69,6 +69,8 @@ const S = {
    * 协同恢复：任一分支报组件故障立即挂横幅，另一分支成功/普通 unknown 不得撤；
    * 本轮两分支都完成且无故障才撤旧横幅（FB4 的两到达顺序一致语义） */
   runtime: { error: null, checkPending: false, listPending: false, roundError: null },
+  /* 更新只读GitHub，单独记录结果；不能借用报名/组件错误通道。 */
+  update: { state: "idle", requestId: "", result: null, timer: null },
   /* FB1 轻量「开始提交中」标志：成功/拒绝/reject 均释放，只做即时按钮反馈，
    * 后端最终接纳点的原子重检仍是最终权威 */
   starting: false,
@@ -133,9 +135,9 @@ async function boot() {
   const bridgeReady = await waitForBridge();
   const info = bridgeReady ? await api("bootstrap").catch(() => null) : null;
   fillHelp((info && info.help) || DEFAULT_HELP);
-  /* 版本唯一显示位在「更多」弹窗：只用 bootstrap 带来的真实版本号，
-   * 前面「当前版本」是行内标签，这里不写死候选号、也不自己拼前缀 */
-  $("#settings-version").textContent = info && info.version ? String(info.version) : "—";
+  /* 当前版本唯一显示位，来自后端；打开帮助不代表已查询GitHub。 */
+  $("#help-version").textContent = info && info.version ? String(info.version) : "—";
+  restoreUpdate(info && info.update_check);
   if (info) {
     /* demo 标记由后端 bootstrap 带来：演示模式绕过「登录校验 valid」的开始门禁 */
     S.demo = !!info.demo;
@@ -1375,7 +1377,7 @@ function updateControls() {
   /* 缺组件：登录/开始都禁用（点了也是结构化失败）；刷新保持可用——复查组件并恢复的唯一通道 */
   $("#btn-login").disabled = S.busy || componentDown;
   $("#btn-refresh").disabled = S.listState === "loading";
-  /* 「更多」按钮本身任何状态可用；只有两处「重看引导」在计划运行中禁用（按钮上有可见原因） */
+  /* 帮助任何状态都可打开；运行中只禁重看引导，原因写在按钮上。 */
   paintReplayButtons();
   const validation = validateSelection();
   /* 开始门禁：真实计划只在学校接口确认登录有效（valid）后可点；
@@ -2015,26 +2017,16 @@ function fillHelp(help) {
 
 function showHelp() {
   const dialog = $("#help");
-  const more = $("#settings");
-  /* 两个弹窗职责不同，但都是原生模态：不能叠着开 */
-  if (more && more.open) more.close();
+  helpStatus("");
+  paintUpdate();
   if (!dialog.open) dialog.showModal();
   savePrefs({ welcome_seen: true });
 }
 
-function showSettings() {
-  /* 「更多」入口任何状态都可用：未登录、出错、计划运行中都要能打开（只读动作不受忙限制） */
-  const dialog = $("#settings");
-  const help = $("#help");
-  if (help && help.open) help.close();
-  settingsStatus("");          /* 每次打开都从干净状态开始，不带上一轮的错误 */
-  if (dialog && !dialog.open) dialog.showModal();
-}
-
-/* 「更多」的局部反馈：只在这个弹窗里说下一步，不去复读到大屏或结果框。
+/* 辅助动作的局部反馈：只在帮助里说下一步，不去复读到大屏或结果框。
  * 长地址/错误原话做成可选文本，不在 WebView 里导航。 */
-function settingsStatus(text, tone) {
-  const box = $("#settings-status");
+function helpStatus(text, tone) {
+  const box = $("#help-status");
   if (!box) return;
   if (!text) {
     box.hidden = true;
@@ -2044,10 +2036,17 @@ function settingsStatus(text, tone) {
   box.hidden = false;
   box.dataset.tone = tone || "warn";
   box.textContent = text;
+  revealHelpStatus(box);
 }
 
-/* 说明与「更多」两处重播共用这一条路径：先确认非忙，再关当前弹窗、
- * 把焦点还给对应顶栏入口（退出引导时正好回到这里），最后进第 1 步。
+/* 矮窗里反馈可能刚好落在折叠处：用户触发的结果滚入正文可见区，头尾不动。 */
+function revealHelpStatus(box) {
+  if (box && $("#help").open && typeof box.scrollIntoView === "function") {
+    box.scrollIntoView({ block: "nearest" });
+  }
+}
+
+/* 帮助中的重播先确认非忙，再关模态、把焦点还给顶栏，最后进第1步。
  * 不复制教程长文，也不在弹窗还开着时叠一层遮罩。 */
 function replayTourFrom(dialogSelector, openerSelector) {
   if (S.busy) {
@@ -2064,14 +2063,92 @@ function replayTourFrom(dialogSelector, openerSelector) {
   return true;
 }
 
-/* 忙时两处重播都禁用，并把原因写在按钮上——不只靠 title 提示 */
+/* 忙时只禁重播；查版本、打开目录不打断报名计划。 */
 function paintReplayButtons() {
-  [["#btn-settings-tour", "重看引导"], ["#btn-help-tour", "重看引导"]].forEach((pair) => {
+  [["#btn-help-tour", "重看引导"]].forEach((pair) => {
     const btn = $(pair[0]);
     if (!btn) return;
     btn.disabled = !!S.busy;
     btn.textContent = S.busy ? "计划结束后可重看引导" : pair[1];
     btn.title = S.busy ? "计划结束后可重看引导" : "重新看一遍六步引导";
+  });
+}
+
+function paintUpdate() {
+  const box = $("#update-status");
+  const button = $("#btn-update-check");
+  const state = S.update.state;
+  box.dataset.state = state;
+  button.disabled = state === "checking";
+  button.textContent = state === "checking" ? "检查中…" : state === "error" ? "重试检查" : "检查更新";
+  const copy = { idle: "尚未检查", checking: "正在检查…", current: "当前为最新正式版",
+    available: "发现新版本 " + (S.update.result && S.update.result.latest_version || ""),
+    preview: "当前为预览版本，最新正式版 " + (S.update.result && S.update.result.latest_version || ""),
+    unavailable: "暂无正式发布" };
+  box.textContent = state === "error" ? "暂时无法检查更新。" + (S.update.result && S.update.result.text || "请重试或查看发布页。") : copy[state] || copy.idle;
+  /* 手动检查的结论带发生时间，避免把很久以前的结果误当成实时状态。 */
+  const checked = $("#update-checked-at");
+  const at = S.update.result && Date.parse(S.update.result.checked_at);
+  checked.hidden = state === "checking" || !Number.isFinite(at);
+  checked.textContent = checked.hidden ? "" : "检查时间 " + new Date(at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function watchUpdate(requestId) {
+  clearTimeout(S.update.timer);
+  /* 后端请求有8秒网络超时；桥接丢事件也不能让按钮永久停在检查中。 */
+  S.update.timer = setTimeout(() => {
+    if (S.update.state === "checking" && S.update.requestId === requestId) {
+      receiveUpdate({ request_id: requestId, state: "error", text: "没有收到检查结果，请重试。" });
+    }
+  }, 15000);
+}
+
+function receiveUpdate(payload) {
+  const data = payload || {};
+  if (!data.request_id || data.request_id !== S.update.requestId) return;
+  clearTimeout(S.update.timer);
+  S.update.result = data;
+  S.update.state = ["available", "current", "preview", "unavailable", "error"].indexOf(data.state) >= 0 ? data.state : "error";
+  paintUpdate();
+  revealHelpStatus($("#update-status").parentElement);
+}
+
+function restoreUpdate(snapshot) {
+  if (!snapshot || !snapshot.request_id) { paintUpdate(); return; }
+  S.update.requestId = String(snapshot.request_id);
+  if (snapshot.checking) {
+    S.update.state = "checking";
+    watchUpdate(S.update.requestId);
+  } else if (snapshot.result) receiveUpdate(snapshot.result);
+  paintUpdate();
+}
+
+function checkUpdate() {
+  if (S.update.state === "checking") return;
+  const requestId = "update-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+  S.update.requestId = requestId;
+  S.update.state = "checking";
+  watchUpdate(requestId);
+  paintUpdate();
+  api("check_update", requestId).then((res) => {
+    /* 结果可以先于ack到达：完成后不再被ack改回检查中。 */
+    if (S.update.requestId !== requestId || S.update.state !== "checking") return;
+    if (!res || res.ok === false || res.queued === false) {
+      receiveUpdate({ request_id: requestId, state: "error", text: res && res.text || "检查没能启动，请重试。" });
+    } else if (res.skipped && res.request_id) {
+      S.update.requestId = String(res.request_id);
+      watchUpdate(S.update.requestId);
+      /* 重载时可能接上已完成的在途请求；读取本地快照，不额外发网络检查。 */
+      const attachedId = S.update.requestId;
+      api("bootstrap").then((info) => {
+        /* 快照晚到时用户可能已开新查询；只有仍在接管同一请求才允许恢复。 */
+        if (S.update.requestId === attachedId) restoreUpdate(info && info.update_check);
+      }).catch(() => {});
+    }
+  }).catch((err) => {
+    if (S.update.requestId === requestId && S.update.state === "checking") {
+      receiveUpdate({ request_id: requestId, state: "error", text: msg(err) });
+    }
   });
 }
 
@@ -2699,7 +2776,7 @@ function tourClose(finished) {
 }
 
 function tourSkip() {
-  /* 跳过=本版不再自动弹；说明页的「重新看一遍引导」随时可以重播 */
+  /* 跳过=本版不再自动弹；帮助中的重看引导随时可回顾。 */
   savePrefsNow({ tour_version: TOUR_VERSION, tour_skipped_at: new Date().toISOString() });
   tourClose(false);
 }
@@ -2811,6 +2888,7 @@ window.onBackend = {
   plan: (payload) => handlePlan(payload),
   task: (payload) => handleTask(payload),
   plan_done: (payload) => handlePlanDone(payload),
+  update: (payload) => receiveUpdate(payload),
 };
 
 $("#q").addEventListener("input", (event) => setFilter("q", event.target.value));
@@ -2904,27 +2982,26 @@ $("#tour-next").addEventListener("click", () => {
   S.tour.step += 1;
   paintTour();
 });
-/* 辅助入口：说明与「更多」各自有重播按钮，共用 replayTourFrom 一条路径；
+/* 单帮助入口：重播仍走 replayTourFrom 的关闭模态与焦点恢复路径；
  * 计划运行中禁用重播（不打断计划），弹窗本身任何状态都能打开。 */
-$("#btn-settings").addEventListener("click", showSettings);
-$("#btn-settings-tour").addEventListener("click", () => replayTourFrom("#settings", "#btn-settings"));
 $("#btn-help-tour").addEventListener("click", () => replayTourFrom("#help", "#btn-help"));
-$("#btn-settings-latest").addEventListener("click", () => {
+$("#btn-update-check").addEventListener("click", checkUpdate);
+$("#btn-help-latest").addEventListener("click", () => {
   /* 用户点击才打开外链：后端用系统默认浏览器打开固定的 releases/latest 地址；
    * 打不开时把地址摆成可选文本（局部反馈），不在 WebView 里跳转 */
-  settingsStatus("");
+  helpStatus("");
   api("open_latest_release").then((res) => {
     if (!res || res.ok === false) {
-      settingsStatus("发布页没能打开（系统浏览器可能被拦）。地址：" + RELEASES_LATEST_URL, "warn");
+      helpStatus("发布页没能打开（系统浏览器可能被拦）。地址：" + RELEASES_LATEST_URL, "warn");
     }
   }).catch((err) => {
-    settingsStatus("发布页没能打开：" + msg(err) + "。地址：" + RELEASES_LATEST_URL, "warn");
+    helpStatus("发布页没能打开：" + msg(err) + "。地址：" + RELEASES_LATEST_URL, "warn");
   });
 });
-$("#btn-settings-data").addEventListener("click", () => {
-  settingsStatus("");
+$("#btn-help-data").addEventListener("click", () => {
+  helpStatus("");
   api("open_data").catch((err) => {
-    settingsStatus("打不开数据目录：" + msg(err) + "。可以先再试一次，或在系统里手动打开本机数据目录。", "bad");
+    helpStatus("打不开数据目录：" + msg(err) + "。可以先再试一次，或在系统里手动打开本机数据目录。", "bad");
   });
 });
 /* 窗口尺寸或内部滚动变化时重新定位高亮与卡片 */
@@ -2954,11 +3031,11 @@ document.addEventListener("keydown", (event) => {
       return;   /* 卡片内回车：交给按钮原生激活（click 监听照常触发） */
     }
   }
-  /* 任意弹窗（说明/设置/停止确认）打开时：Enter/Esc 只属于弹窗——
+  /* 帮助/停止确认打开时：Enter/Esc 只属于弹窗——
    * 不穿透到背景开始计划、不清空选择、不误跳引导；停止确认弹窗的
    * Esc/「继续等待」=不停止 的原生语义不变 */
   if ((event.key === "Enter" || event.key === "Escape") &&
-      ["#help", "#settings", "#dlg-stop"].some((sel) => { const d = $(sel); return !!d && d.open; })) {
+      ["#help", "#dlg-stop"].some((sel) => { const d = $(sel); return !!d && d.open; })) {
     return;
   }
   /* Ctrl+F 或 / 跳到搜索框 */

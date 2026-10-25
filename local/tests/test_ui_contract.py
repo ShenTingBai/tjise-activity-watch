@@ -22,9 +22,9 @@ def read(rel: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def settings_dialog(html: str) -> str:
+def help_dialog(html: str) -> str:
     """截取更多 dialog 元素本体（不含其前注释），供禁词等逐字断言使用。"""
-    start = html.index('<dialog class="dlg dlg-settings"')
+    start = html.index('<dialog class="dlg dlg-help"')
     end = html.index("</dialog>", start) + len("</dialog>")
     return html[start:end]
 
@@ -348,8 +348,7 @@ class NameContractTests(unittest.TestCase):
 
     def test_window_title_uses_formal_name(self):
         py = read("app.py")
-        self.assertGreaterEqual(py.count("天软活动预报名工具"), 2,
-                                "app.py 的 help() 标题与 webview 窗口标题都要用正式名称")
+        self.assertIn('"title": "使用帮助"', py, "帮助标题描述用途，正式名称仍由窗口标题表达")
         self.assertIn("天软活动预报名工具\", str(UI)", py,
                       "webview.create_window 的窗口标题必须是正式名称")
 
@@ -707,11 +706,11 @@ class TourAndLifecycleContractTests(unittest.TestCase):
                        'id="tour-skip"', 'id="tour-prev"', 'id="tour-next"',
                        'id="tour-step"', 'id="tour-dots"'):
             self.assertIn(needle, html, "引导结构缺 %s" % needle)
-        self.assertIn('id="btn-settings-tour"', html, "「更多」里必须有「重看引导」入口")
+        self.assertIn('id="btn-help-tour"', html, "「更多」里必须有「重看引导」入口")
         self.assertIn('id="btn-help-tour"', html,
                       "说明底部必须有重播快捷入口（与更多共用同一条处理路径）")
         self.assertIn("重看引导", html, "重播入口要有可读文字，不能只靠图标")
-        self.assertIn('id="settings"', html, "必须有独立 dialog #settings")
+        self.assertIn('id="help"', html, "必须有独立 dialog #help")
         self.assertIn("跳过引导", html, "必须有跳过按钮")
 
     def test_app_js_tour_definition_and_version(self):
@@ -796,13 +795,13 @@ class TourAndLifecycleContractTests(unittest.TestCase):
     def test_releases_latest_link_is_user_triggered(self):
         """GitHub releases/latest：只由用户点击打开，启动时不自动联网。"""
         html = read("ui/index.html")
-        self.assertNotIn("<a ", settings_dialog(html),
+        self.assertNotIn("<a ", help_dialog(html),
                          "发布页不得变成 WebView 内导航链接")
         js = read("ui/app.js")
         self.assertIn("const RELEASES_LATEST_URL =", js, "外链地址必须是固定常量")
         self.assertIn('api("open_latest_release")', js, "打开外链必须走后端动作（点击触发）")
-        handler = js[js.index('$("#btn-settings-latest").addEventListener'):
-                     js.index('$("#btn-settings-data").addEventListener')]
+        handler = js[js.index('$("#btn-help-latest").addEventListener'):
+                     js.index('$("#btn-help-data").addEventListener')]
         self.assertIn("RELEASES_LATEST_URL", handler,
                       "打不开时要把固定地址摆成可选文本，让用户能自己复制")
         # 启动路径（boot/refresh）不得自动请求外链
@@ -813,7 +812,7 @@ class TourAndLifecycleContractTests(unittest.TestCase):
     def test_tour_does_not_gate_login_or_start(self):
         """引导未完成/进行中都不影响登录与 start_plan 门禁（门禁只看登录四态）。
 
-        断言锁 S.tour 引导状态（而非 "tour" 子串——#btn-settings-tour 的
+        断言锁 S.tour 引导状态（而非 "tour" 子串——#btn-help-tour 的
         disabled 引用是设置功能，不是引导门禁）。
         """
         js = read("ui/app.js")
@@ -831,13 +830,13 @@ class TourAndLifecycleContractTests(unittest.TestCase):
         """「更多」显示后端版本（VERSION 唯一来源），帮助载荷带版本与外链；
         旧说明弹窗版本位 id 不得残留。"""
         js = read("ui/app.js")
-        anchor = js.index('$("#settings-version").textContent')
+        anchor = js.index('$("#help-version").textContent')
         self.assertIn("info.version", js[anchor:anchor + 160],
                       "版本必须来自 bootstrap.version（唯一来源）")
-        self.assertIn('$("#settings-version")', js, "版本必须填入更多弹窗唯一位置")
+        self.assertIn('$("#help-version")', js, "版本必须填入更多弹窗唯一位置")
         html = read("ui/index.html")
-        self.assertIn('id="settings-version"', html, "设置弹窗必须有版本位")
-        self.assertNotIn('id="help-version"', html, "旧说明弹窗版本位 id 不得残留")
+        self.assertIn('id="help-version"', html, "设置弹窗必须有版本位")
+        self.assertEqual(html.count('id="help-version"'), 1, "当前版本只出现一个真实节点")
         # 只锁字符串字面量：注释里提及历史候选号不算硬编码
         self.assertNotIn('"1.1.0"', js, "界面代码不得写死候选版本号字符串")
         self.assertNotIn("'1.1.0'", js, "界面代码不得写死候选版本号字符串")
@@ -1206,40 +1205,41 @@ tourSkip();
 
 
 class SettingsEntryContractTests(unittest.TestCase):
-    """辅助入口的静态契约：顶栏「说明 + 更多」，更多面板只有一块强调区。"""
+    """历史双入口覆盖迁移至单帮助；真实DOM不得保留第二套旧节点。"""
 
     def test_index_has_settings_entry_and_groups(self):
-        """顶栏「更多」入口；面板 = 引导区 + 版本行 + 数据行，动作都可发现。"""
+        """单帮助入口；使用说明、手动更新与本机数据都在同一模态。"""
         html = read("ui/index.html")
-        self.assertIn('id="btn-settings"', html, "顶栏必须有独立「更多」按钮")
-        self.assertIn('aria-label="更多：重看引导、版本与本机数据"', html,
+        self.assertIn('id="btn-help"', html, "顶栏必须有独立「更多」按钮")
+        self.assertIn('aria-label="帮助：使用说明、版本更新与本机数据"', html,
                       "入口必须有可读的无障碍名（不能只靠图标）")
-        self.assertIn(">更多<", html, "顶栏按钮的文字必须是「更多」")
-        self.assertIn("<svg", html[max(0, html.index('id="btn-settings"') - 300):
-                                   html.index('id="btn-settings"') + 400],
+        self.assertIn(">帮助<", html, "顶栏按钮的文字必须是「帮助」")
+        self.assertIn("<svg", html[max(0, html.index('id="btn-help"') - 300):
+                                   html.index('id="btn-help"') + 400],
                       "更多按钮必须带内联 SVG 图标")
-        for needle in ("btn-settings-tour", "btn-settings-latest", "btn-settings-data",
-                       "settings-title", "settings-version", "settings-status"):
+        for needle in ("btn-help-tour", "btn-help-latest", "btn-help-data",
+                       "help-title", "help-version", "help-status"):
             self.assertIn('id="%s"' % needle, html, "更多弹窗缺组件 #%s" % needle)
-        dialog = settings_dialog(html)
-        for text in ("操作引导", "本机数据", "重看引导", "查看发布页",
+        dialog = help_dialog(html)
+        self.assertNotIn('id="btn-settings"', html)
+        self.assertNotIn('id="settings"', html)
+        for text in ("三步使用说明", "本机数据", "重看引导", "查看发布页",
                      "打开数据目录", "Esc 关闭"):
             self.assertIn(text, dialog, "更多弹窗缺「%s」" % text)
         # 不再用三张同形分组卡叠套；现行入口统一叫「更多」
         self.assertNotIn("set-group", dialog, "不再用三张同形分组卡")
-        self.assertNotIn("设置", dialog, "现行入口统一叫「更多」，旧「设置」措辞不得残留")
+        self.assertNotIn('id="settings"', dialog, "不保留第二个设置模态")
         for banned in ("清空凭证", "重置", "自动更新", "自动检查更新"):
             self.assertNotIn(banned, dialog,
                              "更多弹窗不得出现未确认功能「%s」" % banned)
 
     def test_help_dialog_keeps_quick_help_only(self):
-        """说明弹窗 = 三步快速帮助 + 重播快捷入口 + 知道了；版本与外链只归「更多」。"""
+        """合并后仍有完整三步，并能直接找到版本与更新；不用第二层页面。"""
         html = read("ui/index.html")
-        help_body = html[html.index('id="help"'):html.index('id="settings"')]
-        for migrated in ("btn-latest", "help-version"):
-            self.assertNotIn('id="%s"' % migrated, help_body,
-                             "说明弹窗仍残留已迁去「更多」的 %s" % migrated)
-        self.assertIn("知道了", help_body, "说明弹窗保留关闭按钮")
+        help_body = help_dialog(html)
+        for component in ("help-version", "btn-update-check", "update-status"):
+            self.assertIn('id="%s"' % component, help_body)
+        self.assertIn("关闭", help_body, "帮助弹窗保留关闭按钮")
         self.assertIn('id="btn-help-tour"', help_body,
                       "说明底部保留重播快捷入口（学习入口就近可重播）")
         self.assertIn('id="help-steps"', help_body, "说明弹窗保留三步快速帮助容器")
@@ -1251,13 +1251,13 @@ class SettingsEntryContractTests(unittest.TestCase):
     def test_app_js_wires_settings_actions(self):
         """两处重播共用 replayTourFrom；版本/目录仍走既有接口；忙时禁用有可见原因。"""
         js = read("ui/app.js")
-        for anchor in ('$("#btn-settings")', '$("#btn-settings-tour")',
-                       '$("#btn-help-tour")', '$("#btn-settings-latest")',
-                       '$("#btn-settings-data")'):
+        for anchor in ('$("#btn-help")', '$("#btn-help-tour")',
+                       '$("#btn-help-tour")', '$("#btn-help-latest")',
+                       '$("#btn-help-data")'):
             self.assertIn(anchor, js, "app.js 缺辅助入口绑定：%s" % anchor)
-        for stale in ('$("#btn-latest")', '$("#help-version")'):
+        for stale in ('$("#btn-latest")', '$("#settings-version")', '$("#btn-settings")'):
             self.assertNotIn(stale, js, "app.js 残留旧引用 %s（元素已删除会直接抛错）" % stale)
-        self.assertIn('replayTourFrom("#settings", "#btn-settings")', js,
+        self.assertIn('replayTourFrom("#help", "#btn-help")', js,
                       "更多里的重播必须走共用处理函数")
         self.assertIn('replayTourFrom("#help", "#btn-help")', js,
                       "说明里的重播必须走同一个处理函数")
@@ -1277,7 +1277,7 @@ class SettingsEntryContractTests(unittest.TestCase):
         js = read("ui/app.js")
         key_at = js.index('document.addEventListener("keydown"')
         body = js[key_at:key_at + 2400]
-        self.assertIn('"#settings"', body,
+        self.assertIn('"#help"', body,
                       "弹窗键盘隔离必须覆盖更多弹窗")
         self.assertIn('"#dlg-stop"', body, "停止确认弹窗保持原有 Esc 语义")
 
@@ -1288,11 +1288,11 @@ class SettingsDialogBehaviorTests(unittest.TestCase):
     def test_top_entry_opens_and_replay_chain(self):
         """顶栏入口打开设置；重看引导先关设置再进引导。"""
         res = run_js(r"""
-document.querySelector("#btn-settings").click();
-const opened = document.querySelector("#settings").open;
-document.querySelector("#btn-settings-tour").click();
+document.querySelector("#btn-help").click();
+const opened = document.querySelector("#help").open;
+document.querySelector("#btn-help-tour").click();
 out.push({ opened,
-  settingsClosed: !document.querySelector("#settings").open,
+  settingsClosed: !document.querySelector("#help").open,
   tourOpen: S.tour.open, step: S.tour.step });
 tourSkip();
 """)
@@ -1305,13 +1305,13 @@ tourSkip();
         """计划运行中：设置可打开、重看引导禁用且不重播；结束后可重播。"""
         res = run_js(r"""
 setBusy(true);
-document.querySelector("#btn-settings").click();
-const openedWhileBusy = document.querySelector("#settings").open;
-const replayDisabled = document.querySelector("#btn-settings-tour").disabled;
-document.querySelector("#btn-settings-tour").click();
+document.querySelector("#btn-help").click();
+const openedWhileBusy = document.querySelector("#help").open;
+const replayDisabled = document.querySelector("#btn-help-tour").disabled;
+document.querySelector("#btn-help-tour").click();
 const tourNotOpened = !S.tour.open;
 setBusy(false);
-document.querySelector("#btn-settings-tour").click();
+document.querySelector("#btn-help-tour").click();
 const tourOpenedAfterEnd = S.tour.open;
 out.push({ openedWhileBusy, replayDisabled, tourNotOpened, tourOpenedAfterEnd });
 tourSkip();
@@ -1328,7 +1328,7 @@ S.selected.add("a1");
 let startCalled = 0;
 const realStart = startPlan;
 startPlan = () => { startCalled += 1; };
-const dlg = document.querySelector("#settings");
+const dlg = document.querySelector("#help");
 dlg.open = true;
 __dispatchKey({ key: "Enter" });
 __dispatchKey({ key: "Escape" });
@@ -1347,8 +1347,8 @@ window.pywebview = { api: {
   open_latest_release: () => { out.latest = (out.latest || 0) + 1; return Promise.resolve({ ok: true }); },
   open_data: () => { out.data = (out.data || 0) + 1; return Promise.resolve({ ok: true }); },
 } };
-document.querySelector("#btn-settings-latest").click();
-document.querySelector("#btn-settings-data").click();
+document.querySelector("#btn-help-latest").click();
+document.querySelector("#btn-help-data").click();
 out.push({ latest: out.latest, data: out.data });
 """)
         self.assertEqual(res[0]["latest"], 1, "外链每次点击恰调用一次")
@@ -2717,9 +2717,9 @@ class AssistanceBehaviorTests(unittest.TestCase):
 
     # 已确认的文案基线：两端一起漂移时，这一份仍然能挡住
     _EXPECTED_COPY = {
-        "title": "天软活动预报名工具怎么用",
-        "subtitle": "确认登录，选活动并开始，再看每场结果。",
-        "note": "仅操作本人账号；选中活动还没有开始，报名结果以学校活动页为准。",
+        "title": "使用帮助",
+        "subtitle": "使用说明、版本更新与本机数据",
+        "note": "仅操作本人账号，报名结果以学校活动页为准。",
         "steps": [
             (1, "确认登录",
              "首次点「登录」，在浏览器里完成登录。重开会自动检查；"
@@ -2783,9 +2783,9 @@ class AssistanceBehaviorTests(unittest.TestCase):
         res = run_js(r"""
 function openCase(prepare) {
   prepare();
-  const dlg = document.querySelector("#settings");
+  const dlg = document.querySelector("#help");
   if (dlg.open) dlg.close();
-  document.querySelector("#btn-settings").click();
+  document.querySelector("#btn-help").click();
   const opened = dlg.open;
   dlg.close();
   return opened;
@@ -2796,9 +2796,9 @@ const busy = openCase(() => { S.busy = true; });
 S.busy = false;
 document.querySelector("#btn-help").click();
 const helpOpen = document.querySelector("#help").open;
-document.querySelector("#btn-settings").click();
-const stacked = { more: document.querySelector("#settings").open,
-  help: document.querySelector("#help").open };
+document.querySelector("#btn-help").click();
+const stacked = { more: document.querySelector("#help").open,
+  tour: S.tour.open };
 out.push({ fresh, errored, busy, helpOpen, stacked });
 """)
         case = res[0]
@@ -2807,15 +2807,15 @@ out.push({ fresh, errored, busy, helpOpen, stacked });
         self.assertTrue(case["busy"], "计划运行中也要能打开更多")
         self.assertTrue(case["helpOpen"])
         self.assertTrue(case["stacked"]["more"])
-        self.assertFalse(case["stacked"]["help"], "两个模态不得叠着开")
+        self.assertFalse(case["stacked"]["tour"], "重复打开帮助不能自行启动引导")
 
     def test_both_replay_entries_close_dialog_and_return_focus(self):
         """两处重播都先关弹窗、从第 1 步开始，退出后焦点回到各自顶栏入口。"""
         res = run_js(r"""
-const more = document.querySelector("#settings");
+const more = document.querySelector("#help");
 const help = document.querySelector("#help");
-document.querySelector("#btn-settings").click();
-document.querySelector("#btn-settings-tour").click();
+document.querySelector("#btn-help").click();
+document.querySelector("#btn-help-tour").click();
 const fromMore = { closed: !more.open, tour: S.tour.open, step: S.tour.step,
   opener: S.tour.restoreFocus && S.tour.restoreFocus.__sel };
 tourSkip();
@@ -2833,9 +2833,9 @@ out.push({ fromMore, afterMore, fromHelp, afterHelp,
         self.assertTrue(case["fromMore"]["closed"], "重播前必须先关掉更多")
         self.assertTrue(case["fromMore"]["tour"])
         self.assertEqual(case["fromMore"]["step"], 0)
-        self.assertEqual(case["fromMore"]["opener"], "#btn-settings",
+        self.assertEqual(case["fromMore"]["opener"], "#btn-help",
                          "开始前的焦点必须是「更多」入口")
-        self.assertEqual(case["afterMore"], "#btn-settings", "退出引导把焦点还回更多入口")
+        self.assertEqual(case["afterMore"], "#btn-help", "退出引导把焦点还回更多入口")
         self.assertTrue(case["fromHelp"]["closed"], "重播前必须先关掉说明")
         self.assertEqual(case["fromHelp"]["opener"], "#btn-help")
         self.assertEqual(case["afterHelp"], "#btn-help")
@@ -2845,18 +2845,18 @@ out.push({ fromMore, afterMore, fromHelp, afterHelp,
     def test_busy_disables_replay_but_keeps_version_visible(self):
         """运行中两处重播都禁用并写明原因；版本仍可查，点击也不进引导。"""
         res = run_js(r"""
-document.querySelector("#settings-version").textContent = "9.9.9";
+document.querySelector("#help-version").textContent = "9.9.9";
 setBusy(true);
-document.querySelector("#btn-settings").click();
-const opened = document.querySelector("#settings").open;
-const tourBtn = document.querySelector("#btn-settings-tour");
+document.querySelector("#btn-help").click();
+const opened = document.querySelector("#help").open;
+const tourBtn = document.querySelector("#btn-help-tour");
 const helpBtn = document.querySelector("#btn-help-tour");
 const disabled = { tour: tourBtn.disabled, help: helpBtn.disabled };
 const label = tourBtn.textContent;
 /* 桩不按 disabled 拦截点击：这里同时验证代码自己的忙判定 */
-document.querySelector("#btn-settings-tour").click();
+document.querySelector("#btn-help-tour").click();
 const noTour = !S.tour.open;
-const version = document.querySelector("#settings-version").textContent;
+const version = document.querySelector("#help-version").textContent;
 setBusy(false);
 out.push({ opened, disabled, label, noTour, version,
   restored: { disabled: tourBtn.disabled, label: tourBtn.textContent } });
@@ -2880,13 +2880,13 @@ window.pywebview = { api: {
   open_latest_release: () => { latest += 1; return Promise.resolve({ ok: true }); },
   open_data: () => { data += 1; return Promise.resolve({ ok: true }); },
 } };
-document.querySelector("#btn-settings").click();
+document.querySelector("#btn-help").click();
 const atOpen = { latest, data };
-document.querySelector("#btn-settings-latest").click();
-document.querySelector("#btn-settings-data").click();
+document.querySelector("#btn-help-latest").click();
+document.querySelector("#btn-help-data").click();
 await Promise.resolve();
 out.push({ atOpen, latest, data,
-  statusHidden: document.querySelector("#settings-status").hidden });
+  statusHidden: document.querySelector("#help-status").hidden });
 """)
         case = res[0]
         self.assertEqual(case["atOpen"], {"latest": 0, "data": 0},
@@ -2902,17 +2902,17 @@ window.pywebview = { api: {
   open_latest_release: () => Promise.resolve({ ok: false }),
   open_data: () => Promise.reject(new Error("没有权限")),
 } };
-document.querySelector("#btn-settings").click();
-document.querySelector("#btn-settings-latest").click();
+document.querySelector("#btn-help").click();
+document.querySelector("#btn-help-latest").click();
 await Promise.resolve(); await Promise.resolve();
-const latest = { hidden: document.querySelector("#settings-status").hidden,
-  text: document.querySelector("#settings-status").textContent,
-  tone: document.querySelector("#settings-status").dataset.tone };
-document.querySelector("#btn-settings-data").click();
+const latest = { hidden: document.querySelector("#help-status").hidden,
+  text: document.querySelector("#help-status").textContent,
+  tone: document.querySelector("#help-status").dataset.tone };
+document.querySelector("#btn-help-data").click();
 await Promise.resolve(); await Promise.resolve();
-const data = { hidden: document.querySelector("#settings-status").hidden,
-  text: document.querySelector("#settings-status").textContent,
-  tone: document.querySelector("#settings-status").dataset.tone };
+const data = { hidden: document.querySelector("#help-status").hidden,
+  text: document.querySelector("#help-status").textContent,
+  tone: document.querySelector("#help-status").dataset.tone };
 out.push({ latest, data, url: RELEASES_LATEST_URL });
 """)
         case = res[0]
@@ -2924,6 +2924,146 @@ out.push({ latest, data, url: RELEASES_LATEST_URL });
         self.assertIn("打不开数据目录", case["data"]["text"])
         self.assertIn("没有权限", case["data"]["text"])
         self.assertEqual(case["data"]["tone"], "bad")
+
+
+class ManualUpdateUiBehaviorTests(unittest.TestCase):
+    """更新通道独立于报名，覆盖请求时序、失败收尾与页面恢复。"""
+
+    def test_late_snapshot_does_not_replace_newer_check(self):
+        """接管旧请求后的快照可能晚到，不能覆盖用户随后新开的查询。"""
+        res = run_js(r"""
+let finishSnapshot, first = true;
+window.pywebview = { api: {
+  check_update: id => {
+    if (first) { first = false; return Promise.resolve({ok:true,queued:true,skipped:true,request_id:"old"}); }
+    return Promise.resolve({ok:true,queued:true,request_id:id});
+  },
+  bootstrap: () => new Promise(resolve => { finishSnapshot = resolve; }),
+} };
+checkUpdate();
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+window.onBackend.update({request_id:"old",state:"current"});
+checkUpdate();
+const fresh = S.update.requestId;
+finishSnapshot({update_check:{checking:false,request_id:"old",result:{request_id:"old",state:"current"}}});
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+const pending = {preserved:S.update.requestId===fresh,state:S.update.state};
+window.onBackend.update({request_id:fresh,state:"available",latest_version:"1.2.0"});
+out.push({pending,state:S.update.state});
+""")
+        self.assertEqual(res[0], {"pending": {"preserved": True, "state": "checking"},
+                                  "state": "available"})
+
+    def test_result_timestamp_is_not_a_live_check(self):
+        res = run_js(r"""
+S.update.requestId = "request";
+window.onBackend.update({request_id:"request",state:"current",checked_at:"2026-10-25T15:00:00Z"});
+const known = {hidden:document.querySelector("#update-checked-at").hidden,
+  text:document.querySelector("#update-checked-at").textContent};
+window.onBackend.update({request_id:"request",state:"error",checked_at:"invalid"});
+out.push({known,unknownHidden:document.querySelector("#update-checked-at").hidden});
+""")
+        self.assertFalse(res[0]["known"]["hidden"])
+        self.assertIn("检查时间", res[0]["known"]["text"])
+        self.assertTrue(res[0]["unknownHidden"])
+
+    def test_open_help_never_queries_update(self):
+        res = run_js(r"""
+let calls = 0;
+window.pywebview = { api: { check_update: () => { calls += 1; } } };
+document.querySelector("#btn-help").click();
+document.querySelector("#btn-help").click();
+out.push({ calls, open: document.querySelector("#help").open,
+  state: document.querySelector("#update-status").textContent });
+""")
+        self.assertEqual(res[0], {"calls": 0, "open": True, "state": "尚未检查"})
+
+    def test_double_click_is_single_flight(self):
+        res = run_js(r"""
+let calls = 0;
+window.pywebview = { api: { check_update: id => { calls += 1; return Promise.resolve({ok:true,queued:true,request_id:id}); } } };
+document.querySelector("#btn-update-check").click();
+document.querySelector("#btn-update-check").click();
+out.push({ calls, disabled: document.querySelector("#btn-update-check").disabled });
+""")
+        self.assertEqual(res[0], {"calls": 1, "disabled": True})
+
+    def test_result_before_ack_does_not_reenter_checking(self):
+        res = run_js(r"""
+window.pywebview = { api: { check_update: id => {
+  window.onBackend.update({request_id:id,state:"current"});
+  return Promise.resolve({ok:true,queued:true,request_id:id});
+} } };
+document.querySelector("#btn-update-check").click();
+await Promise.resolve(); await Promise.resolve();
+out.push({state:S.update.state,disabled:document.querySelector("#btn-update-check").disabled});
+""")
+        self.assertEqual(res[0], {"state": "current", "disabled": False})
+
+    def test_stale_event_cannot_replace_current_request(self):
+        res = run_js(r"""
+window.pywebview = { api: { check_update: id => Promise.resolve({ok:true,queued:true,request_id:id}) } };
+checkUpdate();
+const current = S.update.requestId;
+window.onBackend.update({request_id:"old",state:"available",latest_version:"9.9.9"});
+const stale = S.update.state;
+window.onBackend.update({request_id:current,state:"preview",latest_version:"1.0.2"});
+out.push({stale,state:S.update.state,text:document.querySelector("#update-status").textContent});
+""")
+        self.assertEqual(res[0]["stale"], "checking")
+        self.assertEqual(res[0]["state"], "preview")
+        self.assertIn("1.0.2", res[0]["text"])
+
+    def test_all_terminal_states_restore_button(self):
+        res = run_js(r"""
+for (const state of ["available","current","preview","unavailable","error"]) {
+  S.update.requestId = "request"; S.update.state = "checking";
+  window.onBackend.update({request_id:"request",state,latest_version:"1.2.0",text:"连接超时"});
+  out.push({state,disabled:document.querySelector("#btn-update-check").disabled,
+    text:document.querySelector("#update-status").textContent});
+}
+""")
+        self.assertTrue(all(not item["disabled"] for item in res))
+        self.assertIn("发现新版本", res[0]["text"])
+        self.assertIn("最新正式版", res[1]["text"])
+        self.assertIn("预览", res[2]["text"])
+        self.assertEqual(res[3]["text"], "暂无正式发布")
+        self.assertIn("暂时无法检查", res[4]["text"])
+
+    def test_bridge_reject_is_local_and_recoverable(self):
+        res = run_js(r"""
+S.runtime.error = "worker_missing"; S.busy = true;
+const oldResult = document.querySelector("#result").textContent;
+window.pywebview = { api: { check_update: () => Promise.reject(new Error("桥接失败")) } };
+checkUpdate();
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+out.push({state:S.update.state,runtime:S.runtime.error,busy:S.busy,
+  result:document.querySelector("#result").textContent===oldResult,
+  disabled:document.querySelector("#btn-update-check").disabled});
+""")
+        self.assertEqual(res[0], {"state": "error", "runtime": "worker_missing", "busy": True,
+                                  "result": True, "disabled": False})
+
+    def test_bootstrap_restores_without_network_query(self):
+        res = run_js(r"""
+let calls = 0;
+window.pywebview = { api: { check_update: () => { calls += 1; } } };
+restoreUpdate({checking:true,request_id:"inflight",result:null});
+const pending = S.update.state;
+restoreUpdate({checking:false,request_id:"inflight",result:{request_id:"inflight",state:"current"}});
+out.push({calls,pending,state:S.update.state});
+""")
+        self.assertEqual(res[0], {"calls": 0, "pending": "checking", "state": "current"})
+
+    def test_lost_event_has_finite_wait(self):
+        res = run_js(r"""
+const original = setTimeout; let timeout;
+setTimeout = fn => { timeout = fn; return 1; };
+window.pywebview = { api: { check_update: id => Promise.resolve({ok:true,queued:true,request_id:id}) } };
+checkUpdate(); timeout(); setTimeout = original;
+out.push({state:S.update.state,disabled:document.querySelector("#btn-update-check").disabled});
+""")
+        self.assertEqual(res[0], {"state": "error", "disabled": False})
 
 
 if __name__ == "__main__":

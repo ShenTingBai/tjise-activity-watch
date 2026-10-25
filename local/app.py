@@ -29,6 +29,7 @@ from pathlib import Path
 import webview
 
 from signup_plan import PlanCoordinator, TaskSpec, classify_signup_mode, validate_plan
+from update_check import check_latest_release
 
 # 登录态/偏好统一数据根：开发用 local/data，冻结 EXE 用 %LOCALAPPDATA%
 # （TJISE_DATA_DIR 可覆盖），与 grab-worker 解析出同一份登录文件
@@ -462,6 +463,10 @@ class Api:
         self._listing = False
         # 最近一次 check 的四态结论：start_plan 的放行/拒绝只信它
         self._last_check: dict = {}
+        # 更新检查独立于登录/报名，只由帮助按钮触发；页面重载复用内存中的在途请求。
+        self._updating = False
+        self._update_request_id = ""
+        self._update_result: dict | None = None
 
     # ---------- 事件推送 ----------
     def _emit(self, kind: str, payload) -> None:
@@ -491,6 +496,9 @@ class Api:
         }
         with self._lock:
             plan = self._plan
+            payload["update_check"] = {"checking": self._updating,
+                                       "request_id": self._update_request_id,
+                                       "result": self._update_result}
         if plan is not None:
             # 页面重载会丢掉 plan/task 事件：把计划快照一并交给 bootstrap，
             # 界面才能恢复任务列表和「停止」按钮；计划本身不会重复提交。
@@ -499,8 +507,8 @@ class Api:
 
     def help(self) -> dict:
         return {
-            "title": "天软活动预报名工具怎么用",
-            "subtitle": "确认登录，选活动并开始，再看每场结果。",
+            "title": "使用帮助",
+            "subtitle": "使用说明、版本更新与本机数据",
             # 版本与最新版本入口：界面据此显示「版本 1.1.0」和 GitHub 外链按钮
             # （APP_VERSION 恒来自 read_version()，这里只是示例注释，不写死实现）
             "version": APP_VERSION,
@@ -517,13 +525,53 @@ class Api:
                  "text": "电脑保持唤醒和联网，窗口可最小化。逐场看结果；"
                          "停止会结束本机任务，不会撤销学校报名。"},
             ],
-            "note": "仅操作本人账号；选中活动还没有开始，报名结果以学校活动页为准。",
+            "note": "仅操作本人账号，报名结果以学校活动页为准。",
         }
 
     def front_ready(self) -> dict:
         # 仅排障：前端 boot 完成时打一声招呼，确认桥接真的通了
         self._trace("front_ready")
         return {"ok": True}
+
+    def check_update(self, request_id: str) -> dict:
+        """只登记轻量后台查询，不在桥接线程等待网络，也不改变报名门禁。"""
+        if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", request_id):
+            return {"ok": False, "queued": False, "text": "更新请求无效，请重试。"}
+        with self._lock:
+            if self._closing:
+                return {"ok": False, "queued": False, "text": "程序正在关闭。"}
+            if self._updating:
+                return {"ok": True, "queued": True, "skipped": True,
+                        "request_id": self._update_request_id}
+            self._updating = True
+            self._update_request_id = request_id
+        try:
+            threading.Thread(target=self._do_check_update, args=(request_id,), daemon=True).start()
+        except Exception:
+            with self._lock:
+                self._updating = False
+            return {"ok": False, "queued": False, "text": "检查没能启动，请重试。"}
+        return {"ok": True, "queued": True, "request_id": request_id}
+
+    def _do_check_update(self, request_id: str) -> None:
+        result = {"state": "error", "current_version": APP_VERSION,
+                  "latest_version": None, "url": RELEASES_LATEST_URL,
+                  "text": "检查没能完成，请重试。", "error_code": "unexpected_error"}
+        try:
+            checked = check_latest_release(APP_VERSION)
+            if isinstance(checked, dict):
+                result = checked
+        except Exception:
+            # 最后兜底仍须解锁；普通更新错误不进入组件/登录错误通道。
+            pass
+        finally:
+            result = dict(result, request_id=request_id)
+            with self._lock:
+                self._update_result = result
+                self._updating = False
+                closing = self._closing
+            if not closing:
+                self._emit("update", result)
 
     def check(self) -> dict:
         # js_api 的处理跑在 UI 线程上：一旦在这里跑 subprocess，

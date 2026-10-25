@@ -49,7 +49,8 @@
 | 运行时间线（真实事件 + 原定参考 + 统一截止） | implemented（真机验收待用户） | [007](decisions/007-runtime-timeline.md) |
 | 应用生命周期、版本单一来源与发布资产 | implemented（构建/上传待授权，真机验收待用户） | [008](decisions/008-lifecycle-version-release.md) |
 | 六步可重播功能引导 | implemented（mock 截图见 [current-ui/](current-ui/)，真机验收待用户） | [009](decisions/009-replayable-product-tour.md) |
-| 独立可用单 EXE 与辅助入口（现行入口：说明 + 更多） | pending（源码已落地，运行验证/实包验收待授权） | [010](decisions/010-standalone-exe-and-settings.md) · [规范](specs/assistance-panels.md) |
+| 独立可用单EXE | implemented（离线实包通过，用户真机待验收） | [010](decisions/010-standalone-exe-and-settings.md) |
+| 统一帮助、主题对齐与手动检查更新 | confirmed（代码已落地，技术与用户验收分列） | [011](decisions/011-unified-help-and-manual-update.md) · [规范](specs/assistance-panels.md) |
 
 状态口径见 [decisions/README.md](decisions/README.md)：confirmed 只表示规则已敲定，
 implemented 另要求代码落地并有证据，proposed 一律放 [proposals/](proposals/)。
@@ -63,7 +64,7 @@ implemented 另要求代码落地并有证据，proposed 一律放 [proposals/](
 | EXE 重开复用登录态真机确认 | 只有用户能做 | [006 已知限制](decisions/006-session-persistence.md) |
 | 可重播分步功能引导 | 已实现（mock 截图 ≠ 有效登录验收），待用户真机过一遍 | [009 已知限制](decisions/009-replayable-product-tour.md) |
 | 生命周期提示 / 版本查看 / Release 入口真机确认 | 只有用户能做 | [008 已知限制](decisions/008-lifecycle-version-release.md) |
-| 五项体验缺陷 UX-01～05（空态误导 / 三步缺开始 / 已知零显示破折号 / 运行目标读旧选择 / 单场成功染整屏） | 源码已修、回归已定义，**运行验证与用户验收待授权** | [UI_SPEC §5.14](../docs/UI_SPEC.md) · [辅助入口规范](specs/assistance-panels.md) |
+| 五项体验缺陷 UX-01～05（空态误导 / 三步缺开始 / 已知零显示破折号 / 运行目标读旧选择 / 单场成功染整屏） | 隔离运行已通过，**用户与学校实测仍分列** | [UI_SPEC §5.14](../docs/UI_SPEC.md) · [辅助入口规范](specs/assistance-panels.md) |
 
 ## 历史原型说明
 

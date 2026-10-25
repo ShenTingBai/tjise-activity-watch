@@ -293,46 +293,49 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 /* 弹窗：分区式（原型 680 / padding 0 / 三列步骤卡） */
 .dlg { width: min(680px, calc(100vw - 32px)); max-width: calc(100vw - 32px); padding: 0; border: 1px solid var(--line); border-radius: 14px; color: var(--ink); box-shadow: 0 24px 70px rgba(24,55,45,.2); }.dlg::backdrop { background: rgba(17,29,38,.38); }.dlg-sm { width: min(440px, 90vw); }.dlg-sm form { display: flex; gap: 8px; justify-content: flex-end; }.dlg-sm .btn { height: 36px; padding: 0 16px; }.btn-stop-confirm { background: var(--bad); color: #fff; }.btn-stop-confirm:hover { background: #9a2a20; }.dlg-head { padding: 22px 24px 4px; }.dlg-head h2 { margin: 0; font-size: 20px; }.dlg-head p { margin: 6px 0 0; color: var(--ink-2); font-size: 13px; }.dlg-body { padding: 14px 24px 4px; }.steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 0; padding: 0; list-style: none; }.steps li { padding: 14px 14px 16px; border-radius: 10px; background: var(--paper-2); box-shadow: inset 0 0 0 1px var(--line); }.step-no, .steps .no { display: block; width: auto; height: auto; padding: 0; border-radius: 0; background: none; color: var(--blue); font-family: var(--font-num); font-size: 30px; font-weight: 600; line-height: 1; }.steps h3, .steps .t { margin: 10px 0 6px; font-size: 15px; font-weight: 700; }.steps p, .steps .d { margin: 0; color: var(--ink-2); font-size: 13px; }.rules { margin: 14px 0 0; padding: 12px 14px; border-radius: 10px; background: var(--warn-tint); color: #5e3a00; font-size: 13px; }.dlg-foot { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 16px 24px 20px; }.grow { flex: 1; }
 
-/* 更多弹窗（600px 紧凑工具面板）：固定头尾、只有正文滚动；
-   一块浅琥珀引导区 + 两条普通行，不再三层同形卡片叠套。
-   display 只在 [open] 时改 flex——否则会盖掉原生 dialog 的隐藏语义。 */
-.dlg-settings { width: min(600px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); }
-.dlg-settings[open] { display: flex; flex-direction: column; }
-.dlg-settings .dlg-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 22px 24px 10px; }
-.dlg-settings .dlg-head h2 { margin: 0; font-size: 20px; }
-.dlg-x { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border: 0; border-radius: 8px; background: transparent; color: var(--ink-2); }
-.dlg-x:hover { background: rgba(26,31,36,.07); color: var(--ink); }
-.dlg-settings .dlg-body { flex: 1 1 auto; min-height: 0; overflow: auto; display: grid; align-content: start; gap: 0; padding: 6px 24px 4px; }
-/* 唯一强调区：左侧 3px 琥珀短线沿用主界面「等开放」的语义 */
-.set-guide { margin-bottom: 4px; padding: 12px 14px; border-left: 3px solid var(--amber); border-radius: 10px; background: var(--warn-tint); }
-.set-guide .set-text b { color: #6b4100; }
-.set-guide .set-dim { color: #7a5210; }
-/* 引导区的主动作：琥珀底 = 主界面「开始报名计划」的同一语义，只在这个区域用 */
-.btn-amber { color: #1d1505; background: var(--amber); }
-.btn-amber:hover:not(:disabled) { background: #ffc44f; }
-.btn-amber:active:not(:disabled) { background: #e89b0c; }
-.set-line { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 2px; border-bottom: 1px solid var(--line); }
-.set-line:last-of-type { border-bottom: 0; }
-.set-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-.set-row .btn { flex: none; }
-.set-text { margin: 0; color: var(--ink); font-size: 14px; font-weight: 600; line-height: 1.5; }
-.set-text .set-dim { font-weight: 400; }
-/* 「当前版本」是行内小标签，数字才是这一行唯一的视觉重点 */
-.set-k { margin-right: 8px; color: var(--ink-2); font-size: 12px; font-weight: 400; }
-.set-dim { display: block; margin-top: 3px; color: var(--ink-2); font-size: 12px; font-weight: 400; line-height: 1.55; }
-/* 版本是这一屏唯一的数字，用点阵同款字体，20px 不与标题抢 */
-#settings-version { font-family: var(--font-num); font-size: 20px; font-weight: 600; letter-spacing: .02em; }
-/* 局部失败反馈：长 URL/错误原话可选中可换行，不撑宽弹窗、不在 WebView 里跳转 */
-.set-status { margin: 4px 0 10px; padding: 9px 11px; overflow-wrap: anywhere; border-radius: 8px; background: var(--bad-tint); color: #7e2119; font-size: 12px; line-height: 1.6; user-select: text; }
-.set-status[data-tone="warn"] { background: var(--warn-tint); color: var(--warn); }
-.set-esc { color: var(--ink-3); font-size: 12px; }
-.dlg-settings .dlg-foot { flex: none; padding: 14px 24px 18px; border-top: 1px solid var(--line); }
-/* 窄窗（约 746×512）：动作落到说明下方并左对齐，不强撑两列；
-   不动主界面的 860px 断点。 */
+/* 帮助沿用站牌与时刻表的层级：黑色标题、白纸正文、真实三步路线和普通工具行。
+   只有正文滚动；[open] 才改 flex，保留原生 dialog 的关闭语义。 */
+.dlg-help { width: min(680px, calc(100vw - 32px)); max-height: calc(100vh - 32px); max-height: calc(100dvh - 32px); }
+.dlg-help[open] { display: flex; flex-direction: column; }
+.dlg-help .help-head { display: flex; justify-content: space-between; gap: 16px; flex: none; padding: 18px 22px; background: var(--board); background-image: radial-gradient(rgba(236,239,234,.055) .7px, transparent .9px); background-size: 5px 5px; color: var(--on-board); }
+.dlg-help .help-head h2 { padding-left: 11px; border-left: 3px solid var(--amber); font-size: 18px; line-height: 1.3; }
+.dlg-help .help-head p { margin-top: 6px; color: var(--on-board-2); font-size: 12px; }
+.dlg-help .dlg-x { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 30px; height: 30px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--on-board-2); }
+.dlg-help .dlg-x:hover { background: rgba(255,255,255,.09); color: var(--on-board); }
+.dlg-help .dlg-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 0; }
+.help-guide { padding: 16px 22px 12px; }
+.help-section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px; }
+.help-section-head h3, .help-tool-text h3 { margin: 0; font-size: 13px; font-weight: 700; }
+.help-section-head .btn { height: 30px; flex: none; }
+.dlg-help .steps { position: relative; display: block; }
+.dlg-help .steps::before { position: absolute; left: 12px; top: 22px; bottom: 28px; width: 1px; background: var(--line-2); content: ""; }
+.dlg-help .steps li { position: relative; display: grid; grid-template-columns: 26px minmax(0,1fr); gap: 13px; padding: 8px 0; border-radius: 0; background: transparent; box-shadow: none; }
+.dlg-help .steps .no { display: flex; align-items: center; justify-content: center; width: 26px; height: 26px; border: 1px solid var(--line-2); border-radius: 50%; background: var(--paper); color: var(--ink); font: 17px/1 var(--font-num); }
+.dlg-help .steps li:first-child .no { border-color: var(--amber-dim); }
+.dlg-help .steps .t { margin: 1px 0 3px; font-size: 13px; }
+.dlg-help .steps .d { font-size: 12px; line-height: 1.65; }
+.dlg-help .rules { margin: 7px 0 0 39px; padding: 7px 0 0; border-top: 1px solid var(--line); border-radius: 0; background: transparent; color: var(--ink-3); font-size: 12px; }
+.help-tools { padding: 0 22px; border-top: 1px solid var(--line); background: var(--paper-2); }
+.help-tool-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 13px 0; border-bottom: 1px solid var(--line); }
+.help-tool-row:last-of-type { border-bottom: 0; }
+.help-tool-text { min-width: 0; }
+.help-tool-text p { margin: 4px 0 0; color: var(--ink-2); font-size: 12px; overflow-wrap: anywhere; }
+.help-tool-text .help-checked { margin-top: 2px; color: var(--ink-3); font-size: 11px; }
+.help-current { margin-left: 10px; color: var(--ink-3); font-size: 12px; font-weight: 400; white-space: nowrap; }
+#help-version { margin-left: 4px; color: var(--ink); font: 17px/1 var(--font-num); }
+.help-actions { display: flex; flex: none; gap: 6px; }
+.help-tool-row > .btn { flex: none; }
+#update-status[data-state="available"] { color: var(--warn); }
+#update-status[data-state="error"] { color: var(--bad); }
+.help-status { margin: 0; padding: 0 0 12px; color: var(--bad); overflow-wrap: anywhere; font-size: 12px; user-select: text; }
+.help-status[data-tone="warn"] { color: var(--warn); }
+.dlg-help .dlg-foot { flex: none; padding: 11px 22px; border-top: 1px solid var(--line); }
+.help-esc { color: var(--ink-3); font-size: 12px; }
 @media (max-width: 720px) {
-  .dlg-settings .dlg-head, .dlg-settings .dlg-body, .dlg-settings .dlg-foot { padding-right: 18px; padding-left: 18px; }
-  .set-row, .set-line { flex-direction: column; align-items: flex-start; gap: 10px; }
-  .set-row .btn, .set-line .btn { align-self: stretch; }
+  .dlg-help .help-head, .help-guide, .help-tools, .dlg-help .dlg-foot { padding-right: 16px; padding-left: 16px; }
+  .help-tool-row { flex-wrap: wrap; gap: 9px; }
+  .help-actions { flex-wrap: wrap; }
+  .help-section-head .btn { max-width: 190px; height: auto; min-height: 30px; white-space: normal; }
 }
 
 /* 时钟/时间详情浮层 */
