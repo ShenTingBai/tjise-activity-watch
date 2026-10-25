@@ -22,6 +22,39 @@ def read(rel: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def settings_dialog(html: str) -> str:
+    """截取更多 dialog 元素本体（不含其前注释），供禁词等逐字断言使用。"""
+    start = html.index('<dialog class="dlg dlg-settings"')
+    end = html.index("</dialog>", start) + len("</dialog>")
+    return html[start:end]
+
+
+# 帮助载荷隔离求值用的注入常量：证明 help() 用的是外部版本来源，不是写死值
+HELP_TEST_VERSION = "9.9.9-test"
+HELP_TEST_URL = "https://example.invalid/releases/latest"
+
+
+def load_backend_help() -> dict:
+    """只取 app.py 里 Api.help 这一个方法，在隔离命名空间里求值后调用。
+
+    不 import app.py：它的顶层会 import webview 并经 runtime_paths 触碰数据根，
+    与本计划「不安装依赖、不读真实登录文件」的边界冲突。这里用 ast 抽出
+    FunctionDef，单独编译并注入 APP_VERSION / RELEASES_LATEST_URL，
+    因此拿到的是**真实方法的返回值**，不是源码子串的推测。
+    """
+    import ast
+
+    tree = ast.parse(read("app.py"))
+    node = next(item for item in ast.walk(tree)
+                if isinstance(item, ast.FunctionDef) and item.name == "help"
+                and [arg.arg for arg in item.args.args][:1] == ["self"])
+    module = ast.Module(body=[node], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"APP_VERSION": HELP_TEST_VERSION, "RELEASES_LATEST_URL": HELP_TEST_URL}
+    exec(compile(module, "<Api.help>", "exec"), namespace)  # noqa: S102 - 只编译受控片段
+    return namespace["help"](None)
+
+
 class FilterControlTests(unittest.TestCase):
     """两个筛选控件：全部/需要/无需 三态都必须存在。"""
 
@@ -605,7 +638,15 @@ class DualModeUiContractTests(unittest.TestCase):
         start = js.index("function taskHtml(")
         body = js[start:js.index("function updateControls(", start)]
         self.assertIn("signup_mode", body, "任务卡必须读取任务的 signup_mode")
-        self.assertIn("modeText(mode)", body, "任务卡必须输出模式文案")
+        self.assertIn("taskModePrefix(task)", body, "任务卡必须使用统一的模式文案")
+        cards = run_js(r"""
+const task = { task_id: "mode", name: "模式样本", status: "waiting",
+  sign_start: "2099-01-01 09:00:00" };
+out.push(taskHtml({ ...task, signup_mode: "pre_register" }));
+out.push(taskHtml({ ...task, signup_mode: "instant_signup" }));
+""")
+        self.assertIn("预报名 · ", cards[0])
+        self.assertIn("立即报名/抢名额 · ", cards[1])
 
 
 class PreopenRouteContractTests(unittest.TestCase):
@@ -647,6 +688,2242 @@ class PreopenRouteContractTests(unittest.TestCase):
                          "批次循环内不得 join：重试中的场次不得阻塞后续调度")
         self.assertIn('== "instant_signup"', sp,
                       "已开放场次必须立即启动，不等历史 sign_start")
+
+
+class TourAndLifecycleContractTests(unittest.TestCase):
+    """六步可重播引导 + 生命周期提示的静态契约（决策 009 / UI_SPEC §5.11）。"""
+
+    def test_index_has_six_tour_targets(self):
+        """六个稳定高亮锚点：登录/列表/筛选/选择/开始/运行。"""
+        html = read("ui/index.html")
+        for key in ("login", "list", "filters", "select", "start", "run"):
+            self.assertIn('data-tour-target="%s"' % key, html,
+                          "缺少第 %s 步的高亮锚点 data-tour-target" % key)
+
+    def test_index_has_tour_overlay_and_replay_entry(self):
+        """引导遮罩结构 + 两处重播入口（「更多」与说明底部，共用一条路径）。"""
+        html = read("ui/index.html")
+        for needle in ('id="tour"', 'id="tour-card"', 'id="tour-spot"',
+                       'id="tour-skip"', 'id="tour-prev"', 'id="tour-next"',
+                       'id="tour-step"', 'id="tour-dots"'):
+            self.assertIn(needle, html, "引导结构缺 %s" % needle)
+        self.assertIn('id="btn-settings-tour"', html, "「更多」里必须有「重看引导」入口")
+        self.assertIn('id="btn-help-tour"', html,
+                      "说明底部必须有重播快捷入口（与更多共用同一条处理路径）")
+        self.assertIn("重看引导", html, "重播入口要有可读文字，不能只靠图标")
+        self.assertIn('id="settings"', html, "必须有独立 dialog #settings")
+        self.assertIn("跳过引导", html, "必须有跳过按钮")
+
+    def test_app_js_tour_definition_and_version(self):
+        """TOUR_VERSION=2（内容实质变化）、六步定义、完成/跳过存储键与立即保存。"""
+        js = read("ui/app.js")
+        self.assertIn("const TOUR_VERSION = 2", js,
+                      "六步文案已纠正「选中即执行」，内容版本必须升到 2")
+        self.assertGreaterEqual(js.count("target: "), 6, "TOUR_STEPS 必须定义六步")
+        for key in ("tour_version", "tour_completed_at", "tour_skipped_at"):
+            self.assertIn(key, js, "引导状态键 %s 必须写入偏好" % key)
+        self.assertIn("savePrefsNow", js, "完成/跳过必须立即落盘，不等防抖")
+        # 六步标题齐全（顺序在数组里固定）
+        for title in ("登录状态", "活动与模式", "筛选", "选择与冲突", "重试与开始", "运行与结果"):
+            self.assertIn('title: "%s"' % title, js, "TOUR_STEPS 缺「%s」步骤" % title)
+
+    def test_tour_steps_do_not_promise_selection_starts(self):
+        """第 2 步不得再写「选中后马上执行」：选择不等于开始（UX-02 同源误导读法）。"""
+        js = read("ui/app.js")
+        steps = js[js.index("TOUR_STEPS = ["):js.index("const S = {")]
+        self.assertNotIn("选中后马上执行", steps,
+                         "引导不得暗示选中即执行；开始必须点「开始报名计划」")
+        self.assertIn("再点「开始报名计划」", steps, "第 2 步要写清真正的开始动作")
+        # 第 5 步讲次数口径，第 6 步讲任务/计划结果分层与停止语义
+        self.assertIn("次数只算真正发出去的提交", steps, "第 5 步要讲清次数只算真实提交")
+        self.assertIn("整块大屏的结论要等整个计划结束", steps,
+                      "第 6 步要区分任务结果与计划结果")
+        self.assertIn("不会撤销学校那边已经报上的", steps, "第 6 步要说明停止不等于撤销报名")
+
+    def test_tour_never_triggers_backend_actions(self):
+        """引导只做说明：开始/推进/跳过引导的代码不得调用任何桥接动作。"""
+        js = read("ui/app.js")
+        start = js.index("function tourShouldAutoStart()")
+        end = js.index("/* ---------------------------------------------------------------- 事件绑定 */")
+        body = js[start:end]
+        for banned in ("api(\"login\"", "api(\"start_plan\"", "api(\"check\"",
+                       "api(\"list_activities\"", "toggleSelection(", "startPlan()"):
+            self.assertNotIn(banned, body,
+                             "引导逻辑不得代替用户执行动作：%s" % banned)
+
+    def test_tour_skip_pause_and_narrow_fallback(self):
+        """跳过后同版不再自动弹；窄窗（≤980）与目标缺失退回底部说明条；运行中暂停。"""
+        js = read("ui/app.js")
+        self.assertIn("tourShouldAutoStart", js, "自动开始必须有判定函数")
+        self.assertIn("seen >= TOUR_VERSION", js,
+                      "自动开始只按已看过的内容版本判定（旧时间戳不得拦截新版）")
+        self.assertIn("window.innerWidth > 980", js, "窄窗（≤980）必须退回底部说明条")
+        self.assertIn('classList.toggle("is-bottom"', js, "回退态必须挂 is-bottom 类")
+        self.assertIn("tourPauseNow", js, "计划运行中必须暂停引导")
+        self.assertIn("tourResumeNow", js, "计划结束后必须可恢复引导")
+        # Esc 等同跳过
+        esc_at = js.index('if (event.key === "Escape")')
+        esc_body = js[esc_at:esc_at + 400]
+        self.assertIn("tourSkip()", esc_body, "Esc 在引导打开时必须先走跳过")
+
+    def test_chrome_login_window_text_only(self):
+        """第 1 步必须说明 Chrome 登录窗口高亮不了（系统窗口）。"""
+        js = read("ui/app.js")
+        first_step = js[js.index("TOUR_STEPS = ["):js.index('{ target: "list"')]
+        self.assertIn("高亮不了", first_step, "登录步骤必须说明系统窗口不能高亮")
+
+    def test_lifecycle_display_and_estimate_reminder(self):
+        """生命周期提示：离线时长 abnormal 带「约」；登录估算同源且只是提醒；valid 不被估算压成失效。"""
+        js = read("ui/app.js")
+        self.assertIn("S.lifecycle = info.lifecycle || null", js,
+                      "bootstrap 的 lifecycle 快照必须消费")
+        self.assertIn("上次关闭后离线", js, "时钟浮层必须显示上一周期的固定离线间隔")
+        self.assertIn("约 ", js, "abnormal/估算值必须带「约」")
+        self.assertIn("以学校校验为准", js, "登录估算必须注明以学校校验为准")
+        # R4：浮层剩余与胶囊同源（S.login 锚点），不得读冻结的生命周期快照
+        pop_body = js[js.index("function toggleClockPop("):js.index("function paintClockPopLeft")]
+        self.assertNotIn("life.login", pop_body,
+                         "浮层登录剩余必须用当前锚点，不得用 bootstrap 冻结的旧快照")
+        self.assertIn("S.login.expireAt", pop_body, "浮层剩余必须与胶囊同一来源")
+        self.assertIn('S.login.result === "valid" && typeof h === "number" && h <= 0',
+                      js, "校验有效但估算到点必须单独分支（不得落失效分支）")
+        # 估算不参与开始门禁：门禁仍只看 result === "valid"
+        gate = js[js.index("function updateControls("):js.index("function paintBanners")]
+        self.assertNotIn("estimated_expires_at", gate,
+                         "生命周期估算不得进入开始按钮门禁")
+        self.assertNotIn("lifecycle", gate, "生命周期字段不得参与门禁")
+
+    def test_releases_latest_link_is_user_triggered(self):
+        """GitHub releases/latest：只由用户点击打开，启动时不自动联网。"""
+        html = read("ui/index.html")
+        self.assertNotIn("<a ", settings_dialog(html),
+                         "发布页不得变成 WebView 内导航链接")
+        js = read("ui/app.js")
+        self.assertIn("const RELEASES_LATEST_URL =", js, "外链地址必须是固定常量")
+        self.assertIn('api("open_latest_release")', js, "打开外链必须走后端动作（点击触发）")
+        handler = js[js.index('$("#btn-settings-latest").addEventListener'):
+                     js.index('$("#btn-settings-data").addEventListener')]
+        self.assertIn("RELEASES_LATEST_URL", handler,
+                      "打不开时要把固定地址摆成可选文本，让用户能自己复制")
+        # 启动路径（boot/refresh）不得自动请求外链
+        boot_body = js[js.index("async function boot()"):js.index("function applyPrefs")]
+        self.assertNotIn("open_latest_release", boot_body, "启动时不得自动打开/请求 GitHub")
+
+
+    def test_tour_does_not_gate_login_or_start(self):
+        """引导未完成/进行中都不影响登录与 start_plan 门禁（门禁只看登录四态）。
+
+        断言锁 S.tour 引导状态（而非 "tour" 子串——#btn-settings-tour 的
+        disabled 引用是设置功能，不是引导门禁）。
+        """
+        js = read("ui/app.js")
+        gate = js[js.index("function updateControls("):js.index("function paintBanners")]
+        self.assertNotIn("S.tour", gate,
+                         "开始按钮门禁不得引用引导状态")
+        auto = js[js.index("function tourShouldAutoStart()"):js.index("function startTour")]
+        self.assertNotIn("S.login", auto,
+                         "引导自动开始不读登录状态：未登录也要能看引导")
+        # 引导也不改变登录按钮：paintLogin 的四态分支里没有引导概念
+        paint = js[js.index("function paintLogin()"):js.index("function setBusy")]
+        self.assertNotIn("tour", paint, "登录胶囊渲染与引导互不影响")
+
+    def test_settings_dialog_shows_version(self):
+        """「更多」显示后端版本（VERSION 唯一来源），帮助载荷带版本与外链；
+        旧说明弹窗版本位 id 不得残留。"""
+        js = read("ui/app.js")
+        anchor = js.index('$("#settings-version").textContent')
+        self.assertIn("info.version", js[anchor:anchor + 160],
+                      "版本必须来自 bootstrap.version（唯一来源）")
+        self.assertIn('$("#settings-version")', js, "版本必须填入更多弹窗唯一位置")
+        html = read("ui/index.html")
+        self.assertIn('id="settings-version"', html, "设置弹窗必须有版本位")
+        self.assertNotIn('id="help-version"', html, "旧说明弹窗版本位 id 不得残留")
+        # 只锁字符串字面量：注释里提及历史候选号不算硬编码
+        self.assertNotIn('"1.1.0"', js, "界面代码不得写死候选版本号字符串")
+        self.assertNotIn("'1.1.0'", js, "界面代码不得写死候选版本号字符串")
+        py = read("app.py")
+        self.assertIn('"version": APP_VERSION', py, "bootstrap/help 用 APP_VERSION")
+        self.assertIn('"latest_url": RELEASES_LATEST_URL', py,
+                      "help 载荷要带最新版本入口信息")
+
+    def test_unknown_attendance_copy_stays(self):
+        """未知签到/签退仍显示「待说明」并被需要/无需筛选排除（回归防线）。"""
+        js = read("ui/app.js")
+        html = read("ui/index.html")
+        self.assertIn("签到待说明", js)
+        self.assertIn("签退待说明", js)
+        self.assertIn("签到/签退待说明", js)
+        for key in ("checkin", "checkout"):
+            self.assertIn('id="%s"' % key, html)
+
+
+# --------------------------------------------------------------------- 行为测试装置
+# 在 node vm 里加载生产 app.js + 最小 DOM 桩，执行代码片段并取回断言输出。
+# 不开浏览器、不装依赖：node 是项目既有工具链（服务器机器人同用）。
+# 桩的边界：querySelector 按选择器缓存同一元素；focus 记录到 focused；
+# document 只捕获 keydown 监听（__dispatchKey 合成按键）；定时器只记录不调度。
+
+JS_HARNESS = r"""
+"use strict";
+const vm = require("vm");
+const fs = require("fs");
+const appJs = process.argv[2];
+const snippetFile = process.argv[3];
+
+const out = [];
+const focused = [];
+const els = new Map();
+const keydownListeners = [];
+
+function makeEl(sel) {
+  const el = {
+    __sel: sel, hidden: false, disabled: false, checked: false,
+    value: "", textContent: "", title: "", innerHTML: "", returnValue: "",
+    tagName: "DIV", open: false,
+    dataset: {}, style: {}, _cls: new Set(),
+    listeners: {},
+  };
+  el.classList = {
+    toggle(c, on) {
+      if (on === undefined) { if (el._cls.has(c)) el._cls.delete(c); else el._cls.add(c); }
+      else if (on) el._cls.add(c); else el._cls.delete(c);
+    },
+    add(c) { el._cls.add(c); },
+    remove(c) { el._cls.delete(c); },
+    contains(c) { return el._cls.has(c); },
+  };
+  el.addEventListener = (type, fn) => { (el.listeners[type] = el.listeners[type] || []).push(fn); };
+  el.removeEventListener = () => {};
+  el.setAttribute = (k, v) => { el["attr_" + k] = v; };
+  el.getAttribute = (k) => el["attr_" + k];
+  el.focus = () => { sandbox.document.activeElement = el; focused.push(sel); };
+  el.blur = () => { if (sandbox.document.activeElement === el) sandbox.document.activeElement = null; };
+  el.select = () => {};
+  el.click = () => (el.listeners.click || []).forEach((fn) => fn({ target: el, preventDefault() {} }));
+  el.closest = () => null;
+  el.contains = () => true;
+  /* <dialog> 原生方法桩：设置/说明/停止确认的 open 状态靠它们翻转 */
+  el.showModal = () => { el.open = true; };
+  el.close = () => { el.open = false; };
+  el.appendChild = () => {};
+  el.removeChild = () => {};
+  el.insertBefore = () => {};
+  el.childElementCount = 0;
+  el.childNodes = [];
+  el.getBoundingClientRect = () => ({ top: 100, left: 100, bottom: 140, right: 460, width: 360, height: 40 });
+  el.getClientRects = () => [1];
+  el.offsetWidth = 360;
+  el.offsetHeight = 40;
+  el.querySelector = (s) => el2(sel + " " + s);
+  el.querySelectorAll = (s) => [el2(sel + " " + s)];
+  return el;
+}
+
+function el2(sel) {
+  if (!els.has(sel)) els.set(sel, makeEl(sel));
+  return els.get(sel);
+}
+
+const sandbox = {
+  console, Date, Math, JSON, Promise, Object, Array, Number, String, Boolean, RegExp, Error,
+  isNaN, parseInt, parseFloat,
+  innerWidth: 1120, innerHeight: 800,
+  setTimeout: () => 0, clearTimeout: () => {}, setInterval: () => 0, clearInterval: () => {},
+  navigator: { onLine: true },
+  /* window.addEventListener/removeEventListener：app.js 顶层注册 resize/online/offline 用 */
+  addEventListener: () => {}, removeEventListener: () => {},
+  out, focused, __els: els,
+  requestAnimationFrame: () => 0,
+  __dispatchKey: (ev) => {
+    const e = Object.assign(
+      { ctrlKey: false, shiftKey: false, altKey: false, defaultPrevented: false,
+        target: { closest: () => null, tagName: "BODY", blur() {} } }, ev);
+    e.preventDefault = () => { e.defaultPrevented = true; };
+    keydownListeners.slice().forEach((fn) => fn(e));
+    return e;
+  },
+  document: {
+    hidden: false, activeElement: null,
+    querySelector: (s) => el2(s),
+    querySelectorAll: (s) => [el2(s)],
+    createElement: (tag) => el2("<" + tag + ">"),
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
+    addEventListener: (t, fn) => { if (t === "keydown") keydownListeners.push(fn); },
+    removeEventListener: () => {},
+  },
+};
+sandbox.window = sandbox;
+sandbox.document.body = el2("body");
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(appJs, "utf8"), sandbox, { filename: "app.js" });
+/* 片段统一包成 async IIFE：顶层 await 可用（受控 Promise 次序），同步片段
+ * 返回的 promise 立即完成，输出时序不变 */
+const snippetSource = fs.readFileSync(snippetFile, "utf8");
+const snippetResult = vm.runInContext(
+  "(async () => {\n" + snippetSource + "\n})()",
+  sandbox, { filename: "snippet.js" });
+const finishHarness = () => process.stdout.write("__RESULT__" + JSON.stringify(out));
+snippetResult.then(finishHarness, (err) => { process.stderr.write(String(err)); process.exit(1); });
+"""
+
+
+def run_js(snippet: str):
+    """在受控 JS 上下文里执行片段，返回 out 数组（list）。node 缺失时 skip。"""
+    import json
+    import shutil
+    import subprocess
+    import tempfile
+    node = shutil.which("node")
+    if not node:
+        raise unittest.SkipTest("本机没有 node，无法运行 JS 行为测试")
+    with tempfile.TemporaryDirectory() as name:
+        harness = Path(name) / "harness.js"
+        part = Path(name) / "snippet.js"
+        harness.write_text(JS_HARNESS, encoding="utf-8")
+        part.write_text(snippet, encoding="utf-8")
+        res = subprocess.run([node, str(harness), str(LOCAL / "ui" / "app.js"), str(part)],
+                             capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=30)
+        if res.returncode != 0:
+            raise AssertionError("JS 行为测试崩溃：%s" % res.stderr[-800:])
+        marker = res.stdout.rfind("__RESULT__")
+        if marker < 0:
+            raise AssertionError("JS 行为测试没有输出结果：%s" % res.stdout[-500:])
+        return json.loads(res.stdout[marker + len("__RESULT__"):].strip() or "[]")
+
+
+class LoginEstimateBehaviorTests(unittest.TestCase):
+    """R4：登录剩余同一来源、绝对时刻计时、刷新不续期（node vm 行为，不调用学校）。"""
+
+    def test_relogin_swaps_anchor_without_reload(self):
+        """启动旧估算 → 窗口内重新登录 → check 事件带新锚点：不重载窗口也同步换新。"""
+        res = run_js(r"""
+const H = 3600e3;
+const now = Date.now();
+/* bootstrap：旧凭证还剩 1 小时，随后第一次校验回来（ok=true，与真实启动时序一致） */
+setLogin(1, null, true, { session_present: true, saved_at: "s-old", estimated_expires_at: (now + 1 * H) / 1000 });
+window.onBackend.check({ ok: true, result: "valid", hours_left: 1,
+  session_present: true, estimated_expires_at: (now + 1 * H) / 1000, saved_at: "s-old" });
+const before = S.login.expireAt;
+/* 重新登录成功：旧锚点立即作废（未知，等 check 带新锚点） */
+window.onBackend.done({ kind: "login", ok: true });
+const cleared = S.login.expireAt;
+/* check 回来：新锚点 = 新 saved_at + 17.5h */
+window.onBackend.check({ ok: true, result: "valid", hours_left: 17.5,
+  session_present: true, estimated_expires_at: (now + 17.5 * H) / 1000, saved_at: "s-new" });
+out.push({ before, cleared, after: S.login.expireAt,
+  pillText: document.querySelector("#pill-text").textContent,
+  pillSub: document.querySelector("#pill-sub").textContent });
+""")
+        self.assertEqual(res[0]["cleared"], None, "重登成功后旧锚点必须作废")
+        self.assertGreater(res[0]["after"], res[0]["before"] + 8 * 3600e3,
+                           "check 事件必须换上重登后的新锚点")
+        self.assertEqual(res[0]["pillText"], "登录有效")
+
+    def test_anchor_counts_down_with_clock(self):
+        """时钟推进两小时：锚点不动，各处剩余同步减两小时（不重开窗口、不刷新）。"""
+        res = run_js(r"""
+const H = 3600e3;
+const realNow = Date.now;
+const t0 = 1700000000000;
+Date.now = () => t0;
+setLogin(5, null, true, { estimated_expires_at: t0 / 1000 + 5 * 3600 });
+/* 校验回来：ok=true 才会离开「正在检查」分支（与真实启动时序一致） */
+window.onBackend.check({ ok: true, result: "valid", hours_left: 5,
+  session_present: true, estimated_expires_at: t0 / 1000 + 5 * 3600 });
+const h1 = loginHoursLeft();
+Date.now = () => t0 + 2 * H;
+paintLogin();
+const h2 = loginHoursLeft();
+const sub = document.querySelector("#pill-sub").textContent;
+Date.now = realNow;
+out.push({ h1, h2, sub });
+""")
+        self.assertAlmostEqual(res[0]["h1"], 5.0, delta=0.01)
+        self.assertAlmostEqual(res[0]["h2"], 3.0, delta=0.01, msg="两小时后剩余必须少两小时")
+        self.assertIn("3 小时", res[0]["sub"], "胶囊「约剩」要按绝对锚点走字")
+
+    def test_repeated_check_does_not_renew_anchor(self):
+        """刷新同一凭证：锚点是绝对时刻，不会按「本次刷新时刻 + hours」续期。"""
+        res = run_js(r"""
+const H = 3600e3;
+const t0 = 1700000000000;
+const realNow = Date.now;
+Date.now = () => t0;
+const anchor = t0 / 1000 + 4 * 3600;
+setLogin(4, null, true, { estimated_expires_at: anchor });
+window.onBackend.check({ ok: true, result: "valid", hours_left: 4,
+  session_present: true, estimated_expires_at: anchor });
+const a1 = S.login.expireAt;
+/* 两小时后再次 check：后端 hours 按绝对墙钟递减（4→2），锚点必须仍是同一绝对时刻 */
+Date.now = () => t0 + 2 * H;
+window.onBackend.check({ ok: true, result: "valid", hours_left: 2,
+  session_present: true, estimated_expires_at: anchor });
+Date.now = realNow;
+out.push({ a1, a2: S.login.expireAt });
+""")
+        self.assertEqual(res[0]["a1"], res[0]["a2"], "同一凭证的锚点不得随刷新漂移")
+
+    def test_valid_at_zero_estimate_stays_valid(self):
+        """估算到点但学校 valid：仍「登录有效」，不显示成过期（放行只看学校结论）。"""
+        res = run_js(r"""
+window.onBackend.check({ ok: true, result: "valid", hours_left: 0,
+  session_present: true, estimated_expires_at: Date.now() / 1000 - 60 });
+out.push({ state: document.querySelector("#pill").dataset.state,
+  text: document.querySelector("#pill-text").textContent,
+  sub: document.querySelector("#pill-sub").textContent });
+""")
+        self.assertEqual(res[0]["state"], "ok")
+        self.assertEqual(res[0]["text"], "登录有效")
+        self.assertIn("以学校校验为准", res[0]["sub"])
+
+    def test_no_anchor_shows_unknown_not_fabricated(self):
+        """没有锚点：不编 17 小时；unknown 结论也不显示成过期。"""
+        res = run_js(r"""
+setLogin(null, true, true, { session_present: true, saved_at: null, estimated_expires_at: null });
+S.login.result = "unknown"; S.login.ok = false;
+paintLogin();
+out.push({ text: document.querySelector("#pill-text").textContent,
+  expiry: expiryText() });
+""")
+        self.assertEqual(res[0]["text"], "暂时无法确认登录态")
+        self.assertNotIn("17", res[0]["expiry"], "没有锚点不得编造 17 小时")
+        self.assertIn("未知", res[0]["expiry"])
+
+
+class TourBehaviorTests(unittest.TestCase):
+    """R5/R6：引导内容版本判定、焦点循环、背景快捷键隔离、暂停放行（node vm 行为）。"""
+
+    def test_autostart_by_content_version_not_timestamps(self):
+        """新用户自动弹；同版完成/跳过不弹；计划运行中不弹。"""
+        res = run_js(r"""
+S.busy = false;
+S.prefs = {};
+out.push({ fresh: tourShouldAutoStart() });
+S.prefs = { tour_version: TOUR_VERSION, tour_completed_at: "2026-01-01T00:00:00Z" };
+out.push({ sameDone: tourShouldAutoStart() });
+S.prefs = { tour_version: TOUR_VERSION, tour_skipped_at: "2026-01-01T00:00:00Z" };
+out.push({ sameSkipped: tourShouldAutoStart() });
+S.prefs = { tour_version: 0, tour_completed_at: "2026-01-01T00:00:00Z" };
+out.push({ oldVersionWithOldStamp: tourShouldAutoStart() });
+S.busy = true;
+out.push({ busyBlocks: !tourShouldAutoStart() });
+S.busy = false;
+""")
+        self.assertTrue(res[0]["fresh"], "新用户必须自动弹")
+        self.assertFalse(res[1]["sameDone"], "同版完成不重复弹")
+        self.assertFalse(res[2]["sameSkipped"], "同版跳过不重复弹")
+        self.assertTrue(res[3]["oldVersionWithOldStamp"],
+                        "旧内容版本的时间戳不得挡住更新的内容版本（R5）")
+        self.assertTrue(res[4]["busyBlocks"], "计划运行中不自动弹")
+
+    def test_tab_cycles_inside_card_and_background_shortcuts_blocked(self):
+        """Tab 在卡片按钮间循环；背景 Ctrl+F/`/`/Enter 不移焦点、不开始计划。"""
+        res = run_js(r"""
+S.busy = false;
+startTour(0);
+const qFocused = () => focused.indexOf("#q") >= 0;
+/* startTour 已聚焦 #tour-next（buttons=[skip,prev,next] 的第 3 个）：
+ * Tab 从 next 前进绕回 skip，Shift+Tab 再回到 next——首尾相接 */
+__dispatchKey({ key: "Tab" });
+__dispatchKey({ key: "Tab", shiftKey: true });
+const tabInCard = focused.slice(-2);
+/* 背景快捷键：焦点不得进搜索框 */
+__dispatchKey({ key: "f", ctrlKey: true });
+const ctrlF = qFocused();
+__dispatchKey({ key: "/" });
+const slash = qFocused();
+/* 背景 Enter：必须拦截（不得开始计划） */
+const ev = __dispatchKey({ key: "Enter" });
+out.push({ tabInCard, ctrlF, slash, enterBlocked: ev.defaultPrevented,
+  tourOpen: S.tour.open });
+tourSkip();
+""")
+        self.assertEqual(res[0]["tabInCard"], ["#tour-skip", "#tour-next"],
+                         "Tab 必须在卡片按钮间首尾循环（next → skip → next）")
+        self.assertFalse(res[0]["ctrlF"], "引导可见时 Ctrl+F 不得把焦点送进背景搜索框")
+        self.assertFalse(res[0]["slash"], "引导可见时 `/` 不得移动焦点")
+        self.assertTrue(res[0]["enterBlocked"], "背景 Enter 必须被拦截，不得开始计划")
+        self.assertTrue(res[0]["tourOpen"], "以上按键都不得顺手关掉引导")
+
+    def test_esc_skips_once_and_restores_focus(self):
+        """Esc=跳过且只落一次偏好；关闭后焦点还给引导开始前的元素。"""
+        res = run_js(r"""
+const saved = [];
+savePrefsNow = (patch) => saved.push(patch);
+const target = document.querySelector("#btn-refresh");
+target.focus();
+startTour(2);
+const enteredTour = focused.indexOf("#tour-next") >= 0;
+__dispatchKey({ key: "Escape" });
+__dispatchKey({ key: "Escape" });   /* 第二次 Esc：引导已关，不得再落一次跳过记录 */
+out.push({ savedCount: saved.length, savedKeys: Object.keys(saved[0] || {}),
+  tourOpen: S.tour.open, restored: focused.slice(-1)[0], enteredTour });
+""")
+        self.assertTrue(res[0]["enteredTour"], "开始引导时焦点必须进卡片")
+        self.assertEqual(res[0]["savedCount"], 1, "Esc 跳过只持久化一次")
+        self.assertIn("tour_version", res[0]["savedKeys"])
+        self.assertFalse(res[0]["tourOpen"])
+        self.assertEqual(res[0]["restored"], "#btn-refresh", "关闭后焦点还给引导前的元素")
+
+    def test_busy_pause_releases_constraints_and_resume(self):
+        """计划运行暂停引导：键盘约束放行（背景快捷键正常工作）、不挡停止；结束后回原步骤。"""
+        res = run_js(r"""
+startTour(3);
+setBusy(true);          /* 暂停：遮罩隐藏 */
+const pausedVisible = tourVisible();
+/* 暂停期间背景快捷键照常工作：Ctrl+F 正常跳搜索框（约束已解除） */
+__dispatchKey({ key: "f", ctrlKey: true });
+const qReachable = focused.indexOf("#q") >= 0;
+const stillOpen = S.tour.open;
+setBusy(false);         /* 恢复 */
+out.push({ pausedVisible, qReachable,
+  stillOpen, resumedVisible: tourVisible(), step: S.tour.step,
+  boxHidden: document.querySelector("#tour").hidden });
+tourSkip();
+""")
+        self.assertFalse(res[0]["pausedVisible"], "暂停期间引导不可见（不挡运行界面）")
+        self.assertTrue(res[0]["qReachable"], "暂停时背景快捷键放行（停止/搜索操作不受影响）")
+        self.assertTrue(res[0]["stillOpen"], "暂停只是隐藏，引导状态保留")
+        self.assertTrue(res[0]["resumedVisible"], "计划结束恢复引导显示")
+        self.assertEqual(res[0]["step"], 3, "恢复后回到原步骤")
+        self.assertFalse(res[0]["boxHidden"])
+
+    def test_render_repositions_open_tour(self):
+        """列表重画挪动目标后：重新定位现有高亮，不重开、不假点击。"""
+        res = run_js(r"""
+startTour(1);
+const spot = document.querySelector("#tour-spot");
+spot.style.top = "0px";
+render();               /* 活动重画（空列表也走 render） */
+out.push({ step: S.tour.step, open: S.tour.open,
+  repositioned: String(spot.style.top) !== "0px" });
+tourSkip();
+""")
+        self.assertEqual(res[0]["step"], 1, "重定位不得改变当前步骤")
+        self.assertTrue(res[0]["open"], "render 不得重开或关闭引导")
+        self.assertTrue(res[0]["repositioned"], "render 后必须重新定位高亮框")
+
+
+class SettingsEntryContractTests(unittest.TestCase):
+    """辅助入口的静态契约：顶栏「说明 + 更多」，更多面板只有一块强调区。"""
+
+    def test_index_has_settings_entry_and_groups(self):
+        """顶栏「更多」入口；面板 = 引导区 + 版本行 + 数据行，动作都可发现。"""
+        html = read("ui/index.html")
+        self.assertIn('id="btn-settings"', html, "顶栏必须有独立「更多」按钮")
+        self.assertIn('aria-label="更多：重看引导、版本与本机数据"', html,
+                      "入口必须有可读的无障碍名（不能只靠图标）")
+        self.assertIn(">更多<", html, "顶栏按钮的文字必须是「更多」")
+        self.assertIn("<svg", html[max(0, html.index('id="btn-settings"') - 300):
+                                   html.index('id="btn-settings"') + 400],
+                      "更多按钮必须带内联 SVG 图标")
+        for needle in ("btn-settings-tour", "btn-settings-latest", "btn-settings-data",
+                       "settings-title", "settings-version", "settings-status"):
+            self.assertIn('id="%s"' % needle, html, "更多弹窗缺组件 #%s" % needle)
+        dialog = settings_dialog(html)
+        for text in ("操作引导", "本机数据", "重看引导", "查看发布页",
+                     "打开数据目录", "Esc 关闭"):
+            self.assertIn(text, dialog, "更多弹窗缺「%s」" % text)
+        # 不再用三张同形分组卡叠套；现行入口统一叫「更多」
+        self.assertNotIn("set-group", dialog, "不再用三张同形分组卡")
+        self.assertNotIn("设置", dialog, "现行入口统一叫「更多」，旧「设置」措辞不得残留")
+        for banned in ("清空凭证", "重置", "自动更新", "自动检查更新"):
+            self.assertNotIn(banned, dialog,
+                             "更多弹窗不得出现未确认功能「%s」" % banned)
+
+    def test_help_dialog_keeps_quick_help_only(self):
+        """说明弹窗 = 三步快速帮助 + 重播快捷入口 + 知道了；版本与外链只归「更多」。"""
+        html = read("ui/index.html")
+        help_body = html[html.index('id="help"'):html.index('id="settings"')]
+        for migrated in ("btn-latest", "help-version"):
+            self.assertNotIn('id="%s"' % migrated, help_body,
+                             "说明弹窗仍残留已迁去「更多」的 %s" % migrated)
+        self.assertIn("知道了", help_body, "说明弹窗保留关闭按钮")
+        self.assertIn('id="btn-help-tour"', help_body,
+                      "说明底部保留重播快捷入口（学习入口就近可重播）")
+        self.assertIn('id="help-steps"', help_body, "说明弹窗保留三步快速帮助容器")
+        js = read("ui/app.js")
+        for step_title in ("确认登录", "选活动并开始", "看进度与结果"):
+            self.assertIn(step_title, js, "三步快速帮助必须保留（%s）" % step_title)
+        self.assertIn("再点「开始报名计划」", js, "三步说明必须写出真正的开始动作")
+
+    def test_app_js_wires_settings_actions(self):
+        """两处重播共用 replayTourFrom；版本/目录仍走既有接口；忙时禁用有可见原因。"""
+        js = read("ui/app.js")
+        for anchor in ('$("#btn-settings")', '$("#btn-settings-tour")',
+                       '$("#btn-help-tour")', '$("#btn-settings-latest")',
+                       '$("#btn-settings-data")'):
+            self.assertIn(anchor, js, "app.js 缺辅助入口绑定：%s" % anchor)
+        for stale in ('$("#btn-latest")', '$("#help-version")'):
+            self.assertNotIn(stale, js, "app.js 残留旧引用 %s（元素已删除会直接抛错）" % stale)
+        self.assertIn('replayTourFrom("#settings", "#btn-settings")', js,
+                      "更多里的重播必须走共用处理函数")
+        self.assertIn('replayTourFrom("#help", "#btn-help")', js,
+                      "说明里的重播必须走同一个处理函数")
+        body = js[js.index("function replayTourFrom("):js.index("function paintReplayButtons")]
+        self.assertIn("S.busy", body, "重播必须先确认非忙")
+        self.assertIn("dialog.close()", body, "重播前必须关掉当前弹窗，不叠模态")
+        self.assertIn("opener.focus()", body, "重播前把焦点还给对应顶栏入口")
+        self.assertIn("startTour(0)", body, "重播最终从第 1 步开始")
+        self.assertIn('api("open_latest_release")', js, "查看发布页仍走既有后端外链")
+        self.assertIn('api("open_data")', js, "打开数据目录复用既有后端接口")
+        replay = js[js.index("function paintReplayButtons("):js.index("function savePrefs(")]
+        self.assertIn("btn.disabled = !!S.busy", replay, "忙时必须禁用重播")
+        self.assertIn('"计划结束后可重看引导"', replay, "禁用原因必须可见，不只靠 title")
+
+    def test_dialog_keys_do_not_penetrate(self):
+        """任意 dialog 打开时 Enter/Esc 不穿透（不开始计划、不清空选择）。"""
+        js = read("ui/app.js")
+        key_at = js.index('document.addEventListener("keydown"')
+        body = js[key_at:key_at + 2400]
+        self.assertIn('"#settings"', body,
+                      "弹窗键盘隔离必须覆盖更多弹窗")
+        self.assertIn('"#dlg-stop"', body, "停止确认弹窗保持原有 Esc 语义")
+
+
+class SettingsDialogBehaviorTests(unittest.TestCase):
+    """设置入口行为回归（node vm 行为，不开浏览器、不调用学校）。"""
+
+    def test_top_entry_opens_and_replay_chain(self):
+        """顶栏入口打开设置；重看引导先关设置再进引导。"""
+        res = run_js(r"""
+document.querySelector("#btn-settings").click();
+const opened = document.querySelector("#settings").open;
+document.querySelector("#btn-settings-tour").click();
+out.push({ opened,
+  settingsClosed: !document.querySelector("#settings").open,
+  tourOpen: S.tour.open, step: S.tour.step });
+tourSkip();
+""")
+        self.assertTrue(res[0]["opened"], "点顶栏「设置」必须打开设置弹窗")
+        self.assertTrue(res[0]["settingsClosed"], "重播前必须先关闭设置弹窗")
+        self.assertTrue(res[0]["tourOpen"], "重播必须进入六步引导")
+        self.assertEqual(res[0]["step"], 0, "重播从第 1 步开始")
+
+    def test_running_can_open_settings_but_not_replay(self):
+        """计划运行中：设置可打开、重看引导禁用且不重播；结束后可重播。"""
+        res = run_js(r"""
+setBusy(true);
+document.querySelector("#btn-settings").click();
+const openedWhileBusy = document.querySelector("#settings").open;
+const replayDisabled = document.querySelector("#btn-settings-tour").disabled;
+document.querySelector("#btn-settings-tour").click();
+const tourNotOpened = !S.tour.open;
+setBusy(false);
+document.querySelector("#btn-settings-tour").click();
+const tourOpenedAfterEnd = S.tour.open;
+out.push({ openedWhileBusy, replayDisabled, tourNotOpened, tourOpenedAfterEnd });
+tourSkip();
+""")
+        self.assertTrue(res[0]["openedWhileBusy"], "计划运行中也必须能打开设置")
+        self.assertTrue(res[0]["replayDisabled"], "运行中「重看引导」必须禁用")
+        self.assertTrue(res[0]["tourNotOpened"], "运行中不得重播引导打断计划")
+        self.assertTrue(res[0]["tourOpenedAfterEnd"], "计划结束后可以重播")
+
+    def test_dialog_open_blocks_enter_and_escape_penetration(self):
+        """设置弹窗打开时：Enter 不开始计划、Esc 不清空选择、不误跳引导。"""
+        res = run_js(r"""
+S.selected.add("a1");
+let startCalled = 0;
+const realStart = startPlan;
+startPlan = () => { startCalled += 1; };
+const dlg = document.querySelector("#settings");
+dlg.open = true;
+__dispatchKey({ key: "Enter" });
+__dispatchKey({ key: "Escape" });
+dlg.open = false;
+startPlan = realStart;
+out.push({ startCalled, selKept: S.selected.has("a1"), tourOpen: S.tour.open });
+""")
+        self.assertEqual(res[0]["startCalled"], 0, "弹窗打开时 Enter 不得穿透开始计划")
+        self.assertTrue(res[0]["selKept"], "弹窗打开时 Esc 不得清空选择")
+        self.assertFalse(res[0]["tourOpen"], "弹窗打开时 Esc 不得误触引导")
+
+    def test_latest_and_data_actions_called_once_per_click(self):
+        """「GitHub 最新版本」与「打开数据目录」各走一次既有后端接口。"""
+        res = run_js(r"""
+window.pywebview = { api: {
+  open_latest_release: () => { out.latest = (out.latest || 0) + 1; return Promise.resolve({ ok: true }); },
+  open_data: () => { out.data = (out.data || 0) + 1; return Promise.resolve({ ok: true }); },
+} };
+document.querySelector("#btn-settings-latest").click();
+document.querySelector("#btn-settings-data").click();
+out.push({ latest: out.latest, data: out.data });
+""")
+        self.assertEqual(res[0]["latest"], 1, "外链每次点击恰调用一次")
+        self.assertEqual(res[0]["data"], 1, "数据目录每次点击恰调用一次")
+
+
+class ErrorFeedbackContractTests(unittest.TestCase):
+    """错误说明唯一归属的静态契约：结果框/大屏/空态不再复读同一份错误说明。"""
+
+    def test_apply_activities_failure_has_no_result_popup(self):
+        """列表失败收尾不生成同义结果框：失败原话留给列表空态做唯一完整说明。"""
+        js = read("ui/app.js")
+        start = js.index("function applyActivities(")
+        body = js[start:js.index("function render(", start)]
+        self.assertNotIn("setResult(", body,
+                         "列表失败收尾不得再弹同义结果框")
+        self.assertIn("S.listError = res.text", body,
+                      "失败原话必须记入 S.listError 供空态归因")
+
+    def test_refresh_list_catch_has_no_result_popup(self):
+        """refresh 的列表异常回调不再额外 setResult；只保留「未连接本机脚本」一处。"""
+        js = read("ui/app.js")
+        start = js.index("function refresh(")
+        body = js[start:js.index("function applyActivities", start)]
+        self.assertEqual(body.count("setResult("), 1,
+                         "refresh 内只允许「未连接本机脚本」一处结果框")
+        self.assertIn("还没有连接本机脚本", body)
+        self.assertIn("S.listError = msg(err)", body,
+                      "桥接异常与 worker 失败同口径：原话归列表空态")
+
+    def test_board_and_empty_no_longer_repeat_full_component_hint(self):
+        """组件长说明与「重新检查」唯一归顶部横幅：大屏只留短状态、空态只留占位。"""
+        js = read("ui/app.js")
+        empty = js[js.index("function paintEmpty("):js.index("function paintCount(")]
+        # 组件分支 = paintEmpty 里第一段；到「列表失败」分支为止（登录四态已抽成
+        # loginEmptyState()，不再用 if (S.login.present) 当切片锚点）
+        comp = empty[empty.index("if (S.runtime.error)"):
+                     empty.index('if (S.listState === "error")')]
+        self.assertNotIn("copy.hint", comp, "列表空态组件分支不得复读长说明")
+        self.assertNotIn("重新检查", comp, "「重新检查」只能出现在顶部横幅")
+        board = js[js.index("function paintSelected("):js.index("function setBoardTag(")]
+        comp_board = board[board.index('S.runtime.error && S.listState !== "ready"'):
+                           board.index('if (!S.busy && S.listState === "error"')]
+        self.assertNotIn(".hint", comp_board, "大屏组件分支只留短状态")
+
+    def test_list_error_copy_uses_real_failure_text(self):
+        """空态归因用真实失败原话（S.listError），不再丢原话按空串猜。"""
+        js = read("ui/app.js")
+        empty = js[js.index("function paintEmpty("):js.index("function paintCount(")]
+        self.assertIn('listErrorCopy(S.listError || "")', empty,
+                      "空态归因必须用真实失败原话")
+
+
+class ErrorFeedbackBehaviorTests(unittest.TestCase):
+    """错误说明唯一归属的行为回归（node vm，不开浏览器、不调用学校）。"""
+
+    def test_component_hint_only_in_banner_with_single_recheck(self):
+        """组件错误：完整说明+重新检查只在顶部横幅；大屏/列表只留短状态与占位。"""
+        res = run_js(r"""
+setResult(null);   /* 桩里 #result 初始可见：先把结果框归零再进场景 */
+S.runtime.error = "worker_missing";
+S.listState = "error";
+render();
+const hint = RUNTIME_ERRORS.worker_missing.hint.slice(0, 10);
+const banners = document.querySelector("#banners").innerHTML;
+const board = document.querySelector("#board-text").textContent +
+              document.querySelector("#selected").textContent;
+const empty = document.querySelector("#empty-title").textContent +
+              document.querySelector("#empty-text").textContent;
+const action = document.querySelector("#empty-action");
+const result = document.querySelector("#result");
+/* 只数恢复入口（data-act="runtime-refresh" 按钮）：hint 文案本身含「重新检查」
+ * 三个字，按字面量计数会把说明文本误当第二个入口 */
+const recheck = (banners.match(/data-act="runtime-refresh"/g) || []).length +
+  (action.hidden || action.textContent.indexOf("重新检查") < 0 ? 0 : 1);
+out.push({ hintInBanner: banners.indexOf(hint) >= 0,
+  hintInBoard: board.indexOf(hint) >= 0,
+  hintInEmpty: empty.indexOf(hint) >= 0,
+  resultVisible: !result.hidden,
+  emptyActionHidden: action.hidden,
+  recheck });
+""")
+        self.assertTrue(res[0]["hintInBanner"], "横幅必须承载完整组件说明")
+        self.assertFalse(res[0]["hintInBoard"], "大屏不得复读长说明（只留短状态）")
+        self.assertFalse(res[0]["hintInEmpty"], "列表空态只留未加载占位，不得复读长说明")
+        self.assertFalse(res[0]["resultVisible"], "不得生成同义结果框")
+        self.assertTrue(res[0]["emptyActionHidden"], "空态不得出现第二个「重新检查」")
+        self.assertEqual(res[0]["recheck"], 1, "「重新检查」全页只能有一个")
+
+    def test_list_failure_full_reason_only_in_empty_and_result_preserved(self):
+        """普通列表失败：完整原因+重试只在列表空态；先放入的真实报名结果保留。"""
+        res = run_js(r"""
+setResult({ ok: true, title: "报名成功：校园夜跑", text: "建议去活动页确认一眼。" });
+window.onBackend.activities({ ok: false, text: "学校接口 500 了", items: [] });
+const result = document.querySelector("#result");
+const action = document.querySelector("#empty-action");
+out.push({
+  resultKept: !result.hidden && result.innerHTML.indexOf("报名成功：校园夜跑") >= 0,
+  resultText: result.innerHTML,
+  emptyTitle: document.querySelector("#empty-title").textContent,
+  emptyText: document.querySelector("#empty-text").textContent,
+  retryText: action.hidden ? "" : action.textContent,
+  board: document.querySelector("#board-text").textContent,
+  banners: document.querySelector("#banners").innerHTML,
+});
+""")
+        self.assertTrue(res[0]["resultKept"], "列表失败不得清掉真实报名结果")
+        self.assertEqual(res[0]["retryText"], "重试", "「重试」只在列表空态")
+        self.assertNotIn("报名成功", res[0]["emptyTitle"] + res[0]["emptyText"],
+                         "空态说明与报名结果互不混写")
+        self.assertNotIn("活动暂时没加载", res[0]["resultText"],
+                         "结果框不得复读列表失败的完整说明")
+        self.assertNotIn("脚本没跑通", res[0]["resultText"] + res[0]["board"],
+                         "结果框与大屏都不得复读空态的完整原因")
+        self.assertNotIn("程序组件", res[0]["banners"],
+                         "普通列表失败不得冒充组件横幅")
+
+    def test_component_recovery_restores_state(self):
+        """组件故障恢复：本轮两分支都完成且无组件故障才撤横幅（轮次协议）。"""
+        res = run_js(r"""
+let resolveCheck, resolveList;
+window.pywebview = { api: {
+  check: () => new Promise((resolve) => { resolveCheck = resolve; }),
+  list_activities: () => new Promise((resolve) => { resolveList = resolve; }),
+}};
+S.runtime.error = "worker_missing";
+S.listState = "error";
+render();
+refresh(false);          /* 开启复查轮：两分支 pending，旧横幅保持到收口 */
+await Promise.resolve();
+resolveCheck({ ok: true, queued: true });
+window.onBackend.check({ ok: true, result: "valid", hours_left: 10, session_present: true });
+await Promise.resolve();
+const bannerMidRound = document.querySelector("#banners").innerHTML.indexOf("程序组件缺失") >= 0;
+resolveList({ ok: true, queued: true });
+window.onBackend.activities({ ok: true, items: [] });
+await Promise.resolve(); await Promise.resolve();
+out.push({
+  bannerMidRound,
+  bannerGone: document.querySelector("#banners").innerHTML.indexOf("程序组件缺失") < 0,
+  loginEnabled: !document.querySelector("#btn-login").disabled,
+  runtimeCleared: !S.runtime.error,
+});
+""")
+        self.assertTrue(res[0]["bannerMidRound"], "list 分支未完成时不得提前撤横幅")
+        self.assertTrue(res[0]["runtimeCleared"], "本轮两分支完成且无故障后恢复")
+        self.assertTrue(res[0]["bannerGone"], "恢复后横幅必须撤下")
+        self.assertTrue(res[0]["loginEnabled"], "恢复后登录按钮必须解禁")
+
+
+class ErrorFeedbackRoundtripTests(unittest.TestCase):
+    """FB4 四入口组件码与刷新轮次恢复的行为回归（node vm + 受控 Promise 次序，不执行）。
+
+    场景：A/B=check/list 两种到达顺序；C/D=login/start_plan 同步组件失败；
+    E=同轮不互相撤、下一轮恢复、同步拒绝不悬挂 pending；F=真实业务结果保留与
+    普通登录失败既有呈现。数 data-act 属性而非 hint 中的同名字样。
+    """
+
+    def test_check_valid_then_list_component_error_keeps_banner(self):
+        """A：check valid 先到、list 组件故障后到——横幅恰一、控件禁用、无同义结果框。"""
+        res = run_js(r"""
+setResult(null);   /* 桩里 #result 初始可见：先归零再进场景 */
+let resolveCheck, resolveList;
+window.pywebview = { api: {
+  check: () => new Promise((resolve) => { resolveCheck = resolve; }),
+  list_activities: () => new Promise((resolve) => { resolveList = resolve; }),
+}};
+refresh(false);
+await Promise.resolve();
+resolveCheck({ ok: true, queued: true });
+window.onBackend.check({ ok: true, result: "valid", hours_left: 10,
+  session_present: true, estimated_expires_at: Date.now() / 1000 + 15 * 3600 });
+await Promise.resolve();
+resolveList({ ok: true, queued: true });
+window.onBackend.activities({ ok: false, text: "程序组件缺失，请重新下载完整版本",
+  items: [], runtime_error: "worker_missing" });
+await Promise.resolve(); await Promise.resolve();
+const banners = document.querySelector("#banners").innerHTML;
+out.push({
+  bannerHint: (banners.match(/它没跟着程序一起到位/g) || []).length,
+  recheck: (banners.match(/data-act="runtime-refresh"/g) || []).length,
+  loginDisabled: document.querySelector("#btn-login").disabled,
+  startDisabled: document.querySelector("#btn-plan").disabled,
+  resultVisible: !document.querySelector("#result").hidden,
+  runtime: S.runtime.error,
+});
+""")
+        self.assertEqual(res[0]["bannerHint"], 1, "组件完整说明全页恰一次")
+        self.assertEqual(res[0]["recheck"], 1, "恢复入口恰一个")
+        self.assertTrue(res[0]["loginDisabled"], "缺组件时登录必须禁用")
+        self.assertTrue(res[0]["startDisabled"], "缺组件时开始必须禁用")
+        self.assertFalse(res[0]["resultVisible"], "不得生成同义结果框")
+        self.assertEqual(res[0]["runtime"], "worker_missing")
+
+    def test_list_component_error_then_check_valid_keeps_banner(self):
+        """B：activities 组件故障先到、check valid 后到——横幅不得被同轮另一分支撤掉。"""
+        res = run_js(r"""
+let resolveCheck, resolveList;
+window.pywebview = { api: {
+  check: () => new Promise((resolve) => { resolveCheck = resolve; }),
+  list_activities: () => new Promise((resolve) => { resolveList = resolve; }),
+}};
+refresh(false);
+await Promise.resolve();
+resolveList({ ok: true, queued: true });
+window.onBackend.activities({ ok: false, text: "程序组件缺失，请重新下载完整版本",
+  items: [], runtime_error: "worker_missing" });
+await Promise.resolve();
+const bannerAfterList = (document.querySelector("#banners").innerHTML
+  .match(/它没跟着程序一起到位/g) || []).length;
+resolveCheck({ ok: true, queued: true });
+window.onBackend.check({ ok: true, result: "valid", hours_left: 10, session_present: true });
+await Promise.resolve(); await Promise.resolve();
+const banners = document.querySelector("#banners").innerHTML;
+out.push({
+  bannerAfterList,
+  bannerAfterCheck: (banners.match(/它没跟着程序一起到位/g) || []).length,
+  recheck: (banners.match(/data-act="runtime-refresh"/g) || []).length,
+  runtime: S.runtime.error,
+});
+""")
+        self.assertEqual(res[0]["bannerAfterList"], 1)
+        self.assertEqual(res[0]["bannerAfterCheck"], 1, "同轮 check valid 后到不得撤组件横幅")
+        self.assertEqual(res[0]["recheck"], 1)
+        self.assertEqual(res[0]["runtime"], "worker_missing")
+
+    def test_login_component_failure_banner_only(self):
+        """C：login 同步组件失败只挂横幅，不再生成「登录没能开始」同义结果框。"""
+        res = run_js(r"""
+window.pywebview = { api: {
+  login: () => Promise.resolve({ ok: false,
+    text: "程序组件无法读取，请重新下载完整版本", error: "worker_permission" }),
+}};
+doLogin();
+await Promise.resolve(); await Promise.resolve();
+const banners = document.querySelector("#banners").innerHTML;
+const result = document.querySelector("#result");
+out.push({
+  bannerHint: (banners.match(/被系统拦住或没有权限/g) || []).length,
+  recheck: (banners.match(/data-act="runtime-refresh"/g) || []).length,
+  resultVisible: !result.hidden,
+  resultText: result.hidden ? "" : result.innerHTML.slice(0, 40),
+  loginDisabled: document.querySelector("#btn-login").disabled,
+  runtime: S.runtime.error,
+});
+""")
+        self.assertEqual(res[0]["bannerHint"], 1, "组件说明只在横幅")
+        self.assertEqual(res[0]["recheck"], 1)
+        self.assertFalse(res[0]["resultVisible"], "组件失败不得再弹同义结果框")
+        self.assertEqual(res[0]["runtime"], "worker_permission")
+        self.assertTrue(res[0]["loginDisabled"], "组件横幅挂出后登录禁用")
+
+    def test_start_plan_component_failure_banner_only(self):
+        """D：start_plan 同步组件失败只挂横幅；提交中标志释放、按钮恢复可点文案。"""
+        res = run_js(r"""
+const item = { id: "a1", name: "活动", sign_start: "2099-01-01 09:00:00",
+  sign_end: "2099-01-02 09:00:00", act_start: "2099-01-03 09:00:00",
+  act_end: "2099-01-03 11:00:00", signed: false, seconds_to_open: 1,
+  state: "未开放", place: "", checkin_required: null, checkout_required: null };
+S.items = [item];
+S.byId = new Map([["a1", item]]);
+S.listState = "ready";
+S.login.result = "valid";
+S.login.checking = false;
+S.selected.add("a1");
+S.demo = false;
+window.pywebview = { api: {
+  start_plan: () => Promise.resolve({ ok: false,
+    text: "程序组件启动失败，请重新下载完整版本", error: "spawn_failed" }),
+}};
+startPlan();
+await Promise.resolve(); await Promise.resolve();
+const banners = document.querySelector("#banners").innerHTML;
+out.push({
+  bannerHint: (banners.match(/组件在但没能启动/g) || []).length,
+  recheck: (banners.match(/data-act="runtime-refresh"/g) || []).length,
+  resultVisible: !document.querySelector("#result").hidden,
+  starting: S.starting,
+  planText: document.querySelector("#btn-plan").textContent,
+  runtime: S.runtime.error,
+});
+""")
+        self.assertEqual(res[0]["bannerHint"], 1)
+        self.assertEqual(res[0]["recheck"], 1)
+        self.assertFalse(res[0]["resultVisible"], "组件失败不得生成同义失败结果框")
+        self.assertFalse(res[0]["starting"], "提交中标志必须释放")
+        self.assertEqual(res[0]["planText"], "开始报名计划", "拒绝后按钮恢复")
+        self.assertEqual(res[0]["runtime"], "spawn_failed")
+
+    def test_next_round_recovery_and_no_permanent_pending(self):
+        """E：同轮不互相撤、下一轮两分支完成才恢复；同步拒绝不把 pending 卡死。"""
+        res = run_js(r"""
+let resolveCheck, resolveList;
+window.pywebview = { api: {
+  check: () => new Promise((resolve) => { resolveCheck = resolve; }),
+  list_activities: () => new Promise((resolve) => { resolveList = resolve; }),
+}};
+refresh(false);
+await Promise.resolve();
+resolveList({ ok: true, queued: true });
+window.onBackend.activities({ ok: false, text: "程序组件缺失，请重新下载完整版本",
+  items: [], runtime_error: "worker_missing" });
+await Promise.resolve();
+resolveCheck({ ok: true, queued: true });
+window.onBackend.check({ ok: false, result: "unknown", hours_left: null, session_present: true });
+await Promise.resolve(); await Promise.resolve();
+const bannerRound1 = document.querySelector("#banners").innerHTML
+  .match(/它没跟着程序一起到位/g).length;
+/* 下一轮：check valid 先完成（list 未完成）→ 不得提前撤 */
+window.pywebview = { api: {
+  check: () => Promise.resolve({ ok: true, queued: true }),
+  list_activities: () => Promise.resolve({ ok: true, queued: true }),
+}};
+refresh(false);
+await Promise.resolve();
+window.onBackend.check({ ok: true, result: "valid", hours_left: 10, session_present: true });
+await Promise.resolve();
+const bannerMidRound = document.querySelector("#banners").innerHTML
+  .match(/它没跟着程序一起到位/g).length;
+window.onBackend.activities({ ok: true, items: [] });
+await Promise.resolve(); await Promise.resolve();
+const bannerGone = document.querySelector("#banners").innerHTML
+  .indexOf("程序组件缺失") < 0;
+/* 第三轮：后端同步拒绝（无终态事件）不得把 pending 卡死 */
+window.pywebview = { api: {
+  check: () => Promise.resolve({ ok: false, queued: false, text: "程序正在关闭，已取消本次检查" }),
+  list_activities: () => Promise.resolve({ ok: false, queued: false }),
+}};
+refresh(false);
+await Promise.resolve(); await Promise.resolve();
+out.push({
+  bannerRound1, bannerMidRound, bannerGone,
+  loginEnabled: !document.querySelector("#btn-login").disabled,
+  runtimeCleared: !S.runtime.error,
+  pendingAfterRefusal: S.runtime.checkPending || S.runtime.listPending,
+});
+""")
+        self.assertEqual(res[0]["bannerRound1"], 1)
+        self.assertEqual(res[0]["bannerMidRound"], 1, "下一轮 list 未完成不得提前撤")
+        self.assertTrue(res[0]["bannerGone"], "两分支都完成且无故障后撤横幅")
+        self.assertTrue(res[0]["loginEnabled"])
+        self.assertTrue(res[0]["runtimeCleared"])
+        self.assertFalse(res[0]["pendingAfterRefusal"], "同步拒绝也必须有轮次终态")
+
+    def test_business_results_survive_component_rounds(self):
+        """F：真实报名结果在组件错误出现与恢复期间保留；普通登录失败仍按既有结果呈现。"""
+        res = run_js(r"""
+setResult({ ok: true, title: "报名成功：校园夜跑", text: "建议去活动页确认一眼。" });
+window.pywebview = { api: {
+  check: () => Promise.resolve({ ok: true, queued: true }),
+  list_activities: () => Promise.resolve({ ok: true, queued: true }),
+}};
+refresh(false);
+await Promise.resolve();
+window.onBackend.activities({ ok: false, text: "程序组件缺失，请重新下载完整版本",
+  items: [], runtime_error: "worker_missing" });
+await Promise.resolve(); await Promise.resolve();
+const result = document.querySelector("#result");
+const keptDuring = !result.hidden && result.innerHTML.indexOf("报名成功：校园夜跑") >= 0;
+window.onBackend.activities({ ok: true, items: [] });
+await Promise.resolve(); await Promise.resolve();
+const keptAfter = !result.hidden && result.innerHTML.indexOf("报名成功：校园夜跑") >= 0;
+/* 普通登录失败（非组件码）：既有「登录没能开始」结果框语义不变 */
+window.pywebview = { api: {
+  login: () => Promise.resolve({ ok: false, text: "[X] 窗口被关掉了" }),
+}};
+doLogin();
+await Promise.resolve(); await Promise.resolve();
+const loginResult = document.querySelector("#result");
+out.push({
+  keptDuring, keptAfter,
+  bannerUp: document.querySelector("#banners").innerHTML
+    .indexOf("它没跟着程序一起到位") >= 0,
+  normalLoginResultShown: !loginResult.hidden &&
+    loginResult.innerHTML.indexOf("登录没能开始") >= 0,
+});
+""")
+        self.assertTrue(res[0]["keptDuring"], "组件错误出现不得抹掉真实报名结果")
+        self.assertTrue(res[0]["keptAfter"], "组件恢复也不得抹掉真实报名结果")
+        self.assertTrue(res[0]["bannerUp"], "组件横幅与业务结果并存")
+        self.assertTrue(res[0]["normalLoginResultShown"], "普通登录失败保持既有结果框语义")
+
+
+class _ActionInterleaveMixin:
+    """FB4-R1 交错场景的共享装置：受控 check/list/动作 Promise，全走生产动作路径。"""
+
+    _CHECK_OK_EVENT = r"""
+resolveCheck({ ok: true, queued: true });
+window.onBackend.check({ ok: true, result: "valid", hours_left: 10, session_present: true });
+await Promise.resolve();
+"""
+    _LIST_OK_EVENT = r"""
+resolveList({ ok: true, queued: true });
+window.onBackend.activities({ ok: true, items: [] });
+await Promise.resolve();
+"""
+
+    @staticmethod
+    def _interleave_snippet(action_key, prepare, body):
+        template = r"""
+__PREPARE__
+setResult(null);   /* 结果桩初始可见：场景起点归零（生产动作自身也会清） */
+let resolveCheck, resolveList, resolveAction;
+window.pywebview = { api: {
+  check: () => new Promise((resolve) => { resolveCheck = resolve; }),
+  list_activities: () => new Promise((resolve) => { resolveList = resolve; }),
+  __ACTION__: () => new Promise((resolve) => { resolveAction = resolve; }),
+}};
+__BODY__
+const kept = {
+  error: S.runtime.error,
+  roundError: S.runtime.roundError,
+  bannerHint: (document.querySelector("#banners").innerHTML
+    .match(/它没跟着程序一起到位|被系统拦住或没有权限|组件在但没能启动/g) || []).length,
+  recheck: (document.querySelector("#banners").innerHTML
+    .match(/data-act="runtime-refresh"/g) || []).length,
+  resultVisible: !document.querySelector("#result").hidden,
+  loginDisabled: document.querySelector("#btn-login").disabled,
+  startDisabled: document.querySelector("#btn-plan").disabled,
+  planText: document.querySelector("#btn-plan").textContent,
+  starting: S.starting,
+};
+/* 下一轮完整复查：只有一分支完成时旧横幅还在；两分支无组件故障后恢复 */
+window.pywebview = { api: {
+  check: () => Promise.resolve({ ok: true, queued: true }),
+  list_activities: () => Promise.resolve({ ok: true, queued: true }),
+}};
+refresh(false);
+await Promise.resolve();
+window.onBackend.check({ ok: true, result: "valid", hours_left: 10, session_present: true });
+await Promise.resolve(); await Promise.resolve();
+const midRound = (document.querySelector("#banners").innerHTML
+  .match(/data-act="runtime-refresh"/g) || []).length;
+window.onBackend.activities({ ok: true, items: [] });
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+out.push({ kept, midRound,
+  bannerGone: (document.querySelector("#banners").innerHTML
+    .match(/data-act="runtime-refresh"/g) || []).length === 0,
+  runtimeCleared: !S.runtime.error,
+  roundCleared: !S.runtime.roundError,
+  loginEnabled: !document.querySelector("#btn-login").disabled,
+});
+"""
+        return (template.replace("__PREPARE__", prepare)
+                .replace("__ACTION__", action_key)
+                .replace("__BODY__", body))
+
+    @staticmethod
+    def _phase_orders():
+        """动作失败前无分支成功 / check 先成功 / list 先成功 三种交错。"""
+        return {
+            "before-none": ("", _ActionInterleaveMixin._CHECK_OK_EVENT
+                            + _ActionInterleaveMixin._LIST_OK_EVENT),
+            "check-first": (_ActionInterleaveMixin._CHECK_OK_EVENT,
+                            _ActionInterleaveMixin._LIST_OK_EVENT),
+            "list-first": (_ActionInterleaveMixin._LIST_OK_EVENT,
+                           _ActionInterleaveMixin._CHECK_OK_EVENT),
+        }
+
+
+class ActionInterleaveBehaviorTests(_ActionInterleaveMixin, unittest.TestCase):
+    """FB4-R1：刷新未收尾时的登录/开始组件失败必须进入本轮累计（迟到成功不得撤）。
+
+    每组经生产 doLogin()/startPlan() 进入（受控 Promise），覆盖三种交错顺序与
+    下一轮恢复；零学校/浏览器/进程。本任务仅定义，不运行。
+    """
+
+    _START_PREPARE = r"""
+const item = { id: "a1", name: "活动", sign_start: "2099-01-01 09:00:00",
+  sign_end: "2099-01-02 09:00:00", act_start: "2099-01-03 09:00:00",
+  act_end: "2099-01-03 11:00:00", signed: false, seconds_to_open: 1,
+  state: "未开放", place: "", checkin_required: null, checkout_required: null };
+S.items = [item];
+S.byId = new Map([["a1", item]]);
+S.listState = "ready";
+S.login.result = "valid";
+S.login.checking = false;
+S.selected.add("a1");
+S.demo = false;
+"""
+
+    @staticmethod
+    def _assert_kept_and_recovered(case, expected_code, expect_starting_released=False):
+        kept = case["kept"]
+        assert kept["error"] == expected_code, kept
+        assert kept["roundError"] == expected_code, kept
+        assert kept["bannerHint"] == 1, kept
+        assert kept["recheck"] == 1, kept
+        assert kept["resultVisible"] is False, kept
+        assert kept["loginDisabled"] is True, kept
+        assert kept["startDisabled"] is True, kept
+        if expect_starting_released:
+            assert kept["starting"] is False, kept
+            assert kept["planText"] == "开始报名计划", kept
+        assert case["midRound"] == 1, case
+        assert case["bannerGone"] is True, case
+        assert case["runtimeCleared"] is True, case
+        assert case["roundCleared"] is True, case
+        assert case["loginEnabled"] is True, case
+
+    def test_login_component_failure_survives_late_refresh_success(self):
+        """登录组：刷新未收尾时登录组件失败——迟到成功不得撤新横幅。"""
+        payload = ('{ ok: false, error: "worker_permission", '
+                   'text: "程序组件无法读取，请重新下载完整版本" }')
+        for name, (before, after) in self._phase_orders().items():
+            with self.subTest(order=name):
+                body = ("refresh(false);\nawait Promise.resolve();\n" + before
+                        + "\ndoLogin();\nawait Promise.resolve(); await Promise.resolve();\n"
+                        + "resolveAction(" + payload + ");\n"
+                        + "await Promise.resolve(); await Promise.resolve();"
+                        + " await Promise.resolve();\n" + after)
+                res = run_js(self._interleave_snippet("login", "", body))
+                self.assertEqual(res[0]["kept"]["error"], "worker_permission")
+                self._assert_kept_and_recovered(res[0], "worker_permission")
+
+    def test_start_plan_component_failure_survives_late_refresh_success(self):
+        """开始组：先点开始、刷新未收尾时动作失败——迟到成功不得撤新横幅。"""
+        payload = ('{ ok: false, error: "worker_missing", '
+                   'text: "程序组件缺失，请重新下载完整版本" }')
+        for name, (before, after) in self._phase_orders().items():
+            with self.subTest(order=name):
+                body = ("startPlan();\nawait Promise.resolve();\n"
+                        + "refresh(false);\nawait Promise.resolve();\n" + before
+                        + "\nresolveAction(" + payload + ");\n"
+                        + "await Promise.resolve(); await Promise.resolve();"
+                        + " await Promise.resolve();\n" + after)
+                res = run_js(self._interleave_snippet("start_plan",
+                                                      self._START_PREPARE, body))
+                self.assertEqual(res[0]["kept"]["error"], "worker_missing")
+                self._assert_kept_and_recovered(res[0], "worker_missing",
+                                                expect_starting_released=True)
+
+
+class ErrorFeedbackRoundtripContractTests(unittest.TestCase):
+    """FB4 接线的静态契约：四入口消费、轮次协议、提交中标志。"""
+
+    def test_apply_activities_consumes_runtime_error(self):
+        js = read("ui/app.js")
+        body = js[js.index("function applyActivities("):js.index("function render(")]
+        self.assertIn("noteRoundError(res.runtime_error)", body,
+                      "列表失败必须先消费后端组件归类再渲染")
+        self.assertIn('settleRefreshBranch("list")', body,
+                      "activities 事件必须收口本轮 list 分支")
+
+    def test_check_event_uses_round_protocol(self):
+        js = read("ui/app.js")
+        handler = js[js.index("window.onBackend"):]
+        self.assertNotIn("S.runtime.error = data.runtime_error || null", handler,
+                         "check 事件不得无条件覆盖组件结论（会抹掉同轮另一分支故障）")
+        self.assertIn("S.runtime.roundError", handler, "check 终态必须进轮次故障累计")
+
+    def test_login_and_start_plan_consume_component_codes(self):
+        js = read("ui/app.js")
+        login_body = js[js.index("function doLogin()"):
+                        js.index("/* ---------------------------------------------------------------- 事件 */")]
+        self.assertIn("RUNTIME_ERRORS[res.error]", login_body,
+                      "登录同步失败必须只认可知组件码并走横幅")
+        start_body = js[js.index("function startPlan()"):
+                        js.index("function cancelTask(")]
+        self.assertIn("RUNTIME_ERRORS[res.error]", start_body,
+                      "开始计划的同步失败必须只认可知组件码并走横幅")
+        self.assertIn("S.starting = true", start_body, "提交中标志必须置位")
+
+    def test_action_failures_enter_round_accumulator(self):
+        """FB4-R1：两个动作分支必须复用 noteRoundError（写 error+roundError），
+        不得只写 S.runtime.error——否则刷新未收尾时迟到成功会撤掉新横幅。"""
+        js = read("ui/app.js")
+        login_body = js[js.index("function doLogin()"):
+                        js.index("/* ---------------------------------------------------------------- 事件 */")]
+        start_body = js[js.index("function startPlan()"):
+                        js.index("function cancelTask(")]
+        for label, body in (("doLogin", login_body), ("startPlan", start_body)):
+            self.assertIn("noteRoundError(res.error)", body,
+                          "%s 的组件失败必须进入本轮故障累计" % label)
+            self.assertNotIn("S.runtime.error = res.error", body,
+                             "%s 不得绕过累计函数只写显示态" % label)
+        note = js[js.index("function noteRoundError("):
+                  js.index("function settleRefreshBranch(")]
+        self.assertIn("S.runtime.roundError = code", note)
+        self.assertIn("S.runtime.error = code", note)
+        gate = js[js.index("function updateControls("):
+                  js.index("/* ---------------------------------------------------------------- 横幅 */")]
+        self.assertIn("S.starting", gate, "提交中标志必须进入开始按钮门禁")
+
+
+class RuntimeDisplayBehaviorTests(unittest.TestCase):
+    """UX-04/05：当前目标只跟真实任务走，单场结果不抢写整屏（node vm 行为）。
+
+    全部经生产函数 render()/handleTask()/handlePlanDone() 进入；
+    零学校、零 worker、零浏览器。本任务只定义，不运行。
+    """
+
+    def test_canceled_task_leaves_batch_count(self):
+        """A 取消、C 仍等待：批次由 2 变 1，已取消的场次不再当目标。"""
+        res = run_js(r"""
+const start = "2099-01-01 09:00:00";
+S.busy = true;
+S.plan = { id: "p1", status: "running", tasks: new Map() };
+S.plan.tasks.set("A", { task_id: "A", activity_id: "A", name: "活动A",
+  status: "canceled", sign_start: start, signup_mode: "pre_register" });
+S.plan.tasks.set("C", { task_id: "C", activity_id: "C", name: "活动C",
+  status: "waiting", sign_start: start, signup_mode: "pre_register" });
+/* 原勾选集合没被清理：修复前倒计时读的就是它，会继续说「同时提交 2 场」 */
+S.selected = new Set(["A", "C"]);
+render();
+const view = executionView();
+out.push({ phase: view.phase, taskId: view.task.task_id, count: view.count,
+  countdown: document.querySelector("#countdown").textContent,
+  title: document.querySelector("#selected").textContent });
+""")
+        case = res[0]
+        self.assertEqual(case["phase"], "waiting")
+        self.assertEqual(case["taskId"], "C", "当前目标必须是还没结束的 C")
+        self.assertEqual(case["count"], 1, "取消 A 后同批只剩 1 场")
+        self.assertIn("本批 1 场待执行", case["countdown"])
+        self.assertNotIn("2 场", case["countdown"], "已取消的场次不得继续计入批次")
+        self.assertEqual(case["title"], "活动C", "标题必须跟着当前执行目标")
+
+    def test_success_leaves_target_on_future_activity(self):
+        """立即场成功后目标回到仍等待的未来场；LED 标注用真实开放时刻，不重拼。"""
+        res = run_js(r"""
+const start = "2099-01-01 09:00:00";
+S.busy = true;
+S.plan = { id: "p1", status: "running", tasks: new Map() };
+S.plan.tasks.set("B", { task_id: "B", activity_id: "B", name: "活动B",
+  status: "success", sign_start: "2020-01-01 09:00:00", signup_mode: "instant_signup" });
+S.plan.tasks.set("A", { task_id: "A", activity_id: "A", name: "活动A",
+  status: "waiting", sign_start: start, signup_mode: "pre_register" });
+render();
+out.push({ taskId: executionView().task.task_id,
+  countdown: document.querySelector("#countdown").textContent,
+  label: document.querySelector("#led-label b").textContent,
+  expected: fmtClock(toTs(start)) });
+""")
+        case = res[0]
+        self.assertEqual(case["taskId"], "A", "立即场成功后目标必须落到未来场")
+        self.assertIn("本批 1 场待执行", case["countdown"])
+        self.assertNotIn("00:00:00", case["countdown"], "未来场不得显示成全开放")
+        self.assertEqual(case["label"], case["expected"],
+                         "LED 标注必须直接格式化开放时刻（now+left 会差 1 秒）")
+
+    def test_preview_open_label_uses_absolute_time(self):
+        """未选择与选择预览也必须直接显示开放时刻，不能从取整倒计时反推。"""
+        res = run_js(r"""
+const realNow = Date.now;
+const start = "2099-01-01 09:00:00";
+Date.now = () => (toTs(start) - 60) * 1000 + 250;
+const item = { id: "preview", name: "预览场", sign_start: start,
+  sign_end: "2099-01-01 10:00:00", act_start: "2099-01-02 10:00:00",
+  act_end: "2099-01-02 11:00:00", signed: false };
+S.busy = false; S.items = [item]; S.byId = new Map([[item.id, item]]);
+S.selected = new Set(); S.plan = { id: null, status: "idle", tasks: new Map() };
+paintLed();
+const idle = document.querySelector("#led-label b").textContent;
+S.selected.add(item.id);
+paintLed();
+const selected = document.querySelector("#led-label b").textContent;
+Date.now = realNow;
+out.push({ idle, selected, expected: fmtClock(toTs(start)) });
+""")
+        self.assertEqual(res[0]["idle"], res[0]["expected"])
+        self.assertEqual(res[0]["selected"], res[0]["expected"])
+
+    def test_submitting_wins_over_waiting(self):
+        """真实提交优先于未来预热；批次数只数真正提交过且仍活跃的任务。
+
+        样本必须是生产可能出现的形状：已开放（sign_start 在过去）+ 真实
+        run_started_at + attempts>0。未来 2099 + attempts 缺失的样本只能
+        证明「raw submitting 也算提交」，正是本轮要修掉的错口径。
+        """
+        res = run_js(r"""
+const open = "2026-10-25 19:00:00";
+const openTs = toTs(open);
+S.busy = true;
+S.plan = { id: "p1", status: "running", tasks: new Map() };
+/* 未来预热场：raw submitting，但还没开放、一次都没提交 */
+S.plan.tasks.set("W", { task_id: "W", activity_id: "W", name: "预热场",
+  status: "submitting", sign_start: "2099-01-01 09:00:00", page_opened_at: openTs,
+  signup_mode: "pre_register" });
+/* 两场已开放、各提交过一次（并列：应保持快照顺序取 S1） */
+S.plan.tasks.set("S1", { task_id: "S1", activity_id: "S1", name: "提交场1",
+  status: "submitting", attempts: 1, sign_start: open, run_started_at: openTs,
+  retry_for_s: 600, signup_mode: "instant_signup" });
+S.plan.tasks.set("S2", { task_id: "S2", activity_id: "S2", name: "提交场2",
+  status: "submitting", attempts: 2, sign_start: open, run_started_at: openTs,
+  retry_for_s: 600, signup_mode: "instant_signup" });
+S.plan.tasks.set("D", { task_id: "D", activity_id: "D", name: "已完成",
+  status: "success", attempts: 1, sign_start: open, signup_mode: "instant_signup" });
+render();
+const view = executionView();
+out.push({ phase: view.phase, taskId: view.task.task_id, count: view.count,
+  countdown: document.querySelector("#countdown").textContent,
+  label: document.querySelector("#led-label b").textContent,
+  expected: fmtClock(view.retryUntil),
+  warmups: Array.from(S.plan.tasks.values())
+    .map((task) => task.task_id + ":" + taskDisplayPhase(task)).join(",") });
+""")
+        case = res[0]
+        self.assertEqual(case["phase"], "submitting")
+        self.assertEqual(case["taskId"], "S1", "并列时保持快照顺序")
+        self.assertEqual(case["count"], 2, "只数真正提交过且仍活跃的两场，不含未来预热")
+        self.assertIn("正在提交 2 场", case["countdown"])
+        self.assertEqual(case["label"], case["expected"], "LED 标注必须是当前场的重试截止")
+        self.assertIn("W:preopen", case["warmups"], "未来预热不是提交阶段")
+        self.assertIn("S1:retrying", case["warmups"])
+
+    def test_all_terminal_waits_for_plan_done(self):
+        """全终态但 plan_done 未到：汇总中；没有任务：准备中，都不提前报成功。"""
+        res = run_js(r"""
+setResult(null);        /* 结果桩归零：桩默认 hidden=false，真实首屏是隐藏的 */
+S.busy = true;
+S.plan = { id: "p1", status: "running", tasks: new Map() };
+S.plan.tasks.set("A", { task_id: "A", activity_id: "A", name: "活动A",
+  status: "success", sign_start: "2099-01-01 09:00:00", signup_mode: "instant_signup" });
+render();
+const settling = { phase: executionView().phase,
+  countdown: document.querySelector("#countdown").textContent,
+  tag: document.querySelector("#board-tag-text").textContent,
+  text: document.querySelector("#board-text").textContent,
+  resultHidden: document.querySelector("#result").hidden,
+  board: document.querySelector("#board").dataset.planState };
+S.plan.tasks = new Map();
+render();
+const preparing = { phase: executionView().phase,
+  countdown: document.querySelector("#countdown").textContent,
+  tag: document.querySelector("#board-tag-text").textContent };
+out.push({ settling, preparing });
+""")
+        case = res[0]
+        self.assertEqual(case["settling"]["phase"], "settling")
+        self.assertEqual(case["settling"]["countdown"], "正在汇总结果")
+        self.assertEqual(case["settling"]["tag"], "汇总中")
+        self.assertTrue(case["settling"]["resultHidden"],
+                        "计划级结论没到，结果框不得先写成功")
+        self.assertEqual(case["settling"]["board"], "running", "汇总中仍是运行色")
+        self.assertEqual(case["preparing"]["phase"], "preparing")
+        self.assertEqual(case["preparing"]["countdown"], "正在准备")
+        self.assertEqual(case["preparing"]["tag"], "准备中")
+
+    def test_snapshot_restore_without_selection_or_list_item(self):
+        """快照重载且选择为空、列表项不在：仍从任务快照得到同一目标，不回退到别的场。"""
+        res = run_js(r"""
+S.selected = new Set();
+S.items = [];
+S.byId = new Map();
+S.busy = true;
+S.plan = { id: "p1", status: "running", tasks: new Map() };
+S.plan.tasks.set("A", { task_id: "A", activity_id: "A", name: "活动A",
+  status: "waiting", sign_start: "2099-01-01 09:00:00", signup_mode: "pre_register" });
+render();
+const restored = { taskId: executionView().task.task_id,
+  itemName: executionView().item.name,
+  title: document.querySelector("#selected").textContent,
+  route: !!routeTarget(),
+  countdown: document.querySelector("#countdown").textContent };
+/* 连 sign_start 都没有：显示「待公布」，不拿另一场或当前时间凑 */
+S.plan.tasks.set("A", { task_id: "A", activity_id: "A", name: "活动A", status: "waiting" });
+render();
+const unknown = { openAt: executionView().openAt,
+  countdown: document.querySelector("#countdown").textContent,
+  label: document.querySelector("#led-label b").textContent,
+  title: document.querySelector("#selected").textContent };
+out.push({ restored, unknown });
+""")
+        case = res[0]
+        self.assertEqual(case["restored"]["taskId"], "A")
+        self.assertEqual(case["restored"]["itemName"], "活动A", "列表项缺失时用任务字段现构")
+        self.assertEqual(case["restored"]["title"], "活动A")
+        self.assertTrue(case["restored"]["route"], "路线目标必须仍能从任务快照得到")
+        self.assertIn("本批 1 场待执行", case["restored"]["countdown"])
+        self.assertIsNone(case["unknown"]["openAt"])
+        self.assertIn("时间待公布", case["unknown"]["countdown"])
+        self.assertEqual(case["unknown"]["label"], "待公布")
+        self.assertEqual(case["unknown"]["title"], "活动A", "缺字段也不得换成另一场")
+
+    def test_single_failure_does_not_paint_plan(self):
+        """单场失败只更新任务反馈；整屏色彩等计划级终态，且各终态各有其色。"""
+        res = run_js(r"""
+setResult(null);        /* 结果桩归零：桩默认 hidden=false，真实首屏是隐藏的 */
+S.busy = true;
+S.plan = { id: "p1", status: "running", tasks: new Map() };
+handleTask({ plan_id: "p1", task_id: "A", activity_id: "A", name: "活动A",
+  status: "failed", reason: "名额已满", stop_reason: "max_attempts",
+  sign_start: "2099-01-01 09:00:00", sign_end: "2099-01-02 09:00:00" });
+const running = { board: document.querySelector("#board").dataset.planState,
+  resultHidden: document.querySelector("#result").hidden,
+  tasksHtml: document.querySelector("#plan-tasks").innerHTML };
+handlePlanDone({ plan_id: "p1", status: "failed",
+  summary: { counts: { failed: 1 } } });
+const failed = { board: document.querySelector("#board").dataset.planState,
+  resultVisible: !document.querySelector("#result").hidden,
+  resultHtml: document.querySelector("#result").innerHTML };
+const colors = {};
+[["partial"], ["completed"], ["stopped"]].forEach((pair) => {
+  S.plan.status = pair[0];
+  S.plan.doneSelection = selectionSignature();
+  render();
+  colors[pair[0]] = document.querySelector("#board").dataset.planState;
+});
+S.selected.add("zzz");
+render();
+colors.afterChange = document.querySelector("#board").dataset.planState;
+out.push({ running, failed, colors });
+""")
+        case = res[0]
+        self.assertEqual(case["running"]["board"], "running",
+                         "单场失败不得把整屏染成计划失败")
+        self.assertTrue(case["running"]["resultHidden"],
+                        "运行中的单场失败不得抢写结果框")
+        self.assertIn("task-state is-bad", case["running"]["tasksHtml"],
+                      "任务卡要照实显示这一场失败")
+        self.assertIn("失败", case["running"]["tasksHtml"])
+        self.assertIn("达到最大提交次数", case["running"]["tasksHtml"],
+                      "任务卡要写出到达的停止条件")
+        self.assertEqual(case["failed"]["board"], "failed")
+        self.assertIn("报名计划没有成功", case["failed"]["resultHtml"])
+        self.assertEqual(case["colors"]["partial"], "partial")
+        self.assertEqual(case["colors"]["completed"], "completed")
+        self.assertEqual(case["colors"]["stopped"], "stopped")
+        self.assertEqual(case["colors"]["afterChange"], "idle",
+                         "选择集合变了就回到常态，不继续挂着上一轮终态")
+
+
+class RetryDeadlineBoundaryTests(unittest.TestCase):
+    """BC-01：界面回退截止的锚点不能随墙钟跨过开放时刻而切换。
+
+    样本按生产形状写：预报名提前 100 秒开页（run_started_at = 开放 - 100），
+    运行期间还没有 retry_deadline 遥测。worker 的 retry_anchor 在开页前就钉死，
+    界面若在开放那一秒改用启动点，会让截止倒退 100 秒。
+    """
+
+    def test_anchor_is_stable_across_open(self):
+        """open-1 秒 / 开放瞬间 / open+1 秒：推导出的截止必须是同一时刻。"""
+        res = run_js(r"""
+const openTs = toTs("2026-10-25 20:00:00");
+const task = { task_id: "A", status: "submitting", attempts: 1,
+  sign_start: "2026-10-25 20:00:00", sign_end: "", retry_for_s: 120,
+  run_started_at: openTs - 100 };
+out.push({ before: effectiveRetryDeadline(task, openTs - 1),
+  atOpen: effectiveRetryDeadline(task, openTs),
+  after: effectiveRetryDeadline(task, openTs + 1),
+  expected: openTs + 120 });
+""")
+        case = res[0]
+        self.assertEqual(case["before"], case["expected"],
+                         "开放前按 max(开放, 启动) 推导")
+        self.assertEqual(case["atOpen"], case["expected"], "开放瞬间不得换锚")
+        self.assertEqual(case["after"], case["expected"], "开放后不得倒退回启动点 + 时长")
+
+    def test_truncation_fallback_and_telemetry(self):
+        """sign_end 截断、迟到启动、时长 0 回退、遥测优先、未知返回 null。"""
+        res = run_js(r"""
+const openTs = toTs("2026-10-25 20:00:00");
+const base = { task_id: "A", status: "submitting", attempts: 1,
+  sign_start: "2026-10-25 20:00:00", retry_for_s: 120, run_started_at: openTs - 100 };
+const truncated = effectiveRetryDeadline(
+  Object.assign({}, base, { sign_end: "2026-10-25 20:01:00" }), openTs);
+/* 迟到启动：开放后才拉起 worker（已开放场次按启动时刻起算） */
+const late = effectiveRetryDeadline(
+  Object.assign({}, base, { run_started_at: openTs + 30 }), openTs + 40);
+/* 时长 0 且没有 sign_end：回退默认 120 秒 */
+const zeroNoEnd = effectiveRetryDeadline(
+  Object.assign({}, base, { retry_for_s: 0, sign_end: "" }), openTs);
+/* 时长 0 且有 sign_end：直接截到报名截止 */
+const zeroWithEnd = effectiveRetryDeadline(
+  Object.assign({}, base, { retry_for_s: 0, sign_end: "2026-10-25 20:30:00" }), openTs);
+/* 遥测优先：即便本机推导不同，也以 worker 的结构化截止为准 */
+const telemetry = effectiveRetryDeadline(
+  Object.assign({}, base, { retry_deadline: openTs + 300 }), openTs);
+/* 已开放、又没有任何启动参考点：未知（不得拿 now 冒充 0 秒） */
+const unknown = effectiveRetryDeadline(
+  { task_id: "B", status: "submitting", sign_start: "2026-10-25 20:00:00",
+    sign_end: "", retry_for_s: 120 }, openTs + 5);
+/* 未来场且还没启动：原定开放作计划参考 */
+const planned = effectiveRetryDeadline(
+  { task_id: "C", status: "waiting", sign_start: "2026-10-25 21:00:00",
+    sign_end: "", retry_for_s: 120 }, openTs);
+out.push({ truncated, late, zeroNoEnd, zeroWithEnd, telemetry, unknown, planned,
+  openTs });
+""")
+        case = res[0]
+        self.assertEqual(case["truncated"], case["openTs"] + 60, "sign_end 必须硬截断")
+        self.assertEqual(case["late"], case["openTs"] + 30 + 120,
+                         "迟到启动从启动点起算，不再借用原定开放")
+        self.assertEqual(case["zeroNoEnd"], case["openTs"] + 120,
+                         "时长 0 且无截止时回退 120 秒")
+        self.assertEqual(case["zeroWithEnd"], case["openTs"] + 1800,
+                         "时长 0 且有截止时直接到截止")
+        self.assertEqual(case["telemetry"], case["openTs"] + 300, "遥测必须优先")
+        self.assertIsNone(case["unknown"], "没有时间参考时必须是未知，不是当前时刻")
+        self.assertEqual(case["planned"], case["openTs"] + 3600 + 120,
+                         "未来场未启动时用原定开放作计划参考")
+
+
+    def test_absolute_deadline_needs_no_anchor(self):
+        """ED-01：「直到报名截止」+ 已知 sign_end 时，截止与起点无关。
+
+        排队中或快照字段还没齐时，正会出现「有绝对截止、没有启动/开放参考点」；
+        这时不能判未知。有限时长仍需要起点，缺 sign_end 的 0 时长仍回退 120 秒。
+        """
+        res = run_js(r"""
+const now = toTs("2026-10-25 21:00:00");
+out.push({
+  /* 已开放、没有 run_started_at / submitSeen / 遥测 */
+  openPast: effectiveRetryDeadline({ status: "queued",
+    sign_start: "2026-10-25 20:00:00", sign_end: "2026-10-25 22:00:00",
+    retry_for_s: 0 }, now),
+  /* 连开放时间都还没有，但有绝对截止 */
+  noOpen: effectiveRetryDeadline({ status: "queued",
+    sign_start: "", sign_end: "2026-10-25 22:00:00", retry_for_s: 0 }, now),
+  /* 0 时长且没有 sign_end、也没有起点：确实未知 */
+  noEnd: effectiveRetryDeadline({ status: "queued",
+    sign_start: "2026-10-25 20:00:00", sign_end: "", retry_for_s: 0 }, now),
+  /* 有限时长 + 无起点：仍未知（不能拿 now 起算） */
+  finiteNoStart: effectiveRetryDeadline({ status: "queued",
+    sign_start: "2026-10-25 20:00:00", sign_end: "2026-10-25 22:00:00",
+    retry_for_s: 120 }, now),
+  /* 0 时长 + 绝对截止 + 遥测：遥测优先 */
+  telemetry: effectiveRetryDeadline({ status: "queued",
+    sign_start: "", sign_end: "2026-10-25 22:00:00", retry_for_s: 0,
+    retry_deadline: toTs("2026-10-25 21:30:00") }, now),
+  deadline: toTs("2026-10-25 22:00:00"),
+  telemetry_expected: toTs("2026-10-25 21:30:00"),
+});
+""")
+        case = res[0]
+        self.assertEqual(case["openPast"], case["deadline"],
+                         "已开放无起点时，0 时长应直接取 sign_end")
+        self.assertEqual(case["noOpen"], case["deadline"],
+                         "连开放时间都没有，也不影响绝对截止")
+        self.assertIsNone(case["noEnd"], "没有 sign_end 又无起点，只能未知")
+        self.assertIsNone(case["finiteNoStart"], "有限时长缺起点仍未知，不拿 now 起算")
+        self.assertEqual(case["telemetry"], case["telemetry_expected"],
+                         "有遥测时以 worker 的结构化截止为准")
+        self.assertLess(case["telemetry"], case["deadline"], "遥测优先于 sign_end")
+
+
+class DisplayPhaseBoundaryTests(unittest.TestCase):
+    """BC-02：raw submitting 只表示 worker 已接管，预热不等于已提交。"""
+
+    def test_activity_row_tracks_phase_and_open_time(self):
+        """活动行与任务卡共用阶段，缓存的未开放文本不能阻止跨开放时刻换组。"""
+        res = run_js(r"""
+const realNow = Date.now;
+const open = toTs("2099-01-01 09:00:00");
+const item = { id: "A", sign_start: "2099-01-01 09:00:00",
+  sign_end: "2099-01-01 10:00:00", state: "未开放" };
+const task = { ...item, task_id: "A", status: "submitting", attempts: 0 };
+Date.now = () => (open - 10) * 1000;
+const waiting = stateCellHtml(item, stateOf(item), "10 秒", task);
+Date.now = () => (open + 1) * 1000;
+const preparing = stateCellHtml(item, stateOf(item), "已开放", task);
+const rowState = stateOf(item);
+task.attempts = 1;
+const retrying = stateCellHtml(item, rowState, "已开放", task);
+Date.now = realNow;
+out.push({ waiting, preparing, retrying, rowState });
+""")
+        self.assertIn("等待开放", res[0]["waiting"])
+        self.assertIn("准备报名", res[0]["preparing"])
+        self.assertIn("提交中", res[0]["retrying"])
+        self.assertEqual(res[0]["rowState"], "open")
+
+    def test_future_prewarm_is_not_reported_as_submitting(self):
+        """未来场 raw submitting（提前开页）：标题/LED/任务卡都必须是等待开放。
+
+        再把时钟推过开放一秒并跑 tick：必须变成「准备报名」且不被旧文案盖回。
+        """
+        res = run_js(r"""
+const openStr = "2099-01-01 09:00:00";
+const openTs = toTs(openStr);
+S.busy = true;
+S.plan = { id: "p1", status: "running", tasks: new Map() };
+S.plan.tasks.set("A", { task_id: "A", activity_id: "A", name: "未来场",
+  status: "submitting", sign_start: openStr, page_opened_at: openTs - 100,
+  signup_mode: "pre_register" });
+render();
+const before = { phase: executionView().phase, display: executionView().display,
+  countdown: document.querySelector("#countdown").textContent,
+  tag: document.querySelector("#board-tag-text").textContent,
+  led: document.querySelector("#led-label b").textContent,
+  html: document.querySelector("#plan-tasks").innerHTML };
+const realNow = Date.now;
+Date.now = () => (openTs + 1) * 1000;
+tick();
+const after = { phase: executionView().phase,
+  countdown: document.querySelector("#countdown").textContent,
+  tag: document.querySelector("#board-tag-text").textContent,
+  detail: document.querySelector('.task-row[data-task-id="A"] .task-detail').textContent,
+  label: document.querySelector('.task-row[data-task-id="A"] .task-state').textContent };
+Date.now = realNow;
+out.push({ before, after, openClock: fmtClock(openTs) });
+""")
+        case = res[0]
+        self.assertEqual(case["before"]["phase"], "waiting", "未来预热不是提交阶段")
+        self.assertEqual(case["before"]["display"], "preopen")
+        self.assertIn("本批 1 场待执行", case["before"]["countdown"])
+        self.assertEqual(case["before"]["tag"], "等开放")
+        self.assertEqual(case["before"]["led"], case["openClock"],
+                         "LED 必须走到原定开放，不是重试窗口")
+        self.assertIn("提前准备", case["before"]["html"])
+        self.assertNotIn("正在提交", case["before"]["html"],
+                         "任务卡不得把预热说成已提交")
+        self.assertIn("等待开放", case["before"]["html"])
+        self.assertEqual(case["after"]["phase"], "arming", "开放后进入准备报名")
+        self.assertIn("已开放", case["after"]["countdown"])
+        self.assertEqual(case["after"]["tag"], "准备报名")
+        self.assertNotIn("等开放", case["after"]["tag"], "已开放就不能还说等开放")
+        self.assertIn("已开放，正在准备提交", case["after"]["detail"])
+        self.assertEqual(case["after"]["label"], "准备报名",
+                         "标签也要跟着 tick 更新，不能退回原始 submitting 文案")
+
+    def test_missing_attempts_is_not_a_submission(self):
+        """attempts 缺失或非法一律不算已提交（NaN/负数/字符串都不算）。"""
+        res = run_js(r"""
+const openTs = toTs("2026-10-25 19:00:00");
+const phases = [
+  taskDisplayPhase({ status: "submitting", sign_start: "2026-10-25 19:00:00" }, openTs + 1),
+  taskDisplayPhase({ status: "submitting", attempts: 0, sign_start: "2026-10-25 19:00:00" }, openTs + 1),
+  taskDisplayPhase({ status: "submitting", attempts: "abc", sign_start: "2026-10-25 19:00:00" }, openTs + 1),
+  taskDisplayPhase({ status: "submitting", attempts: -2, sign_start: "2026-10-25 19:00:00" }, openTs + 1),
+  taskDisplayPhase({ status: "submitting", attempts: 1, sign_start: "2026-10-25 19:00:00" }, openTs + 1),
+  taskDisplayPhase({ status: "queued", sign_start: "2026-10-25 19:00:00" }, openTs + 1),
+  taskDisplayPhase({ status: "success", attempts: 3, sign_start: "2026-10-25 19:00:00" }, openTs + 1),
+];
+out.push({ phases });
+""")
+        phases = res[0]["phases"]
+        self.assertEqual(phases[:4], ["preparing"] * 4, "没有真实提交就不能进 retrying")
+        self.assertEqual(phases[4], "retrying")
+        self.assertEqual(phases[5], "preparing", "已开放的排队任务是准备报名，不是等开放")
+        self.assertEqual(phases[6], "terminal")
+
+
+class EmptyPreferenceBehaviorTests(unittest.TestCase):
+    """UX-01/03 + 清筛选：空态按真实原因给下一步，清筛选不重置用户策略。"""
+
+    def test_known_zero_has_no_login_nudge(self):
+        """登录有效 + 成功返回 0 场：指标写 0，空态不再诱导登录，大屏不重复原因。"""
+        res = run_js(r"""
+S.items = [];
+S.byId = new Map();
+S.listState = "ready";
+S.login.present = true; S.login.result = "valid"; S.login.ok = true; S.login.checking = false;
+S.selected = new Set();
+render();
+out.push({ title: document.querySelector("#empty-title").textContent,
+  text: document.querySelector("#empty-text").textContent,
+  total: document.querySelector("#metric-total").textContent,
+  free: document.querySelector("#metric-free").textContent,
+  action: document.querySelector("#empty-action").textContent,
+  boardTitle: document.querySelector("#selected").textContent,
+  boardText: document.querySelector("#board-text").textContent });
+""")
+        case = res[0]
+        self.assertEqual(case["title"], "学校当前没有返回活动")
+        self.assertNotIn("重新登录", case["text"])
+        self.assertNotIn("点右上角", case["text"], "登录有效时不得再给登录下一步")
+        self.assertEqual(case["total"], "0", "已知零条必须写 0，不是破折号")
+        self.assertEqual(case["free"], "0")
+        self.assertIn("刷新", case["action"])
+        self.assertEqual(case["boardTitle"], "学校这次没有返回活动")
+        self.assertNotIn("还没公布", case["boardText"], "大屏不得把已知零说成还没公布")
+
+    def test_login_states_get_their_own_next_step(self):
+        """none→登录、expired→重新登录、unknown→刷新（且不得说成过期）。"""
+        res = run_js(r"""
+function snapshot() {
+  render();
+  return { title: document.querySelector("#empty-title").textContent,
+    text: document.querySelector("#empty-text").textContent,
+    action: document.querySelector("#empty-action").textContent };
+}
+S.items = []; S.byId = new Map(); S.listState = "ready";
+S.login.present = false; S.login.result = "none"; S.login.checking = false;
+const none = snapshot();
+S.login.present = true; S.login.result = "expired"; S.login.ok = false;
+const expired = snapshot();
+S.login.result = "unknown"; S.login.ok = false;
+const unknown = snapshot();
+out.push({ none, expired, unknown });
+""")
+        case = res[0]
+        self.assertEqual(case["none"]["title"], "登录后查看活动")
+        self.assertIn("「登录」", case["none"]["text"])
+        self.assertIn("重新登录", case["expired"]["title"])
+        self.assertIn("「重新登录」", case["expired"]["text"])
+        self.assertEqual(case["unknown"]["title"], "暂时无法确认登录态")
+        for banned in ("过期", "重新登录"):
+            self.assertNotIn(banned, case["unknown"]["text"],
+                             "unknown 一律不得说成过期或要求重登")
+        self.assertEqual(case["unknown"]["action"], "刷新")
+
+    def test_error_and_idle_are_not_known_zero(self):
+        """还没拉到 / 拉失败都不是「学校零活动」：指标未知，原因各归其位。"""
+        res = run_js(r"""
+function snapshot() {
+  render();
+  return { title: document.querySelector("#empty-title").textContent,
+    text: document.querySelector("#empty-text").textContent,
+    total: document.querySelector("#metric-total").textContent };
+}
+S.items = []; S.byId = new Map(); S.listState = "idle";
+S.login.result = "valid"; S.login.present = true;
+const idle = snapshot();
+S.listState = "error"; S.listError = "连不上学校站点";
+const error = snapshot();
+out.push({ idle, error });
+""")
+        case = res[0]
+        self.assertEqual(case["idle"]["title"], "还没拉到活动列表")
+        self.assertEqual(case["idle"]["total"], "—", "没拉到之前是未知，不是 0")
+        self.assertNotIn("学校当前没有返回活动", case["error"]["title"],
+                         "网络失败不得伪装成学校零活动")
+        self.assertEqual(case["error"]["total"], "—")
+
+    def test_component_banner_keeps_single_owner(self):
+        """组件问题仍只有横幅一个归属：空态不复读说明、不重复恢复按钮。"""
+        res = run_js(r"""
+S.items = []; S.byId = new Map(); S.listState = "error"; S.listError = "程序组件缺失";
+S.runtime.error = "worker_missing";
+S.login.result = "valid"; S.login.present = true;
+render();
+const html = document.querySelector("#banners").innerHTML;
+out.push({ title: document.querySelector("#empty-title").textContent,
+  text: document.querySelector("#empty-text").textContent,
+  actionHidden: document.querySelector("#empty-action").hidden,
+  rechecks: (html.match(/data-act="runtime-refresh"/g) || []).length,
+  hints: (html.match(/它没跟着程序一起到位/g) || []).length });
+""")
+        case = res[0]
+        self.assertEqual(case["title"], "活动列表未加载")
+        self.assertNotIn("登录", case["text"], "缺组件不许显示成「登录后查看活动」")
+        self.assertTrue(case["actionHidden"], "空态不重复恢复按钮")
+        self.assertEqual(case["rechecks"], 1, "横幅只有一个恢复入口")
+        self.assertEqual(case["hints"], 1, "完整原因只出现一次")
+
+    def test_clear_filter_keeps_retry_policy_and_other_prefs(self):
+        """清筛选只重置 6 个筛选键：600/3、浏览器开关、日志、引导版本全部保留。"""
+        res = run_js(r"""
+const item = { id: "a1", name: "活动A", sign_start: "2099-01-01 09:00:00",
+  sign_end: "2099-01-02 09:00:00", act_start: "2099-01-03 09:00:00",
+  act_end: "2099-01-03 11:00:00", signed: false, state: "未开放" };
+S.items = [normalize(item)];
+S.byId = new Map([["a1", S.items[0]]]);
+S.listState = "ready";
+S.prefs = { retry_policy: { retry_for_s: 600, max_attempts: 3 }, headed: true,
+  log_open: true, tour_version: 2, tour_completed_at: "2026-01-01T00:00:00Z",
+  legacy_unknown: "keep" };
+S.retryPolicy = { retry_for_s: 600, max_attempts: 3 };
+S.logOpen = true;
+S.filter = { q: "zzz", status: "free", time: "today", sort: "name",
+  checkin: "yes", checkout: "no" };
+/* 控件此刻显示用户设的 600 / 3：修复前 applyPrefs 会把它们打回 120 / 0 */
+document.querySelector("#retry-for").value = "600";
+document.querySelector("#max-attempts").value = "3";
+const saved = [];
+savePrefs = (patch) => { saved.push(patch); Object.assign(S.prefs, patch); };
+render();
+const emptyTitle = document.querySelector("#empty-title").textContent;
+document.querySelector("#empty-action").click();
+const payload = saved[saved.length - 1] || {};
+out.push({ emptyTitle,
+  filter: Object.assign({}, S.filter),
+  retryFor: S.retryPolicy.retry_for_s, maxAttempts: S.retryPolicy.max_attempts,
+  retrySelect: document.querySelector("#retry-for").value,
+  maxInput: document.querySelector("#max-attempts").value,
+  policy: S.prefs.retry_policy, headed: S.prefs.headed, logOpen: S.logOpen,
+  tourVersion: S.prefs.tour_version, tourStamp: S.prefs.tour_completed_at,
+  legacy: S.prefs.legacy_unknown,
+  payloadKeys: Object.keys(payload), payloadFilter: payload.filter,
+  q: document.querySelector("#q").value });
+""")
+        case = res[0]
+        self.assertEqual(case["emptyTitle"], "没有符合筛选的活动")
+        self.assertEqual(case["retryFor"], 600, "清筛选不得把重试时长打回默认")
+        self.assertEqual(case["maxAttempts"], 3)
+        self.assertEqual(case["retrySelect"], "600", "控件值必须还是用户设的 10 分钟")
+        self.assertEqual(case["maxInput"], "3", "控件值必须还是用户设的 3 次")
+        self.assertEqual(case["policy"]["retry_for_s"], 600, "偏好里的策略必须原样保留")
+        self.assertTrue(case["headed"], "浏览器开关偏好必须保留")
+        self.assertTrue(case["logOpen"], "运行记录展开状态必须保留")
+        self.assertEqual(case["tourVersion"], 2, "引导内容版本必须保留")
+        self.assertEqual(case["tourStamp"], "2026-01-01T00:00:00Z")
+        self.assertEqual(case["legacy"], "keep", "未识别的偏好键不得被清掉")
+        self.assertEqual(case["payloadKeys"], ["filter"], "save_prefs 只写过滤器差量")
+        self.assertEqual(case["payloadFilter"]["q"], "")
+        self.assertEqual(case["payloadFilter"]["status"], "all")
+        self.assertEqual(case["filter"]["sort"], "open", "排序也要回到默认")
+        self.assertEqual(case["q"], "", "搜索框跟着清空")
+
+    def test_start_plan_payload_keeps_policy_after_clear(self):
+        """清筛选后再开始：start_plan 载荷里的策略仍是 600/3。"""
+        res = run_js(r"""
+let sent = null;
+window.pywebview = { api: {
+  start_plan: (items, headed, policy) => {
+    sent = { items, headed, policy };
+    return Promise.resolve({ ok: true, plan_id: "p1" });
+  },
+} };
+const item = { id: "a1", name: "活动A", sign_start: "2099-01-01 09:00:00",
+  sign_end: "2099-01-02 09:00:00", act_start: "2099-01-03 09:00:00",
+  act_end: "2099-01-03 11:00:00", signed: false, state: "未开放" };
+S.items = [normalize(item)];
+S.byId = new Map([["a1", S.items[0]]]);
+S.listState = "ready";
+S.prefs = { retry_policy: { retry_for_s: 600, max_attempts: 3 } };
+S.retryPolicy = { retry_for_s: 600, max_attempts: 3 };
+S.filter = { q: "zzz", status: "free", time: "today", sort: "name",
+  checkin: "yes", checkout: "no" };
+savePrefs = () => {};
+render();
+document.querySelector("#empty-action").click();   /* 先清筛选，不动策略 */
+S.selected.add("a1");
+S.login.present = true; S.login.result = "valid"; S.login.ok = true; S.login.checking = false;
+S.demo = false;
+render();
+startPlan();
+await Promise.resolve(); await Promise.resolve();
+out.push({ policy: sent && sent.policy, itemCount: sent && sent.items.length,
+  selected: S.selected.size });
+""")
+        case = res[0]
+        self.assertEqual(case["itemCount"], 1)
+        self.assertEqual(case["policy"], {"retry_for_s": 600, "max_attempts": 3},
+                         "开始计划必须用用户设的 600/3，不能被清筛选重置")
+
+
+    def test_ready_nonempty_without_target_keeps_data(self):
+        """BC-03：有活动但没有可执行目标，不等于学校没返回。"""
+        res = run_js(r"""
+function snap() {
+  render();
+  return { title: document.querySelector("#selected").textContent,
+    text: document.querySelector("#board-text").textContent,
+    count: document.querySelector("#count").textContent };
+}
+S.listState = "ready"; S.login.result = "valid"; S.login.present = true;
+S.selected = new Set();
+const signed = normalize({ id: "s1", name: "已报名场", signed: true,
+  sign_start: "2099-01-01 09:00:00", sign_end: "2099-01-02 09:00:00",
+  act_start: "2099-01-03 09:00:00", act_end: "2099-01-03 11:00:00" });
+const closed = normalize({ id: "c1", name: "已截止场",
+  sign_start: "2020-01-01 09:00:00", sign_end: "2020-01-01 10:00:00",
+  act_start: "2020-01-02 09:00:00", act_end: "2020-01-02 11:00:00" });
+const unknown = normalize({ id: "u1", name: "待公布场",
+  sign_start: "", sign_end: "", act_start: "2099-05-01 09:00:00",
+  act_end: "2099-05-01 11:00:00" });
+S.items = [signed]; S.byId = new Map([["s1", signed]]);
+const onlySigned = snap();
+S.items = [closed]; S.byId = new Map([["c1", closed]]);
+const onlyClosed = snap();
+S.items = [unknown]; S.byId = new Map([["u1", unknown]]);
+const onlyUnknown = snap();
+S.items = []; S.byId = new Map();
+const reallyEmpty = snap();
+out.push({ onlySigned, onlyClosed, onlyUnknown, reallyEmpty });
+""")
+        case = res[0]
+        for name in ("onlySigned", "onlyClosed", "onlyUnknown"):
+            self.assertEqual(case[name]["title"], "没有可报名的场次",
+                             "%s：有活动但无目标，不能说学校没返回" % name)
+            self.assertEqual(case[name]["count"], "1 / 1 场",
+                             "%s：列表数据必须原样保留" % name)
+        self.assertNotIn("学校这次没有返回活动", case["onlySigned"]["title"])
+        self.assertEqual(case["reallyEmpty"]["title"], "学校这次没有返回活动",
+                         "真正零条才归咎学校空列表")
+
+    def test_check_arrival_updates_empty_state(self):
+        """BC-04：检查中不说有效；后到的 check 结论自己把空态改过来。
+
+        全程经 window.onBackend.check 进入，不在结论之后手动 render。
+        """
+        res = run_js(r"""
+function snap() {
+  return { title: document.querySelector("#empty-title").textContent,
+    text: document.querySelector("#empty-text").textContent };
+}
+S.items = []; S.byId = new Map(); S.listState = "ready";
+/* 刷新保留旧 result 并进入 checking：这正是提前写「登录是有效的」的窗口 */
+S.login.present = true; S.login.result = "valid"; S.login.ok = true; S.login.checking = true;
+render();
+const whileChecking = snap();
+window.onBackend.check({ ok: false, result: "expired", hours_left: 0, session_present: true });
+const afterExpired = snap();
+/* 再来一轮 unknown：只能说不确定，不说过期、不逼重登 */
+S.login.checking = true;
+render();
+const checkingAgain = snap();
+window.onBackend.check({ ok: false, result: "unknown", hours_left: null, session_present: true });
+const afterUnknown = snap();
+/* 相反次序：check 先到、list 后到 */
+S.login.checking = false;
+window.onBackend.check({ ok: true, result: "valid", hours_left: 6, session_present: true });
+window.onBackend.activities({ ok: true, items: [] });
+const checkThenList = snap();
+out.push({ whileChecking, afterExpired, checkingAgain, afterUnknown, checkThenList });
+""")
+        case = res[0]
+        self.assertEqual(case["whileChecking"]["title"], "正在检查登录态",
+                         "检查没结束时不得提前宣布「登录是有效的」")
+        self.assertIn("重新登录", case["afterExpired"]["title"],
+                      "后到的 expired 必须自己刷新空态，不靠手动 render")
+        self.assertEqual(case["checkingAgain"]["title"], "正在检查登录态")
+        self.assertEqual(case["afterUnknown"]["title"], "暂时无法确认登录态")
+        self.assertNotIn("过期", case["afterUnknown"]["text"], "unknown 不说过期")
+        self.assertEqual(case["checkThenList"]["title"], "学校当前没有返回活动",
+                         "check 先到、list 后到也要收敛到真实状态")
+
+    def test_empty_action_dispatches_by_intent(self):
+        """BC-05：「重试」必须真的重发请求；只有筛选空态才清筛选。"""
+        res = run_js(r"""
+const item = { id: "a1", name: "活动A", sign_start: "2099-01-01 09:00:00",
+  sign_end: "2099-01-02 09:00:00", act_start: "2099-01-03 09:00:00",
+  act_end: "2099-01-03 11:00:00", signed: false, state: "未开放" };
+S.items = [normalize(item)];
+S.byId = new Map([["a1", S.items[0]]]);
+S.filter = { q: "zzz", status: "free", time: "today", sort: "name",
+  checkin: "yes", checkout: "no" };
+S.prefs = { retry_policy: { retry_for_s: 600, max_attempts: 3 } };
+S.retryPolicy = { retry_for_s: 600, max_attempts: 3 };
+savePrefs = () => {};
+let checks = 0, lists = 0;
+window.pywebview = { api: {
+  check: () => { checks += 1; return Promise.reject(new Error("桥接断了")); },
+  list_activities: () => { lists += 1; return Promise.reject(new Error("桥接断了")); },
+} };
+/* 有缓存 + 列表请求失败：空态显示「重试」 */
+S.listState = "error"; S.listError = "连不上学校站点";
+render();
+const errorState = { action: document.querySelector("#empty-action").textContent,
+  intent: document.querySelector("#empty-action").dataset.action };
+document.querySelector("#empty-action").click();
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+const afterRetry = { checks, lists, q: S.filter.q };
+/* 回到正常筛选空态：这里才该清筛选，且不再发请求 */
+S.listState = "ready";
+render();
+const filterState = { action: document.querySelector("#empty-action").textContent,
+  intent: document.querySelector("#empty-action").dataset.action };
+document.querySelector("#empty-action").click();
+out.push({ errorState, afterRetry, filterState,
+  afterClear: { checks, lists, q: S.filter.q, sort: S.filter.sort },
+  retry: S.retryPolicy.retry_for_s, max: S.retryPolicy.max_attempts });
+""")
+        case = res[0]
+        self.assertEqual(case["errorState"]["action"], "重试")
+        self.assertEqual(case["errorState"]["intent"], "refresh",
+                         "失败空态的动作意图必须是刷新，不是清筛选")
+        self.assertEqual(case["afterRetry"]["checks"], 1, "「重试」必须真的再查登录态")
+        self.assertEqual(case["afterRetry"]["lists"], 1, "「重试」必须真的再拉列表")
+        self.assertEqual(case["afterRetry"]["q"], "zzz",
+                         "点重试不得顺手清筛选把错误藏掉")
+        self.assertEqual(case["filterState"]["intent"], "clear-filters")
+        self.assertEqual(case["afterClear"]["q"], "", "筛选空态才清筛选")
+        self.assertEqual(case["afterClear"]["sort"], "open")
+        self.assertEqual(case["afterClear"]["checks"], 1, "清筛选不得发请求")
+        self.assertEqual(case["afterClear"]["lists"], 1)
+        self.assertEqual(case["retry"], 600, "清筛选仍不得动策略")
+        self.assertEqual(case["max"], 3)
+
+
+class AssistanceBehaviorTests(unittest.TestCase):
+    """说明/更多/重播：文案同源、全状态可开、焦点归还、外链与目录一次一点击。"""
+
+    # 已确认的文案基线：两端一起漂移时，这一份仍然能挡住
+    _EXPECTED_COPY = {
+        "title": "天软活动预报名工具怎么用",
+        "subtitle": "确认登录，选活动并开始，再看每场结果。",
+        "note": "仅操作本人账号；选中活动还没有开始，报名结果以学校活动页为准。",
+        "steps": [
+            (1, "确认登录",
+             "首次点「登录」，在浏览器里完成登录。重开会自动检查；"
+             "仅在提示失效时重新登录，暂时无法确认就刷新。"),
+            (2, "选活动并开始",
+             "勾选不冲突的活动，设置重试时长和最多次数，再点「开始报名计划」。"
+             "未来场次等开放，已开放场次立即尝试。"),
+            (3, "看进度与结果",
+             "电脑保持唤醒和联网，窗口可最小化。逐场看结果；"
+             "停止会结束本机任务，不会撤销学校报名。"),
+        ],
+    }
+
+    def test_backend_help_payload_matches_default_help(self):
+        """Api.help() 的真实载荷与 DEFAULT_HELP 逐字段一致（结构 + 顺序 + 文案）。
+
+        后端：ast 只编译 Api.help，注入版本/地址常量后调用 help(None)；
+        前端：node 里把生产 DEFAULT_HELP 取出来。两边深比较，不用源码子串。
+        """
+        backend = load_backend_help()
+        frontend = run_js("out.push(JSON.parse(JSON.stringify(DEFAULT_HELP)));")[0]
+        expected = self._EXPECTED_COPY
+
+        # 后端载荷结构：字段齐全、步骤编号有序、版本/外链来自注入常量
+        self.assertEqual(sorted(backend),
+                         ["latest_url", "note", "steps", "subtitle", "title", "version"],
+                         "help 载荷字段发生变化")
+        self.assertEqual(backend["version"], HELP_TEST_VERSION,
+                         "版本必须来自 APP_VERSION，不能写死")
+        self.assertEqual(backend["latest_url"], HELP_TEST_URL,
+                         "发布页地址必须来自 RELEASES_LATEST_URL")
+        self.assertEqual([step["no"] for step in backend["steps"]], [1, 2, 3],
+                         "三步顺序必须是 1/2/3")
+        for step in backend["steps"]:
+            self.assertEqual(sorted(step), ["no", "text", "title"],
+                             "步骤字段结构变化")
+
+        # 前端对象不带第二套版本来源
+        self.assertEqual(sorted(frontend), ["note", "steps", "subtitle", "title"],
+                         "DEFAULT_HELP 不得自带版本/地址字段")
+
+        # 逐字段深比较（含中文全角标点）
+        self.assertEqual(frontend["title"], backend["title"])
+        self.assertEqual(frontend["subtitle"], backend["subtitle"])
+        self.assertEqual(frontend["note"], backend["note"])
+        self.assertEqual(len(frontend["steps"]), len(backend["steps"]))
+        for got, want in zip(frontend["steps"], backend["steps"]):
+            self.assertEqual((got["no"], got["title"], got["text"]),
+                             (want["no"], want["title"], want["text"]),
+                             "第 %s 步两处必须一字不差" % want["no"])
+
+        # 与已确认文案独立比对：防止前后端一起漂移而深比较仍然通过
+        self.assertEqual(backend["title"], expected["title"])
+        self.assertEqual(backend["subtitle"], expected["subtitle"])
+        self.assertEqual(backend["note"], expected["note"])
+        self.assertEqual([(step["no"], step["title"], step["text"])
+                          for step in backend["steps"]], expected["steps"])
+
+    def test_more_opens_in_every_state(self):
+        """未登录 / 组件报错 / 计划运行中都开得出来；说明与更多不叠模态。"""
+        res = run_js(r"""
+function openCase(prepare) {
+  prepare();
+  const dlg = document.querySelector("#settings");
+  if (dlg.open) dlg.close();
+  document.querySelector("#btn-settings").click();
+  const opened = dlg.open;
+  dlg.close();
+  return opened;
+}
+const fresh = openCase(() => { S.busy = false; S.runtime.error = null; });
+const errored = openCase(() => { S.runtime.error = "worker_missing"; });
+const busy = openCase(() => { S.busy = true; });
+S.busy = false;
+document.querySelector("#btn-help").click();
+const helpOpen = document.querySelector("#help").open;
+document.querySelector("#btn-settings").click();
+const stacked = { more: document.querySelector("#settings").open,
+  help: document.querySelector("#help").open };
+out.push({ fresh, errored, busy, helpOpen, stacked });
+""")
+        case = res[0]
+        self.assertTrue(case["fresh"], "常态必须能打开更多")
+        self.assertTrue(case["errored"], "组件报错时更多仍要能打开")
+        self.assertTrue(case["busy"], "计划运行中也要能打开更多")
+        self.assertTrue(case["helpOpen"])
+        self.assertTrue(case["stacked"]["more"])
+        self.assertFalse(case["stacked"]["help"], "两个模态不得叠着开")
+
+    def test_both_replay_entries_close_dialog_and_return_focus(self):
+        """两处重播都先关弹窗、从第 1 步开始，退出后焦点回到各自顶栏入口。"""
+        res = run_js(r"""
+const more = document.querySelector("#settings");
+const help = document.querySelector("#help");
+document.querySelector("#btn-settings").click();
+document.querySelector("#btn-settings-tour").click();
+const fromMore = { closed: !more.open, tour: S.tour.open, step: S.tour.step,
+  opener: S.tour.restoreFocus && S.tour.restoreFocus.__sel };
+tourSkip();
+const afterMore = focused.slice(-1)[0];
+document.querySelector("#btn-help").click();
+document.querySelector("#btn-help-tour").click();
+const fromHelp = { closed: !help.open, tour: S.tour.open, step: S.tour.step,
+  opener: S.tour.restoreFocus && S.tour.restoreFocus.__sel };
+tourSkip();
+const afterHelp = focused.slice(-1)[0];
+out.push({ fromMore, afterMore, fromHelp, afterHelp,
+  otherStillOpen: more.open, helpStillOpen: help.open });
+""")
+        case = res[0]
+        self.assertTrue(case["fromMore"]["closed"], "重播前必须先关掉更多")
+        self.assertTrue(case["fromMore"]["tour"])
+        self.assertEqual(case["fromMore"]["step"], 0)
+        self.assertEqual(case["fromMore"]["opener"], "#btn-settings",
+                         "开始前的焦点必须是「更多」入口")
+        self.assertEqual(case["afterMore"], "#btn-settings", "退出引导把焦点还回更多入口")
+        self.assertTrue(case["fromHelp"]["closed"], "重播前必须先关掉说明")
+        self.assertEqual(case["fromHelp"]["opener"], "#btn-help")
+        self.assertEqual(case["afterHelp"], "#btn-help")
+        self.assertFalse(case["otherStillOpen"])
+        self.assertFalse(case["helpStillOpen"])
+
+    def test_busy_disables_replay_but_keeps_version_visible(self):
+        """运行中两处重播都禁用并写明原因；版本仍可查，点击也不进引导。"""
+        res = run_js(r"""
+document.querySelector("#settings-version").textContent = "9.9.9";
+setBusy(true);
+document.querySelector("#btn-settings").click();
+const opened = document.querySelector("#settings").open;
+const tourBtn = document.querySelector("#btn-settings-tour");
+const helpBtn = document.querySelector("#btn-help-tour");
+const disabled = { tour: tourBtn.disabled, help: helpBtn.disabled };
+const label = tourBtn.textContent;
+/* 桩不按 disabled 拦截点击：这里同时验证代码自己的忙判定 */
+document.querySelector("#btn-settings-tour").click();
+const noTour = !S.tour.open;
+const version = document.querySelector("#settings-version").textContent;
+setBusy(false);
+out.push({ opened, disabled, label, noTour, version,
+  restored: { disabled: tourBtn.disabled, label: tourBtn.textContent } });
+""")
+        case = res[0]
+        self.assertTrue(case["opened"], "运行中也要能打开更多查版本")
+        self.assertTrue(case["disabled"]["tour"], "运行中「更多」里的重播必须禁用")
+        self.assertTrue(case["disabled"]["help"], "运行中说明里的重播也必须禁用")
+        self.assertEqual(case["label"], "计划结束后可重看引导",
+                         "禁用原因必须直接写在按钮上，不只靠 title")
+        self.assertTrue(case["noTour"], "禁用期间点击不得进引导")
+        self.assertEqual(case["version"], "9.9.9", "版本仍必须可见")
+        self.assertFalse(case["restored"]["disabled"], "计划结束后重播恢复可用")
+        self.assertEqual(case["restored"]["label"], "重看引导")
+
+    def test_external_actions_fire_once_and_not_on_open(self):
+        """打开弹窗不联网、不开目录；每次点击恰调用一次既有接口。"""
+        res = run_js(r"""
+let latest = 0, data = 0;
+window.pywebview = { api: {
+  open_latest_release: () => { latest += 1; return Promise.resolve({ ok: true }); },
+  open_data: () => { data += 1; return Promise.resolve({ ok: true }); },
+} };
+document.querySelector("#btn-settings").click();
+const atOpen = { latest, data };
+document.querySelector("#btn-settings-latest").click();
+document.querySelector("#btn-settings-data").click();
+await Promise.resolve();
+out.push({ atOpen, latest, data,
+  statusHidden: document.querySelector("#settings-status").hidden });
+""")
+        case = res[0]
+        self.assertEqual(case["atOpen"], {"latest": 0, "data": 0},
+                         "打开弹窗不得自动联网或打开目录")
+        self.assertEqual(case["latest"], 1, "外链每次点击恰调用一次")
+        self.assertEqual(case["data"], 1, "数据目录每次点击恰调用一次")
+        self.assertTrue(case["statusHidden"], "成功时不显示局部错误")
+
+    def test_failures_show_local_status_with_fixed_url(self):
+        """失败只在这个弹窗里说下一步；发布页失败要给出可复制的固定地址。"""
+        res = run_js(r"""
+window.pywebview = { api: {
+  open_latest_release: () => Promise.resolve({ ok: false }),
+  open_data: () => Promise.reject(new Error("没有权限")),
+} };
+document.querySelector("#btn-settings").click();
+document.querySelector("#btn-settings-latest").click();
+await Promise.resolve(); await Promise.resolve();
+const latest = { hidden: document.querySelector("#settings-status").hidden,
+  text: document.querySelector("#settings-status").textContent,
+  tone: document.querySelector("#settings-status").dataset.tone };
+document.querySelector("#btn-settings-data").click();
+await Promise.resolve(); await Promise.resolve();
+const data = { hidden: document.querySelector("#settings-status").hidden,
+  text: document.querySelector("#settings-status").textContent,
+  tone: document.querySelector("#settings-status").dataset.tone };
+out.push({ latest, data, url: RELEASES_LATEST_URL });
+""")
+        case = res[0]
+        self.assertFalse(case["latest"]["hidden"], "失败必须在弹窗里可见")
+        self.assertIn("发布页没能打开", case["latest"]["text"])
+        self.assertIn(case["url"], case["latest"]["text"], "要把固定地址摆出来供复制")
+        self.assertEqual(case["latest"]["tone"], "warn")
+        self.assertFalse(case["data"]["hidden"])
+        self.assertIn("打不开数据目录", case["data"]["text"])
+        self.assertIn("没有权限", case["data"]["text"])
+        self.assertEqual(case["data"]["tone"], "bad")
 
 
 if __name__ == "__main__":

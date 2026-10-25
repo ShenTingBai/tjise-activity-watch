@@ -9,6 +9,8 @@
 
 ![本机版界面](local/gui-preview.png)
 
+<sub>当前界面（mock 演示数据，待用户验收）；六步引导的分步截图见 [design/current-ui/](design/current-ui/)。</sub>
+
 > **适用对象**：天津市大学软件学院（天软）**专升本**学生。项目按该校学生端的接口与页面写死；换学校要改 `SCHOOL_ORIGIN` 与接口适配，不在支持范围内。
 > **不适用范围**：不代他人报名、不多账号批量占位、不抢别人的名额。
 
@@ -48,7 +50,16 @@
 
 ## 快速开始 · 本机版（5 分钟）
 
-**不想装 Python**：下 [绿色版](https://github.com/ShenTingBai/tjise-activity-watch/releases)，解压双击 `启动.bat`。
+**不想装 Python**：到 [Releases](https://github.com/ShenTingBai/tjise-activity-watch/releases) 下载本机版资产，任选其一：
+
+- `天软活动预报名工具-vX.Y.Z-win-x64.zip`（**完整便携包，推荐**）：独立 EXE、README 和启动说明都在里面，解压双击主 EXE 即用；
+- `天软活动预报名工具-vX.Y.Z-win-x64.exe`：**独立可用单文件**——程序组件（grab-worker）已内置，拷到任何空目录双击即可，不再需要同目录的 worker；
+- `tjise-grab-portable-*.zip` 绿色版：解压双击 `启动.bat`。
+
+> 独立 EXE 与四成员 ZIP 形态自 v1.1.0 起生效；该版本正式发布前，Release 页现有资产的
+> 形态以资产内启动说明为准，请以实际下载到的资产为准阅读。
+
+右上角分两个入口：**「说明」**给三步快速帮助（确认登录 / 选活动并开始 / 看进度与结果）并带一个「重看引导」；**「更多」**放重看六步引导、当前版本与「查看发布页」、打开本机数据目录。当前版本号以 [VERSION](VERSION) 文件为准（只在「更多」显示，不会自动联网检查），最新发布看 [releases/latest](https://github.com/ShenTingBai/tjise-activity-watch/releases/latest)。
 
 **装了 Python**：
 

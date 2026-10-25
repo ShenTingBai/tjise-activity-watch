@@ -708,6 +708,7 @@ class PreopenSchedulerTests(unittest.TestCase):
 
         def fake_sleep(seconds):
             clock["t"] += seconds
+            time.sleep(0)   # 让出 GIL：纯推进虚拟时钟的自旋会在套件高负载下饿死主线程（取消/断言），偶发假失败
 
         spec = TaskSpec.from_activity(self._activity_row("f", sign_start_ts),
                                       "task-f", lead_s=100, now=clock["t"])
@@ -736,6 +737,7 @@ class PreopenSchedulerTests(unittest.TestCase):
 
         def fake_sleep(seconds):
             clock["t"] += seconds
+            time.sleep(0)   # 让出 GIL：纯推进虚拟时钟的自旋会在套件高负载下饿死主线程（取消/断言），偶发假失败
 
         specs = [
             TaskSpec.from_activity(self._activity_row("f1", sign_start_ts), "task-f1", lead_s=100, now=clock["t"]),
@@ -768,6 +770,7 @@ class PreopenSchedulerTests(unittest.TestCase):
 
         def fake_sleep(seconds):
             clock["t"] += seconds
+            time.sleep(0)   # 让出 GIL：纯推进虚拟时钟的自旋会在套件高负载下饿死主线程（取消/断言），偶发假失败
 
         specs = [
             TaskSpec.from_activity(self._activity_row("f", sign_start_ts), "task-f", lead_s=100, now=clock["t"]),
@@ -801,15 +804,23 @@ class PreopenSchedulerTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
 
     def test_cancel_before_prepare_skips_launch(self):
-        """等待中的未来场被取消后：不再启动 worker，状态保持 canceled。"""
+        """等待中的未来场被取消后：不再启动 worker，状态保持 canceled。
+
+        用事件确定次序：fake_sleep 首次到达即发 entered 并停住，主线程确认
+        「已进等待且未到准备时刻」后再取消，最后放行时钟推进——不再依赖
+        线程调度竞争（礼让只是减轻自旋，不构成时序保证）。"""
         clock = self._clock()
         sign_start_ts = clock["t"] + 600
+        entered, advance = threading.Event(), threading.Event()
 
         def fake_now():
             return clock["t"]
 
         def fake_sleep(seconds):
             clock["t"] += seconds
+            time.sleep(0)   # 保留礼让：避免放行后的等待循环饿死主线程断言
+            entered.set()
+            advance.wait(5)
 
         spec = TaskSpec.from_activity(self._activity_row("f", sign_start_ts),
                                       "task-f", lead_s=100, now=clock["t"])
@@ -822,9 +833,16 @@ class PreopenSchedulerTests(unittest.TestCase):
         coordinator = PlanCoordinator("plan-cancel", [spec], runner, lambda *a: None,
                                       now=fake_now, sleep=fake_sleep)
         coordinator.start()
-        self.assertTrue(coordinator.cancel_task("task-f"))
-        thread = coordinator._thread
-        thread.join(5)
+        try:
+            self.assertTrue(entered.wait(5), "调度线程必须先进入等待循环")
+            self.assertLess(fake_now(), sign_start_ts - 100,
+                            "取消必须发生在准备时刻之前")
+            self.assertTrue(coordinator.cancel_task("task-f"))
+            advance.set()
+        finally:
+            advance.set()            # 失败路径也放行，避免测试线程遗留
+            thread = coordinator._thread
+            thread.join(5)
         self.assertFalse(thread.is_alive())
         self.assertEqual(launches, [], "已取消的场次不得再启动 worker")
         snap = coordinator.snapshot()

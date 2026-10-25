@@ -25,6 +25,13 @@
    以「临时文件 + `os.replace`」搬入，不覆盖已有新文件；迁移失败不阻断启动。
 7. **构建不删登录态**：`build_exe.py` 清理输出目录时保留 `OUT/data`。
 8. 会话文件不含账号密码；`start_plan` 是最终防线：非 demo 且最近一次 check 结论不是 `valid` 一律拒绝。
+9. （2026-10-25 补充）**应用生命周期元数据只进 `ui.json`**：`last_started_at` /
+   `last_heartbeat_at` / `last_closed_at` 由主进程每分钟心跳与正常关闭写入，
+   与界面偏好共用同一把持久化锁做原子读-合并-写；`session.json` / `storage_state.json`
+   永远只存会话信息。重开时的「上次关闭时长」（正常关闭精确、异常退出只给「约」）与
+   「登录预计还剩」都只是提示：估算按 `saved_at` 绝对墙钟跨关闭区间继续计算，
+   **不得因旧估算强制过期、清理会话或刷新 `saved_at`**，登录有效性仍只由真实校验决定
+   （见 [008](008-lifecycle-version-release.md)）。
 
 ## 用户可见行为
 

@@ -14,6 +14,12 @@
 2. 窄窗口（视口 ≤860px）品牌区可使用短标签**「天软预报名工具」**，但**不得**改正式窗口标题。
 3. 「准点」是早期视觉原型（`design/prototype/`）的历史称呼，只允许出现在历史说明与设计资料里，
    不得作为运行时产品名、窗口标题或帮助标题出现。
+4. （2026-10-25 补充）**Release 资产也用正式产品名**：完整便携包
+   `天软活动预报名工具-vX.Y.Z-win-x64.zip`、单文件入口
+   `天软活动预报名工具-vX.Y.Z-win-x64.exe`（版本 X.Y.Z 唯一来自仓库根 `VERSION`）；
+   GitHub 最新版本固定外链 `https://github.com/ShenTingBai/tjise-activity-watch/releases/latest`。
+   内部工程名（`tjise-grab-*`、`tjise-activity-watch.exe`）可以留在仓库与构建产物里，
+   但**对用户可见的发行文件名不得回到「准点」或英文内部名**。
 
 ## 用户可见行为
 

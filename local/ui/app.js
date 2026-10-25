@@ -11,14 +11,14 @@
 const $ = (selector) => document.querySelector(selector);
 
 const DEFAULT_HELP = {
-  title: "天软活动预报名工具",
-  subtitle: "选好多场活动，开放时按批次自动提交",
+  title: "天软活动预报名工具怎么用",
+  subtitle: "确认登录，选活动并开始，再看每场结果。",
   steps: [
-    { no: 1, title: "先登录", text: "点「登录」完成首次登录。之后重开会自动检查，只有失效才重登。" },
-    { no: 2, title: "选活动", text: "把想报的场次加入计划。活动时间重叠时只能保留其中一场；同刻开放但不重叠的场次可以一起提交。" },
-    { no: 3, title: "保持在线", text: "电脑别睡眠、别断网；窗口可以最小化，但不要关掉。每场活动都会单独显示结果。" },
+    { no: 1, title: "确认登录", text: "首次点「登录」，在浏览器里完成登录。重开会自动检查；仅在提示失效时重新登录，暂时无法确认就刷新。" },
+    { no: 2, title: "选活动并开始", text: "勾选不冲突的活动，设置重试时长和最多次数，再点「开始报名计划」。未来场次等开放，已开放场次立即尝试。" },
+    { no: 3, title: "看进度与结果", text: "电脑保持唤醒和联网，窗口可最小化。逐场看结果；停止会结束本机任务，不会撤销学校报名。" },
   ],
-  note: "只给本人账号使用，不要借别人的账号；同一计划由本机统一协调。",
+  note: "仅操作本人账号；选中活动还没有开始，报名结果以学校活动页为准。",
 };
 
 /* 与 grab.py / app.py 对齐的常量 */
@@ -27,6 +27,30 @@ const TOKEN_LIFETIME_H = 17.5; // app.py TOKEN_LIFETIME_H：登录态寿命估�
 const RETRY_WINDOW_S = 120;  // grab.py --window：开放后最多再试 120 秒
 const SLEEP_GAP_MS = 120e3;  // 两次心跳间隔超过 2 分钟：多半是电脑睡过去了
 const WEEK = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+/* 引导内容版本：与软件版本（VERSION 文件）独立，内容有实质变化时 +1，
+ * 完成或跳过过旧版的用户会在新版再自动弹一次；同版绝不重复自动弹。
+ * 2：六步顺序与高亮目标都没变，只纠正「选中即执行」的误导并补清次数口径。 */
+const TOUR_VERSION = 2;
+/* GitHub 最新版本页：只有用户点按钮时才由后端用系统浏览器打开，启动时不联网检查 */
+const RELEASES_LATEST_URL = "https://github.com/ShenTingBai/tjise-activity-watch/releases/latest";
+/* 六步主线：登录状态 → 活动与模式 → 筛选 → 选择与冲突 → 重试与开始 → 运行与结果。
+ * target 对应 index.html 的 data-tour-target；目标隐藏/窄窗时退回底部静态说明，
+ * 引导本身从不代替用户点登录、选活动或开始报名。 */
+const TOUR_STEPS = [
+  { target: "login", title: "登录状态",
+    text: "这里是登录状态和「登录/刷新」入口。第一次点「登录」会弹出 Chrome 窗口——那是系统窗口，引导高亮不了，请在里面输学号、密码和验证码完成登录；之后重开会自动检查，只有失效才需要重新登录。" },
+  { target: "list", title: "活动与模式",
+    text: "活动按车站时刻表分组。未来的场次是「预报名」，选中后点「开始报名计划」，再等它开放；已开放的是「立即报名/抢名额」，也要先选中、再点「开始报名计划」才执行；已截止的只能查看，不能勾选。" },
+  { target: "filters", title: "筛选",
+    text: "按关键词、报名状态、开放时间、排序，以及是否要求签到/签退筛选。学校还没说明要求的显示「待说明」，只在「全部」里保留，不会误判成无需。" },
+  { target: "select", title: "选择与冲突",
+    text: "勾选想报的场次。活动举办时间重叠时只能保留其中一场；同一开放时刻但不重叠的场次可以一起提交，黑色大屏会先给出检查条和冲突提示。" },
+  { target: "start", title: "重试与开始",
+    text: "这里设置重试时长和最多次数（默认 2 分钟、不限次数）。次数只算真正发出去的提交，没发出去的重试不计数；不管怎么设，报名截止都是硬上限。确认大屏检查条没有红灯后，点「开始报名计划」。" },
+  { target: "run", title: "运行与结果",
+    text: "计划运行时，LED 大屏、时间线、任务卡和底部运行记录逐场显示进度：任务卡上是这一场的结果，整块大屏的结论要等整个计划结束。停止只结束本机任务，不会撤销学校那边已经报上的。窗口可以最小化，关掉程序或让电脑睡眠会中断执行。路线图只显示真实发生的时间点，没发生的显示「待打开/待发生」。" },
+];
 
 const S = {
   items: [],
@@ -37,7 +61,17 @@ const S = {
   selectionNotice: "",
   filter: { q: "", status: "all", time: "all", sort: "open", checkin: "all", checkout: "all" },
   listState: "idle",
-  login: { hours: null, ok: null, expireAt: null, present: null, checking: false, result: null },
+  /* 最近一次列表失败的原话：完整失败说明只归列表空态，结果框不再复读 */
+  listError: "",
+  login: { hours: null, ok: null, expireAt: null, savedAt: null, present: null, checking: false, result: null },
+  /* 程序组件自检结论（worker_missing/worker_permission/spawn_failed）：非空时组件
+   * 问题优先于登录/网络文案，登录与开始禁用。check/list 两分支按「刷新轮次」
+   * 协同恢复：任一分支报组件故障立即挂横幅，另一分支成功/普通 unknown 不得撤；
+   * 本轮两分支都完成且无故障才撤旧横幅（FB4 的两到达顺序一致语义） */
+  runtime: { error: null, checkPending: false, listPending: false, roundError: null },
+  /* FB1 轻量「开始提交中」标志：成功/拒绝/reject 均释放，只做即时按钮反馈，
+   * 后端最终接纳点的原子重检仍是最终权威 */
+  starting: false,
   clock: { skew: 0, checked: false },
   online: navigator.onLine !== false,
   sleepGap: 0,
@@ -46,7 +80,13 @@ const S = {
   /* 后端 bootstrap 的 demo 标记：演示模式不要求登录校验 valid 即可开始计划 */
   demo: false,
   plan: { id: null, status: "idle", tasks: new Map() },
+  /* 上一帧的运行阶段：跨过开放时刻/进入真正提交时要重画一次大屏摘要 */
+  lastRunPhase: null,
   prefs: {},
+  /* 后端 bootstrap 的 lifecycle 快照：上次关闭时长/质量 + 登录估算（只提示，不参与门禁） */
+  lifecycle: null,
+  /* 六步引导运行态：open=遮罩在场；paused=计划运行中暂停；restoreFocus=结束后要还的焦点 */
+  tour: { open: false, step: 0, paused: false, restoreFocus: null },
   /* 计划级重试策略：时长 0=直到报名截止（缺截止回退 120 秒）；次数 0=不限 */
   retryPolicy: { retry_for_s: 120, max_attempts: 0 },
   logOpen: false,
@@ -93,17 +133,28 @@ async function boot() {
   const bridgeReady = await waitForBridge();
   const info = bridgeReady ? await api("bootstrap").catch(() => null) : null;
   fillHelp((info && info.help) || DEFAULT_HELP);
-  $("#help-version").textContent = info && info.version ? "版本 " + info.version : "";
+  /* 版本唯一显示位在「更多」弹窗：只用 bootstrap 带来的真实版本号，
+   * 前面「当前版本」是行内标签，这里不写死候选号、也不自己拼前缀 */
+  $("#settings-version").textContent = info && info.version ? String(info.version) : "—";
   if (info) {
     /* demo 标记由后端 bootstrap 带来：演示模式绕过「登录校验 valid」的开始门禁 */
     S.demo = !!info.demo;
+    /* 生命周期快照（上次关闭时长/质量、登录估算）：只进时钟浮层当提示，
+     * 不参与登录四态判定，也不影响开始门禁 */
+    S.lifecycle = info.lifecycle || null;
     applyPrefs(info.prefs || {});
     setLogin(info.login && info.login.hours_left, null,
-             info.login && "session_present" in info.login ? !!info.login.session_present : undefined);
+             info.login && "session_present" in info.login ? !!info.login.session_present : undefined,
+             info.login);
     setBusy(!!info.busy);
     ingestBootstrapPlan(info);
-    /* 第一次打开自动弹一次说明；之后随时从顶栏「说明」打开 */
-    if (!S.prefs.welcome_seen) showHelp();
+    /* 首次使用：六步引导代替一次性静态弹窗；引导不会自动开始时才弹说明 */
+    const tourWillAuto = tourShouldAutoStart();
+    if (!S.prefs.welcome_seen) {
+      savePrefs({ welcome_seen: true });
+      if (!tourWillAuto) showHelp();
+    }
+    if (tourWillAuto) startTour(0);
   } else {
     setLogin(null, null);
     S.listState = "idle";
@@ -146,6 +197,22 @@ function applyPrefs(prefs) {
   setLogOpen(S.logOpen, true);
 }
 
+/* 清筛选的唯一实现：只重置 6 个筛选键与对应控件。
+ * 不能拿「半个 prefs」回调 applyPrefs——那会把重试策略、浏览器开关、
+ * 运行记录展开、引导版本等一起重置掉，用户设的 10 分钟/3 次就白设了。 */
+function clearFilters() {
+  S.filter = { q: "", status: "all", time: "all", sort: "open", checkin: "all", checkout: "all" };
+  $("#q").value = S.filter.q;
+  $("#time").value = S.filter.time;
+  $("#sort").value = S.filter.sort;
+  $("#checkin").value = S.filter.checkin;
+  $("#checkout").value = S.filter.checkout;
+  paintChips();
+  /* 只写过滤器差量：savePrefs 按 key 合并，其他偏好原样保留 */
+  savePrefs({ filter: Object.assign({}, S.filter) });
+  render();
+}
+
 function ingestBootstrapPlan(info) {
   /* 页面重载后 plan/task 事件已丢：用 bootstrap 带回的计划快照恢复任务列表。
    * 只恢复显示，不重新提交——提交只发生在 start_plan，与恢复无关。 */
@@ -162,17 +229,50 @@ function ingestBootstrapPlan(info) {
   render();
 }
 
+/* FB4：组件码唯一接收点——只认可知三码；未知 error 字段保持既有业务失败路径 */
+function noteRoundError(code) {
+  if (!code || !RUNTIME_ERRORS[code]) return false;
+  S.runtime.roundError = code;
+  S.runtime.error = code;
+  return true;
+}
+
+/* FB4：刷新轮次收口——一个分支终态后，若本轮两分支都完成，按该轮故障累计
+ * 决定撤/留横幅（有故障保持，无故障恢复）。任一分支未完成绝不提前清。 */
+function settleRefreshBranch(branch) {
+  if (branch === "check") S.runtime.checkPending = false;
+  else S.runtime.listPending = false;
+  if (S.runtime.checkPending || S.runtime.listPending) return;
+  const next = S.runtime.roundError;
+  if (S.runtime.error !== next) {
+    S.runtime.error = next;
+    paintBanners();
+    updateControls();
+    render();
+  }
+}
+
 function refresh(quiet) {
   if (!hasBridge()) {
     if (!quiet) setResult({ ok: false, title: "还没有连接本机脚本", text: "请从图形界面启动，再点「刷新」拉活动列表。" });
     return;
   }
   S.listState = "loading";
+  S.listError = "";
+  /* 开启新一轮复查：两分支 pending、故障累计清零；旧横幅保持到本轮收口 */
+  S.runtime.checkPending = true;
+  S.runtime.listPending = true;
+  S.runtime.roundError = null;
   /* 先进「检查中」：本机有会话也不提前说「登录有效」，等真实校验回来 */
   S.login.checking = true;
   paintLogin();
   render();
-  api("check").catch((err) => {
+  api("check").then((res) => {
+    if (res && res.ok === false) {
+      /* 同步拒绝（如正在关闭）没有终态事件：本分支按无故障收口，不让轮次悬挂 */
+      settleRefreshBranch("check");
+    }
+  }).catch((err) => {
     /* 桥接/脚本异常也必须离开「检查中」：落 unknown 结论并刷新胶囊与按钮，
      * 不能把界面永远停在「正在检查登录态」；下一步是点「刷新」再试。
      * ok 必须同时置 false：旧的 valid/warn 状态不清理的话，
@@ -182,14 +282,34 @@ function refresh(quiet) {
     S.login.result = "unknown";
     paintLogin();
     updateControls();
+    /* 结论变了，空态要跟着从「正在检查」落到「暂时无法确认」 */
+    refreshLoginEmptyState();
     addLog("[X] 检查登录态失败：" + msg(err) + "；点「刷新」再试一次");
+    settleRefreshBranch("check");
   });
-  api("list_activities").catch((err) => {
+  api("list_activities").then((res) => {
+    if (res && res.ok === false) {
+      settleRefreshBranch("list");
+    }
+  }).catch((err) => {
+    /* 桥接/脚本异常同 Worker 失败一个口径：完整说明归列表空态，
+     * 不再为同一列表错误额外弹结果框 */
     S.listState = "error";
+    S.listError = msg(err);
     render();
-    const copy = listErrorCopy(msg(err));
-    if (!quiet) setResult({ ok: false, title: copy.title, text: copy.text });
+    settleRefreshBranch("list");
   });
+}
+
+/* 组件错误 → 一句话标题 + 恢复动作说明（后端 runtime_error 的唯一展示口径） */
+const RUNTIME_ERRORS = {
+  worker_missing: { title: "程序组件缺失", hint: "登录、拉活动和报名都依赖这个组件，它没跟着程序一起到位。请重新下载完整版本（单 EXE 或完整 ZIP 都内置组件），装好后点「重新检查」。" },
+  worker_permission: { title: "程序组件无法读取", hint: "组件文件在，但被系统拦住或没有权限（刚下载的文件常见）。右键程序 → 属性 → 勾「解除锁定」，或重新解压后再点「重新检查」。" },
+  spawn_failed: { title: "程序组件启动失败", hint: "组件在但没能启动。点「重新检查」再试一次；反复出现请重新下载完整版本。" },
+};
+
+function runtimeErrorCopy() {
+  return RUNTIME_ERRORS[S.runtime.error] || RUNTIME_ERRORS.spawn_failed;
 }
 
 function applyActivities(payload, quiet) {
@@ -199,16 +319,25 @@ function applyActivities(payload, quiet) {
     S.byId = new Map();
     S.selected.clear();
     S.listState = "error";
+    /* FB4：先消费后端的 runtime_error 再渲染——check 成功而 list 起不来时
+     * 组件横幅不能缺席；失败原话留给列表空态做唯一完整说明，不再生成
+     * 同义结果框，也不靠清空 result 去藏重复——真实业务结果原样保留 */
+    if (noteRoundError(res.runtime_error)) {
+      paintBanners();
+      updateControls();
+    }
+    S.listError = res.text || "";
     render();
-    const copy = listErrorCopy(res.text || "未知原因");
-    if (!quiet) setResult({ ok: false, title: copy.title, text: copy.text });
+    settleRefreshBranch("list");
     return;
   }
+  S.listError = "";
   S.items = (res.items || []).map(normalize);
   S.byId = new Map(S.items.map((item) => [String(item.id), item]));
   Array.from(S.selected).forEach((id) => { if (!S.byId.has(String(id))) S.selected.delete(id); });
   S.listState = "ready";
   render();
+  settleRefreshBranch("list");
 }
 
 function render() {
@@ -217,6 +346,7 @@ function render() {
   paintChips();
   paintRail();
   paintSelected();
+  paintBoardState();
   paintChecks();
   paintPlan();
   paintRoute();
@@ -224,6 +354,8 @@ function render() {
   updateControls();
   tick();
   paintLed();
+  /* 引导还开着时，列表重画可能挪动高亮目标：重新定位现有高亮，不重开、不假点击 */
+  if (S.tour.open && !S.tour.paused) paintTour();
 }
 
 /* ---------------------------------------------------------------- 时刻表 */
@@ -364,7 +496,7 @@ function rowHtml(item) {
 
 function stateCellHtml(item, state, leftText, armed) {
   const nextId = nextOpen().bestId;
-  if (armed) return '<span class="state-tag state-armed">' + esc(taskLabel(String(armed.status || "submitting"))) + "</span>";
+  if (armed) return '<span class="state-tag state-armed">' + esc(taskDisplayLabel(armed)) + "</span>";
   if (state === "waiting") {
     const isNext = String(item.id) === String(nextId);
     return "<span class=\"left" + (leftText !== "待公布" && parseLeft(item) <= 600 ? " is-soon" : "") + "\">" + esc(leftText) + "</span>" +
@@ -381,6 +513,25 @@ function parseLeft(item) {
   return left === null ? Infinity : left;
 }
 
+/* 空列表的登录四态 → 下一步。检查没结束时不许提前宣布有效；
+ * 结论缺失或无法判定一律按 unknown 处理——把「还不知道」说成
+ * 「登录是有效的」比说「暂时无法确认」更伤人。 */
+function loginEmptyState() {
+  if (S.login.checking) return "checking";
+  if (S.login.present === false || S.login.result === "none") return "none";
+  if (S.login.result === "expired") return "expired";
+  if (S.login.result === "valid") return "valid";
+  return "unknown";
+}
+
+/* 登录结论变化会影响空态文案（checking → valid/expired/unknown）。
+ * 有列表数据时空态走筛选/错误分支，与登录无关；骨架在场时也不插手。 */
+function refreshLoginEmptyState() {
+  if (S.items.length) return;
+  if (S.listState === "loading") return;
+  paintEmpty([]);
+}
+
 function paintEmpty(rows) {
   const empty = $("#empty");
   const title = $("#empty-title");
@@ -392,27 +543,71 @@ function paintEmpty(rows) {
   }
   empty.hidden = false;
   action.hidden = false;
-  if (S.login.present === false || S.login.result === "none") {
-    title.textContent = "登录后查看活动";
-    text.textContent = "点右上角「登录」，完成后点「刷新」。";
-    action.textContent = "刷新";
+  /* 动作意图每次渲染都写清楚：handler 只认这个键，
+   * 不按 items.length 猜（有缓存时的失败重试会被猜成清筛选）。 */
+  action.dataset.action = "refresh";
+  if (S.runtime.error) {
+    /* 缺组件不许显示成「登录后查看活动」：重登解决不了缺组件。
+     * 完整原因与恢复动作只在顶部横幅——这里只放未加载占位，
+     * 不复读长说明，也不重复恢复按钮。 */
+    title.textContent = "活动列表未加载";
+    text.textContent = "组件有问题，处理办法看页面顶部的提示。";
+    action.hidden = true;
     return;
   }
   if (S.listState === "error") {
-    const copy = listErrorCopy("");
+    /* 普通列表失败：完整原因与「重试」唯一归这里（用真实失败原话归因） */
+    const copy = listErrorCopy(S.listError || "");
     title.textContent = copy.title;
     text.textContent = copy.text;
     action.textContent = "重试";
     return;
   }
   if (S.items.length) {
+    /* 有数据但都被筛掉：只有这一种空态给「清除筛选」 */
     title.textContent = "没有符合筛选的活动";
     text.textContent = "一共 " + S.items.length + " 场，换个关键词，或清除筛选看完整列表。";
     action.textContent = "清除筛选";
+    action.dataset.action = "clear-filters";
     return;
   }
-  title.textContent = "这里还没有活动";
-  text.textContent = "点「刷新」拉一次；还没登录过就先点「登录」，提示登录态失效就先「重新登录」。";
+  if (S.listState !== "ready") {
+    /* 还没成功拉过一次（idle，或首屏加载中）：未知占位，
+     * 不能趁这时候说「学校没有活动」，也不能先让用户去登录 */
+    title.textContent = "还没拉到活动列表";
+    text.textContent = "点「刷新」拉一次；需要登录时，顶部会提示下一步。";
+    action.textContent = "刷新";
+    return;
+  }
+  /* 以下都是「学校成功返回了 0 场」：按登录状态给各自下一步 */
+  const login = loginEmptyState();
+  if (login === "checking") {
+    /* 校验还没回来：不提前说有效，也不逼用户重登 */
+    title.textContent = "正在检查登录态";
+    text.textContent = "正在核对已保存的登录，稍等一下；这段时间先不用重新登录。";
+    action.textContent = "刷新";
+    return;
+  }
+  if (login === "none") {
+    title.textContent = "登录后查看活动";
+    text.textContent = "点右上角「登录」，完成后点「刷新」。";
+    action.textContent = "刷新";
+    return;
+  }
+  if (login === "expired") {
+    title.textContent = "登录态失效，先重新登录";
+    text.textContent = "点右上角「重新登录」，完成后点「刷新」。";
+    action.textContent = "刷新";
+    return;
+  }
+  if (login === "unknown") {
+    title.textContent = "暂时无法确认登录态";
+    text.textContent = "请检查网络后点「刷新」。";
+    action.textContent = "刷新";
+    return;
+  }
+  title.textContent = "学校当前没有返回活动";
+  text.textContent = "登录是有效的，学校这次没有返回可报名活动；稍后点「刷新」再看。";
   action.textContent = "刷新";
 }
 
@@ -424,17 +619,166 @@ function paintCount(rows) {
 function paintRail() {
   /* 可报名指标排除已截止：与筛选、开始门禁同一份 isEligibleForPlan 口径 */
   const free = S.items.filter(isEligibleForPlan).length;
-  $("#metric-total").textContent = S.items.length ? String(S.items.length) : "—";
-  $("#metric-free").textContent = S.items.length ? String(free) : "—";
+  /* 已知零 ≠ 未知：成功返回过（或手里还有缓存快照）就写真实数字，
+   * 只有还没拉到时才用破折号，避免把「0 场」说成「还没获取」。 */
+  const countsKnown = S.listState === "ready" || S.items.length > 0;
+  $("#metric-total").textContent = countsKnown ? String(S.items.length) : "—";
+  $("#metric-free").textContent = countsKnown ? String(free) : "—";
   /* metric-next（LED 标注）统一由 paintLedLabel 维护，这里不再抢写 */
   let text = "先选活动，系统会检查举办时间冲突。";
   if (!S.busy && S.login.present === false) text = "完成登录后选活动。";
-  else if (S.busy && S.plan.id) text = "计划运行中 · 每场任务独立显示结果。";
+  else if (S.busy && S.plan.id) {
+    /* 大屏摘要与标题/LED/任务卡同一套阶段解释：等开放 / 准备提交 / 正在提交 */
+    const view = executionView();
+    text = view.phase === "submitting" ? "正在提交 " + view.count + " 场 · 每场任务独立显示结果。"
+      : view.phase === "arming" ? "已开放，正在准备提交。"
+      : view.phase === "waiting" ? "本批 " + view.count + " 场等开放 · 到点自动开始。"
+      : "计划运行中 · 每场任务独立显示结果。";
+  }
   else if (S.plan.status === "partial") text = "计划部分完成 · 失败的场次可以单独查看。";
   else if (S.plan.status === "completed") text = "计划已完成 · 建议去活动页确认一眼。";
   else if (S.plan.status === "stopped") text = "计划已停止 · 已提交的场次保留原状态。";
   else if (S.selected.size) text = "已选 " + S.selected.size + " 场 · 先看右侧冲突提示。";
   $("#rail-message").textContent = text;
+}
+
+/* ---------------------------------------------------------------- 运行目标 */
+/* 还能动的任务状态：只有这三种参与「当前目标、当前批次、倒计时」。
+ * 已取消/已成功/已报名/已失败是终态，不许再充当运行目标或剩余场次。 */
+const RUNNING_STATUSES = ["queued", "waiting", "submitting"];
+
+/* 任务 → 可显示项：列表项在就用真列表项；不在（被筛掉、刷新掉了、快照
+ * 先到）就用任务自带字段现构。缺字段显示未知，绝不回退到另一场活动。 */
+function taskDisplayItem(task) {
+  const found = findItem(task && task.activity_id);
+  if (found) return found;
+  if (!task) return null;
+  return {
+    id: String(task.activity_id || task.task_id || ""),
+    name: String(task.name || "这一场活动"),
+    sign_start: task.sign_start || "",
+    sign_end: task.sign_end || "",
+    act_start: task.act_start || "",
+    act_end: task.act_end || "",
+    place: task.place || "",
+    signed: false,
+    fromTask: true,
+  };
+}
+
+/* 工作状态 → 显示阶段（纯函数，只读真实时间与提交证据）。
+ * 后端在拉起 runner **之前**就把任务置 submitting，这也包含预报名开放前
+ * lead_s 秒打开活动页的预热（signup_plan.py 的 _run_one / _prepare_ts），
+ * 所以原始状态不能直接当「正在提交」说话：
+ *   preopen   还没到原定开放（哪怕 worker 已经在开页）
+ *   preparing 已开放，但还没有一次真正发起的提交
+ *   retrying  有真实提交且仍非终态（attempts 是唯一「已提交」证据）
+ *   terminal  终态，不参与运行目标
+ * 只影响展示，不写回 task.status、不改协调器与取消条件。 */
+function taskDisplayPhase(task, now) {
+  if (!task) return "terminal";
+  const status = String(task.status || "");
+  if (RUNNING_STATUSES.indexOf(status) < 0) return "terminal";
+  const attempts = Number(task.attempts);
+  if (Number.isFinite(attempts) && attempts > 0) return "retrying";
+  const at = Number.isFinite(now) ? now : Date.now() / 1000;
+  const open = toTs(task.sign_start);
+  /* 开放时间未知时只能「等」：不能因为算不出时间就说已经开放 */
+  if (open === null) return "preopen";
+  if (open > at) return "preopen";
+  return "preparing";
+}
+
+/* 任务卡的阶段标签：raw「等待开放」在已开放时是假话，按显示阶段改写 */
+function taskDisplayLabel(task) {
+  const phase = taskDisplayPhase(task);
+  if (phase === "preopen") return "等待开放";
+  if (phase === "preparing") return "准备报名";
+  if (phase === "retrying") return "提交中";
+  return taskLabel(String(task && task.status || "queued"));
+}
+
+/* 任务卡的模式前缀（混合计划每场标自己的模式）：taskHtml 与 tick 共用一份 */
+function taskModePrefix(task) {
+  const state = String(task && task.status || "queued");
+  const mode = String(task && (task.signup_mode || modeOf(task)));
+  return RUNNING_STATUSES.indexOf(state) >= 0 && modeText(mode) ? modeText(mode) + " · " : "";
+}
+
+/* 任务卡的说明行：与标题/LED 同一解释，tick 每秒复用同一份 */
+function taskDisplayDetail(task, now) {
+  const phase = taskDisplayPhase(task, now);
+  if (phase === "preopen") {
+    const open = toTs(task && task.sign_start);
+    return open === null ? "提前准备，开放时间待公布" : "提前准备，等到 " + fmtClock(open) + " 开放";
+  }
+  if (phase === "preparing") return "已开放，正在准备提交";
+  if (phase === "retrying") return submittingDetail(task);
+  return "";
+}
+
+/* 运行目标的唯一只读模型（标题、路线、LED、批次数共用一份）：
+ * 只读 S.plan.tasks 快照，不读也不改 S.selected——原勾选继续服务草稿与重开。
+ * phase: idle / preparing（还没任务）/ waiting（等开放）/ arming（已开放未提交）
+ *        / submitting（已有真实提交）/ settling（全终态、plan_done 未到）。
+ * 目标优先级：真实重试 > 已开放准备 > 未来预热；同阶段取更早的开放时刻，
+ * 并列时保持快照顺序。未运行时返回 idle，调用方回落到用户选择的预览态。 */
+function executionView() {
+  const empty = { phase: "idle", display: "idle", task: null, item: null,
+                  count: 0, openAt: null, retryUntil: null };
+  if (!S.busy || !S.plan.id) return empty;
+  const now = Date.now() / 1000;
+  const tasks = Array.from(S.plan.tasks.values());
+  const running = tasks.filter((task) => RUNNING_STATUSES.indexOf(String(task.status)) >= 0);
+  if (!running.length) {
+    /* 还没有任务 = 准备中；任务都结束但 plan_done 未到 = 汇总中。
+     * 两种情况都不许提前显示计划成功。 */
+    return Object.assign({}, empty, { phase: tasks.length ? "settling" : "preparing" });
+  }
+  /* 快照顺序做初值：并列时不会被排序打乱 */
+  const stages = running.map((task) => ({
+    task: task,
+    display: taskDisplayPhase(task, now),
+    at: toTs(task.sign_start),
+  }));
+  const earliest = (list) => {
+    let best = list[0];
+    let bestAt = best.at === null ? Infinity : best.at;
+    for (let i = 1; i < list.length; i += 1) {
+      const at = list[i].at === null ? Infinity : list[i].at;
+      if (at < bestAt) { best = list[i]; bestAt = at; }
+    }
+    return best;
+  };
+  const batchCount = (signStart) => running.filter(
+    (task) => String(task.sign_start || "") === String(signStart || "")).length;
+
+  const retrying = stages.filter((stage) => stage.display === "retrying");
+  if (retrying.length) {
+    /* 真正在提交：取真实重试截止最早的一场；未知截止排最后 */
+    let best = retrying[0];
+    let bestAt = effectiveRetryDeadline(best.task, now);
+    for (let i = 1; i < retrying.length; i += 1) {
+      const at = effectiveRetryDeadline(retrying[i].task, now);
+      if (at !== null && (bestAt === null || at < bestAt)) { best = retrying[i]; bestAt = at; }
+    }
+    return { phase: "submitting", display: "retrying", task: best.task,
+             item: taskDisplayItem(best.task), count: retrying.length,
+             openAt: null, retryUntil: bestAt };
+  }
+  const arming = stages.filter((stage) => stage.display === "preparing");
+  if (arming.length) {
+    /* 已开放但还没发起提交：说「准备报名」，不说「还在等开放」 */
+    const best = earliest(arming);
+    return { phase: "arming", display: "preparing", task: best.task,
+             item: taskDisplayItem(best.task), count: batchCount(best.task.sign_start),
+             openAt: best.at, retryUntil: null };
+  }
+  const preopen = stages.filter((stage) => stage.display === "preopen");
+  const best = earliest(preopen);
+  return { phase: "waiting", display: "preopen", task: best.task,
+           item: taskDisplayItem(best.task), count: batchCount(best.task.sign_start),
+           openAt: best.at, retryUntil: null };
 }
 
 function paintSelected() {
@@ -443,28 +787,62 @@ function paintSelected() {
   const boardText = $("#board-text");
   const items = selectedItems();
   const next = boardTargetItem();
-  const activeTask = Array.from(S.plan.tasks.values()).find((task) => ["waiting", "queued", "submitting"].indexOf(String(task.status)) >= 0);
-  const activeItem = activeTask ? (findItem(activeTask.activity_id) || items[0] || null) : null;
+  /* 运行中以 executionView() 为唯一目标：标题、路线、LED、批次数同源，
+   * 不再从原勾选集合里补位（取消的场次不能继续当目标）。 */
+  const view = executionView();
   box.className = "b-title";
   meta.innerHTML = "";
   boardText.textContent = "";
-  if (!S.busy && S.login.present === false) {
+  if (!S.busy && S.login.present === false && !S.runtime.error) {
     setBoardTag("首次使用", "off", true);
     box.textContent = "登录后开始";
     boardText.textContent = "活动会在登录完成后自动加载。";
     return;
   }
-  if (!S.busy && S.listState === "error" && !S.items.length) {
-    setBoardTag("需重试", "red", true);
-    box.textContent = "活动暂时没加载";
-    boardText.textContent = failHint("");
+  if (!S.busy && S.runtime.error && S.listState !== "ready") {
+    /* 组件问题只留短状态：完整原因与恢复动作在顶部横幅，不在大屏复读 */
+    setBoardTag("组件缺失", "red", true);
+    box.textContent = runtimeErrorCopy().title;
+    boardText.textContent = "处理办法看页面顶部的提示。";
     return;
   }
-  if (S.busy && activeItem) {
-    setBoardTag(String(activeTask.status) === "submitting" ? "正在提交" : "等开放", String(activeTask.status) === "submitting" ? "red" : "amber", true);
-    box.textContent = activeItem.name;
-    meta.innerHTML = boardMetaHtml(activeItem);
-    boardText.textContent = "计划运行中 · 每场任务独立显示结果。";
+  if (!S.busy && S.listState === "error" && !S.items.length) {
+    /* 列表失败只留短状态：完整原因与「重试」在列表空态 */
+    setBoardTag("需重试", "red", true);
+    box.textContent = "活动暂时没加载";
+    boardText.textContent = "具体原因看下面列表的提示。";
+    return;
+  }
+  if (!S.busy && S.listState === "loading" && !S.items.length) {
+    /* 列表还在拉：不得把「近期没有要开放的活动」当事实说出口 */
+    setBoardTag("加载中", "off", true);
+    box.textContent = "活动列表正在加载";
+    boardText.textContent = "正在拉取活动，先等这一次加载结束。";
+    return;
+  }
+  if (S.busy) {
+    /* 运行中：标题与批次数都来自同一个执行目标，单场结束不会把这里改成结论。
+     * 三个阶段分开说：等开放 ≠ 已开放待提交 ≠ 真正在提交。 */
+    if (view.phase === "submitting" || view.phase === "arming" || view.phase === "waiting") {
+      const tone = view.phase === "submitting" ? "red" : "amber";
+      const tag = view.phase === "submitting" ? "正在提交"
+        : view.phase === "arming" ? "准备报名" : "等开放";
+      setBoardTag(tag, tone, true);
+      box.textContent = view.item ? view.item.name : "这一场活动";
+      meta.innerHTML = view.item ? boardMetaHtml(view.item) : "";
+      boardText.textContent = view.phase === "submitting"
+        ? "正在提交 " + view.count + " 场 · 每场任务独立显示结果。"
+        : view.phase === "arming"
+          ? "已开放，正在准备 " + view.count + " 场 · 每场任务独立显示结果。"
+          : "本批 " + view.count + " 场待执行 · 每场任务独立显示结果。";
+      return;
+    }
+    /* 没有可执行任务、plan_done 还没到：准备中 / 正在汇总，不提前报成功 */
+    setBoardTag(view.phase === "settling" ? "汇总中" : "准备中", "amber", true);
+    box.textContent = view.phase === "settling" ? "正在汇总结果" : "正在准备报名";
+    boardText.textContent = view.phase === "settling"
+      ? "每一场都结束了，正在汇总这一轮的结果。"
+      : "计划已经接管，正在核对每一场的开放时间。";
     return;
   }
   if (!items.length) {
@@ -474,6 +852,17 @@ function paintSelected() {
       box.textContent = next.name;
       meta.innerHTML = boardMetaHtml(next);
       boardText.textContent = openNow ? "这场已经开放，现在可以选中后开始报名计划。" : "在下面的时刻表里选一场，它就会到这块屏上。";
+    } else if (S.listState === "ready" && !S.items.length) {
+      /* 学校成功返回 0 场：大屏只留一句短状态，完整原因在列表空态，不在这里复读 */
+      setBoardTag("暂时没有", "off", true);
+      box.textContent = "学校这次没有返回活动";
+      boardText.textContent = "稍后点「刷新」再看。";
+    } else if (S.listState === "ready") {
+      /* 列表里有活动，只是没有可执行目标（全已报名 / 全已截止 / 报名时间待公布）：
+       * 这不是「学校没返回」，数据仍在列表里，别替学校下结论。 */
+      setBoardTag("暂时没有", "off", true);
+      box.textContent = "没有可报名的场次";
+      boardText.textContent = "列表里的活动已报名、已截止或还没公布报名时间。";
     } else {
       setBoardTag("暂时没有", "off", true);
       box.textContent = "近期没有要开放的活动";
@@ -481,10 +870,7 @@ function paintSelected() {
     }
     return;
   }
-  const activeTasks = Array.from(S.plan.tasks.values()).filter((task) => ["waiting", "queued", "submitting"].indexOf(String(task.status)) >= 0);
-  if (S.busy && activeTasks.some((task) => String(task.status) === "submitting")) setBoardTag("正在提交", "red", true);
-  else if (S.busy) setBoardTag("等开放", "amber", true);
-  else if (S.plan.status === "completed") setBoardTag("报名成功", "green", true);
+  if (S.plan.status === "completed") setBoardTag("报名成功", "green", true);
   else if (S.plan.status === "partial") setBoardTag("部分完成", "amber", true);
   else if (S.plan.status === "stopped") setBoardTag("计划已停止", "off", true);
   else setBoardTag("报名计划", "amber", true);
@@ -499,7 +885,7 @@ function paintSelected() {
   if (items.length === 1) {
     box.textContent = items[0].name;
     meta.innerHTML = boardMetaHtml(items[0]);
-    boardText.textContent = S.busy ? "计划运行中 · 每场任务独立显示结果。" : "在下面的时刻表里确认活动，再开始报名计划。";
+    boardText.textContent = "在下面的时刻表里确认活动，再开始报名计划。";
   } else {
     box.textContent = "已选 " + items.length + " 场";
     meta.innerHTML = boardMetaHtml(items[0]);
@@ -514,6 +900,18 @@ function setBoardTag(text, tone, dot) {
   tag.dataset.tone = tone || "amber";
   tag.dataset.dot = dot === false ? "false" : "true";
   label.textContent = text;
+}
+
+/* 整屏视觉的显式状态：运行中/准备中保持运行色，只有计划级终态才整屏
+ * 绿/红/警示/中性；选择集合变了就回到未终结的常态（与 LED 同一口径）。 */
+function paintBoardState() {
+  const board = $("#board");
+  if (!board) return;
+  const terminal = ["completed", "failed", "partial", "stopped"].indexOf(String(S.plan.status)) >= 0;
+  let state = "idle";
+  if (S.busy) state = "running";
+  else if (terminal && S.plan.doneSelection === selectionSignature()) state = String(S.plan.status);
+  board.dataset.planState = state;
 }
 
 function boardMetaHtml(item) {
@@ -544,7 +942,8 @@ function paintBoardActions() {
     return;
   }
   actions.hidden = false;
-  const needLogin = S.login.present === false;
+  /* 缺组件时不给快捷登录入口（点了只会拿到结构化失败）；「刷新」可复查恢复 */
+  const needLogin = S.login.present === false && !S.runtime.error;
   const next = nextOpen().bestId ? findItem(nextOpen().bestId) : null;
   const showPick = !needLogin && !selectedItems().length && !!next;
   quickLogin.hidden = !needLogin;
@@ -629,7 +1028,9 @@ function paintPlan() {
 
   const tasksBox = $("#plan-tasks");
   const tasks = Array.from(S.plan.tasks.values());
-  tasksBox.innerHTML = tasks.length ? tasks.map(taskHtml).join("") : "";
+  /* 同一帧用同一个 now：不能让 map 的下标冒充时间参数 */
+  const now = Date.now() / 1000;
+  tasksBox.innerHTML = tasks.length ? tasks.map((task) => taskHtml(task, now)).join("") : "";
   paintCountdown();
 }
 
@@ -659,12 +1060,15 @@ function paintRoute() {
   const watchStarted = Number(task.watch_started_at) || null;
   const deadline = routeDeadline(task, open, now);
   const terminal = ["success", "already_signed", "failed", "canceled"].indexOf(String(task.status)) >= 0;
+  const deadlineKnown = deadline.time !== null;
   const stations = [
     { name: "本次启动", time: runStarted ? routeTime(runStarted) : "待启动", done: runStarted !== null },
     { name: "活动页已打开", time: pageOpened ? routeTime(pageOpened) : "待打开", done: pageOpened !== null },
     { name: "盯按钮", time: watchStarted ? routeTime(watchStarted) : "待发生", done: watchStarted !== null, hot: true },
     { name: "原定开放", time: routeTime(open), done: now >= open, hot: true },
-    { name: deadline.name, time: routeTime(deadline.time), done: terminal || now >= deadline.time },
+    /* 截止未知时显示「待定」，不能因为 null 参与比较而被标成已发生 */
+    { name: deadline.name, time: deadlineKnown ? routeTime(deadline.time) : "待定",
+      done: terminal || (deadlineKnown && now >= deadline.time) },
   ];
   const currentIndex = terminal ? stations.length : stations.findIndex((station) => !station.done);
   box.innerHTML = '<div class="route" style="--n:' + stations.length + '" aria-label="这次报名的时间点">' +
@@ -688,17 +1092,49 @@ function routeTime(ts) {
 }
 
 function routeTarget() {
-  const tasks = Array.from(S.plan.tasks.values());
-  const active = tasks.find((task) => ["waiting", "submitting", "queued"].indexOf(String(task.status)) >= 0);
-  if (active) {
-    const item = findItem(active.activity_id) || selectedItems()[0];
-    if (item) return { item, task: active };
-  }
-  return null;
+  /* 运行中用执行模型的任务；模型没给任务时再按状态兜底（不读原勾选集合） */
+  const view = executionView();
+  const task = view.task
+    || Array.from(S.plan.tasks.values()).find((item) => RUNNING_STATUSES.indexOf(String(item.status)) >= 0)
+    || null;
+  if (!task) return null;
+  const item = taskDisplayItem(task);
+  return item ? { item: item, task: task } : null;
 }
 
 function paintCountdown() {
   const countDown = $("#countdown");
+  const view = executionView();
+  if (S.busy && S.plan.id) {
+    /* 运行中只报当前执行目标：终态场次不参与倒计时和批次数（UX-04）。
+     * 已开放但还没真正提交时给「准备中」，不把预热当提交，也不编 0 秒。 */
+    if (view.phase === "submitting") {
+      countDown.classList.remove("is-hot");
+      countDown.textContent = view.retryUntil === null
+        ? "正在提交 " + view.count + " 场 · 等待结果"
+        : fmt(Math.max(0, view.retryUntil - Date.now() / 1000)) + " · 正在提交 " + view.count + " 场";
+      return;
+    }
+    if (view.phase === "arming") {
+      countDown.classList.remove("is-hot");
+      countDown.textContent = "已开放 · 准备提交 " + view.count + " 场";
+      return;
+    }
+    if (view.phase === "waiting") {
+      if (view.openAt === null) {
+        countDown.classList.remove("is-hot");
+        countDown.textContent = "时间待公布 · 本批 " + view.count + " 场待执行";
+        return;
+      }
+      const left = Math.floor(view.openAt - Date.now() / 1000);
+      countDown.classList.toggle("is-hot", left > 0 && left <= 10);
+      countDown.textContent = (left <= 0 ? "现在开放 · " : fmt(left) + " · ") + "本批 " + view.count + " 场待执行";
+      return;
+    }
+    countDown.classList.remove("is-hot");
+    countDown.textContent = view.phase === "settling" ? "正在汇总结果" : "正在准备";
+    return;
+  }
   const selected = selectedItems();
   if (!selected.length) {
     countDown.textContent = "待选";
@@ -750,28 +1186,41 @@ function paintLedLabel(prefix, value) {
 }
 
 function paintLed() {
+  const view = executionView();
   if (S.busy && S.plan.id) {
-    const tasks = Array.from(S.plan.tasks.values());
-    const submitting = tasks.filter((task) => String(task.status) === "submitting");
-    if (submitting.length) {
-      const end = retryDeadline(submitting[0]);
-      ledSet(fmtLed(Math.max(0, end - Date.now() / 1000)), "amber");
-      paintLedLabel("重试窗口到", fmtClock(end));
-      return;
-    }
-    const selected = selectedItems();
-    if (selected.length) {
-      const groups = groupSelected(selected);
-      const left = leftOf(groups[0].items[0]);
-      if (left !== null && left > 0) {
-        ledSet(fmtLed(left), left <= 10 ? "red" : "amber");
-        paintLedLabel("同时提交 " + groups[0].items.length + " 场，开放", fmtClock(Date.now() / 1000 + left));
+    if (view.phase === "submitting") {
+      if (view.retryUntil === null) {
+        /* 截止未知：点阵只有数字，不拿 00:00:00 冒充已到点 */
+        ledSet("--:--:--", "amber");
+        paintLedLabel("正在提交 " + view.count + " 场，重试截止", "待定");
         return;
       }
-      ledSet("00:00:00", "amber");
-      paintLedLabel("现在开放", null);
+      ledSet(fmtLed(Math.max(0, view.retryUntil - Date.now() / 1000)), "amber");
+      paintLedLabel("正在提交 " + view.count + " 场，重试截止", fmtClock(view.retryUntil));
       return;
     }
+    if (view.phase === "arming") {
+      /* 已开放、还没真正提交：不说「还剩 0 秒」，也不说「正在提交」 */
+      ledSet("--:--:--", "amber");
+      paintLedLabel("已开放，准备报名 " + view.count + " 场", "准备中");
+      return;
+    }
+    if (view.phase === "waiting") {
+      if (view.openAt === null) {
+        ledSet("--:--:--", "off");
+        paintLedLabel("本批 " + view.count + " 场待执行，开放", "待公布");
+        return;
+      }
+      const left = Math.floor(view.openAt - Date.now() / 1000);
+      ledSet(fmtLed(left), left <= 10 ? "red" : "amber");
+      /* 直接格式化真实开放时刻：不再用 now + 已取整 left 重拼，避免 1 秒偏差 */
+      paintLedLabel("本批 " + view.count + " 场待执行，开放", fmtClock(view.openAt));
+      return;
+    }
+    /* 准备中/汇总中：屏上不给假倒计时，也不提前点亮成功 */
+    ledSet("--:--:--", "off");
+    paintLedLabel("计划状态", view.phase === "settling" ? "汇总中" : "准备中");
+    return;
   }
   /* 终态结论（✓/✕/灭灯）留在屏上，直到选择集合发生变化；变化后回到预览倒计时 */
   const terminal = { completed: ["✓", "green"], failed: ["✕", "red"], stopped: ["--:--:--", "off"], partial: ["--:--:--", "off"] }[S.plan.status];
@@ -786,7 +1235,9 @@ function paintLed() {
     const left = leftOf(groups[0].items[0]);
     if (left !== null && left > 0) {
       ledSet(fmtLed(left), left <= 10 ? "red" : "dim");
-      paintLedLabel("最近所选开放", fmtClock(Date.now() / 1000 + left));
+      /* 预览与运行中同样读真实时刻，倒计时取整不能用来重拼开放时间 */
+      const open = toTs(groups[0].items[0].sign_start);
+      paintLedLabel("最近所选开放", open === null ? "待公布" : fmtClock(open));
       return;
     }
     if (left !== null) {
@@ -798,7 +1249,8 @@ function paintLed() {
   const next = nextOpen();
   if (next.best !== null) {
     ledSet(fmtLed(next.best), "dim");
-    paintLedLabel("最近开放", fmtClock(Date.now() / 1000 + next.best));
+    const open = toTs((S.byId.get(String(next.futureId)) || {}).sign_start);
+    paintLedLabel("最近开放", open === null ? "待公布" : fmtClock(open));
     return;
   }
   if (next.openNow) { ledSet("00:00:00", "dim"); paintLedLabel("有活动开放中", null); return; }
@@ -834,28 +1286,39 @@ function telemetryDeadline(task) {
 }
 
 /* 提交中任务行的说明文字：telemetry（第 N 次/最近原因/重试到）优先，
- * 没有 telemetry 才退回固定窗口估算。taskHtml 与每秒走字共用这一份口径。 */
+ * 没有 telemetry 才退回固定窗口估算。taskHtml 与每秒走字共用这一份口径。
+ * 截止可能未知（已开放又没有任何启动参考点）：说「等待结果」，不编 0 秒。 */
 function submittingDetail(task) {
   const parts = [];
   if (task.attempts) parts.push("第 " + task.attempts + " 次提交");
   if (task.last_reason) parts.push(task.last_reason);
   const deadline = telemetryDeadline(task);
-  if (deadline) parts.push("重试到 " + hm(deadline * 1000));
-  return parts.length ? parts.join(" · ") : "重试窗口约 " + fmt(Math.max(0, retryDeadline(task) - Date.now() / 1000));
+  if (deadline) {
+    parts.push("重试到 " + hm(deadline * 1000));
+    return parts.join(" · ");
+  }
+  const fallback = retryDeadline(task);
+  if (fallback === null) {
+    parts.push("等待提交结果");
+    return parts.join(" · ");
+  }
+  parts.push("重试窗口约 " + fmt(Math.max(0, fallback - Date.now() / 1000)));
+  return parts.join(" · ");
 }
 
-function taskHtml(task) {
+function taskHtml(task, now) {
   const state = String(task.status || "queued");
-  const label = taskLabel(state);
+  /* 标签与说明都按显示阶段改写：raw submitting 可能只是提前开页的预热 */
+  const label = taskDisplayLabel(task);
   const cls = taskClass(state);
   /* 混合计划每场显示自己的模式：快照带 signup_mode，旧载荷按时间现算 */
   const mode = String(task.signup_mode || modeOf(task));
-  const modePrefix = ["queued", "waiting", "submitting"].indexOf(state) >= 0 && modeText(mode)
-    ? modeText(mode) + " · " : "";
-  let detail = task.reason || task.detail || (state === "waiting" ? (mode === "pre_register" ? "等待报名开放" : "报名已开放，马上开始") : "");
-  if (state === "submitting") {
-    /* 有 telemetry 就显示第 N 次提交与最近原因，而不是虚构的固定窗口 */
-    detail = submittingDetail(task);
+  const modePrefix = taskModePrefix(task);
+  let detail = task.reason || task.detail || "";
+  if (RUNNING_STATUSES.indexOf(state) >= 0) {
+    /* 等待 / 准备 / 提交共用一份解释；typing 的等待文案只在没有阶段说明时兜底 */
+    detail = taskDisplayDetail(task, now)
+      || (state === "waiting" ? (mode === "pre_register" ? "等待报名开放" : "报名已开放，马上开始") : detail);
   } else if (["failed", "canceled"].indexOf(state) >= 0) {
     const bits = [];
     if (task.attempts) bits.push("提交了 " + task.attempts + " 次");
@@ -868,20 +1331,36 @@ function taskHtml(task) {
 }
 
 /* 统一的有效重试截止（路线图、任务卡、LED、终态文案共用唯一来源）：
- * 优先 worker telemetry 的真实截止（epoch 秒）；没有再按任务推导——
- * 未开放场次从 sign_start 起算，已开放场次从 run_started_at/submitSeen 起算，
- * 用任务携带的 retry_for_s（0=直到报名截止，缺 sign_end 回退 120 秒），
- * sign_end 永远截断。不再固定回退「+120 秒」冒充长策略。 */
+ * 优先 worker telemetry 的真实截止（epoch 秒）；没有再按任务推导。
+ *
+ * 推导锚点必须**不随墙钟跨过开放时刻而切换**。worker 的 retry_anchor()
+ * 在 page.goto 之前取一次 max(原定开放, 启动时刻) 之后就钉死（grab.py），
+ * 界面若按「open 还在未来就用 open，否则改用启动点」逐帧重算，会在开放那一秒
+ * 把截止倒退 lead_s——预报名提前 100 秒开页，就会提前 100 秒归零。
+ * 因此：有真实启动参考点时锚点固定为 max(原定开放, 启动点)；缺 open 只用启动点；
+ * 只有「未来场且还没启动」才拿原定开放当计划参考。
+ *
+ * 「直到报名截止」且 sign_end 已知时，截止就是 sign_end，与启动点/开放点无关——
+ * 排队中或快照字段还没齐时正会出现「有绝对截止、没有启动参考点」，这时不能判未知。
+ *
+ * 返回 null = 既没有绝对截止、也没有任何时间参考：调用方显示未知/预计，
+ * 不拿当前时刻冒充 0 秒。缺 sign_end 的 0 时长回退 120 秒、sign_end 硬截断都保留。
+ * 这里只算界面参考点，worker 的实际停止时机仍由后端决定。 */
 function effectiveRetryDeadline(task, fallbackNow) {
   const telemetry = telemetryDeadline(task);
   if (telemetry !== null) return telemetry;
   const now = Number.isFinite(fallbackNow) ? fallbackNow : Date.now() / 1000;
   const retryFor = task && Number.isFinite(Number(task.retry_for_s)) ? Number(task.retry_for_s) : RETRY_WINDOW_S;
   const signEnd = task ? toTs(task.sign_end) : null;
+  /* 绝对截止不依赖任何起点：先把这条独立路径处理掉，别被 anchor 判空挡住 */
+  if (!(retryFor > 0) && signEnd !== null) return signEnd;
   const started = Number(task && task.run_started_at) || Number(task && task.submitSeen) / 1000 || null;
   const open = toTs(task && task.sign_start);
-  const retryStart = open !== null && open > now ? open : (started || now);
-  let deadline = retryFor > 0 ? retryStart + retryFor : (signEnd !== null ? signEnd : retryStart + RETRY_WINDOW_S);
+  let anchor = null;
+  if (started !== null) anchor = open !== null ? Math.max(open, started) : started;
+  else if (open !== null && open > now) anchor = open;
+  if (anchor === null) return null;
+  let deadline = retryFor > 0 ? anchor + retryFor : anchor + RETRY_WINDOW_S;
   if (signEnd !== null) deadline = Math.min(deadline, signEnd);
   return deadline;
 }
@@ -892,17 +1371,24 @@ function retryDeadline(task) {
 }
 
 function updateControls() {
-  $("#btn-login").disabled = S.busy;
+  const componentDown = !!S.runtime.error;
+  /* 缺组件：登录/开始都禁用（点了也是结构化失败）；刷新保持可用——复查组件并恢复的唯一通道 */
+  $("#btn-login").disabled = S.busy || componentDown;
   $("#btn-refresh").disabled = S.listState === "loading";
+  /* 「更多」按钮本身任何状态可用；只有两处「重看引导」在计划运行中禁用（按钮上有可见原因） */
+  paintReplayButtons();
   const validation = validateSelection();
   /* 开始门禁：真实计划只在学校接口确认登录有效（valid）后可点；
    * checking/unknown/none/expired 一律禁用（demo 模式例外，供视觉演示）。
    * checking 必须显式排除：新一轮检查开始时不清旧 result，
    * 不排除的话上次 valid 会放行尚未确认的检查期。 */
   const loginReady = !!S.demo || (!S.login.checking && S.login.result === "valid");
-  const canStart = !S.busy && loginReady && S.selected.size > 0 && validation.errors.length === 0 && validation.conflicts.length === 0 && S.listState === "ready";
+  const canStart = !S.busy && !S.starting && !componentDown && loginReady && S.selected.size > 0
+    && validation.errors.length === 0 && validation.conflicts.length === 0
+    && S.listState === "ready";
   $("#btn-plan").disabled = !canStart;
-  $("#btn-plan").textContent = S.busy ? "计划运行中" : "开始报名计划";
+  $("#btn-plan").textContent = S.busy ? "计划运行中"
+    : (S.starting ? "正在提交…" : "开始报名计划");
   $("#btn-stop").disabled = !S.busy || !S.plan.id || S.stopping;
   $("#btn-stop").textContent = S.stopping ? "正在停止…" : "停止";
   $("#btn-clear-plan").disabled = S.busy || (!S.selected.size && !S.plan.tasks.size);
@@ -917,6 +1403,13 @@ function updateControls() {
 /* ---------------------------------------------------------------- 横幅 */
 function paintBanners() {
   const parts = [];
+  if (S.runtime.error) {
+    /* 组件问题只挂一条横幅（一个主要提示 + 恢复动作），不在满屏重复 */
+    const copy = runtimeErrorCopy();
+    parts.push('<div class="banner" data-tone="bad" role="alert"><span class="grow"><b>' + esc(copy.title) + "。</b>" +
+      esc(copy.hint) + "</span>" +
+      '<button class="btn btn-ghost" type="button" data-act="runtime-refresh">重新检查</button></div>');
+  }
   if (!S.online) {
     parts.push('<div class="banner" data-tone="bad" role="alert"><span class="grow"><b>网络断开了。</b>' +
       (S.busy ? "到点时还没恢复，这次报名会失败。恢复以后看一眼计划结果。" : "恢复以后点「刷新」。") + "</span></div>");
@@ -931,7 +1424,7 @@ function paintBanners() {
 
 /* ---------------------------------------------------------------- 动作 */
 function startPlan() {
-  if (S.busy) return;
+  if (S.busy || S.starting) return;
   const validation = validateSelection();
   if (!S.selected.size) {
     setResult({ ok: false, title: "还没选活动", text: "在时刻表勾选至少一场未报名活动。" });
@@ -955,10 +1448,23 @@ function startPlan() {
     signup_mode: modeOf(item),
   }));
   setResult(null);
+  /* FB1 轻量提交中标志：只做即时按钮反馈（连点不会创建第二套提交——后端
+   * 最终接纳点的原子重检是最终权威），成功/拒绝/reject 均释放 */
+  S.starting = true;
+  updateControls();
   api("start_plan", items, $("#headed").checked,
       { retry_for_s: S.retryPolicy.retry_for_s, max_attempts: S.retryPolicy.max_attempts }).then((res) => {
+    S.starting = false;
     if (!res || res.ok === false) {
       setBusy(false);
+      if (res && res.error && RUNTIME_ERRORS[res.error]) {
+        /* FB4：开始计划的组件失败同样只挂横幅与唯一恢复入口，
+         * 不生成同义失败结果框；并计入本轮刷新故障累计（迟到成功不得撤） */
+        noteRoundError(res.error);
+        paintBanners();
+        updateControls();
+        return;
+      }
       showPlanError(res && res.text, res && res.conflicts, res && res.errors);
       return;
     }
@@ -979,7 +1485,9 @@ function startPlan() {
     addLog("已安排 " + items.length + " 场活动：" + (parts.join("，") || "按各场状态执行") + "。");
     render();
   }).catch((err) => {
+    S.starting = false;
     setBusy(false);
+    updateControls();
     setResult({ ok: false, title: "计划没能开始", text: msg(err) });
   });
 }
@@ -1028,7 +1536,19 @@ function doLogin() {
   addLog("正在打开登录窗口，在弹出的 Chrome 里登完再回来…");
   api("login").then((res) => {
     if (!res || res.ok === false) {
+      if (res && res.error && RUNTIME_ERRORS[res.error]) {
+        /* FB4：登录的同步组件失败只挂横幅与唯一恢复入口，
+         * 不再生成「登录没能开始」同义结果框；同时计入本轮刷新故障累计——
+         * 刷新尚有分支未返回时，迟到的成功 check/list 不得撤掉这个新横幅 */
+        noteRoundError(res.error);
+        setBusy(false);
+        paintBanners();
+        updateControls();
+        return;
+      }
       setBusy(false);
+      paintBanners();
+      updateControls();
       setResult({ ok: false, title: "登录没能开始", text: (res && res.text) || "再点一次「登录」试试。" });
     }
   }).catch((err) => {
@@ -1043,9 +1563,10 @@ function handleDone(payload) {
   if (data.kind === "login") {
     setBusy(false);
     if (data.ok) {
-      setLogin(null, true, true);
-      /* 登录只看退出码；成功后界面自己刷新列表（契约） */
-      setResult({ ok: true, title: "登录好了", text: "大约 17 小时内有效，约到 " + expiryText() + "。活动列表正在刷新。", autoClose: Date.now() + 6000 });
+      /* 登录成功=新会话已保存：旧锚点立即作废（清掉），紧接着的校验事件会带
+       * 新锚点回来；这两秒里宁可显示未知，也不能拿旧凭证的剩余时间充数。 */
+      setLogin(null, true, true, { estimated_expires_at: null, saved_at: null });
+      setResult({ ok: true, title: "登录好了", text: "剩余时间正在重新核对（以学校校验为准），活动列表正在刷新。", autoClose: Date.now() + 6000 });
       doCheck();
       refresh(true);
     } else {
@@ -1157,17 +1678,28 @@ function restartStoppedPlan() {
 
 function showTaskResult(task) {
   const name = task.name || "这一场活动";
-  if (task.status === "success") setResult({ ok: true, title: "报名成功：" + name, text: "建议去活动页确认一眼。" });
-  else if (task.status === "already_signed") setResult({ ok: "partial", title: "已经报过：" + name, text: "这场保留为已报名，其他场次继续。" });
-  else if (task.status === "canceled") setResult({ ok: "partial", title: "已取消：" + name, text: "其他场次继续按计划处理。" });
-  else {
+  /* 计划还在跑时，单场终态只更新任务卡与运行记录：结果框和整屏留给
+   * handlePlanDone 的计划级结论（单场成功不得抢写全局成功，UX-05）。 */
+  const planLive = !!S.busy;
+  if (task.status === "success") {
+    addLog("[OK] 报名成功：" + name);
+    if (!planLive) setResult({ ok: true, title: "报名成功：" + name, text: "建议去活动页确认一眼。" });
+  } else if (task.status === "already_signed") {
+    addLog("[i] 已经报过：" + name);
+    if (!planLive) setResult({ ok: "partial", title: "已经报过：" + name, text: "这场保留为已报名，其他场次继续。" });
+  } else if (task.status === "canceled") {
+    addLog("[i] 已取消：" + name);
+    if (!planLive) setResult({ ok: "partial", title: "已取消：" + name, text: "其他场次继续按计划处理。" });
+  } else {
     /* 终态文案 = 归因建议 + 学校原话 + 到达的停止条件（时长/次数/截止） */
     const bits = [grabHint(task.reason), "原话：" + cleanReason(task.reason)];
     const stopNote = stopReasonText(task.stop_reason);
     if (stopNote && task.stop_reason !== "process_error") bits.push(stopNote);
-    setResult({ ok: false, title: "没抢到：" + name, text: bits.join(" ") });
+    addLog("[X] 没抢到：" + name + " · " + cleanReason(task.reason));
+    if (!planLive) setResult({ ok: false, title: "没抢到：" + name, text: bits.join(" ") });
     /* 失败后顺手复查一次登录态和列表：掉了登录的页面只会看到按钮不出现，
-     * 复查能把这个真原因翻到登录胶囊上。只查状态，不改写已出的结论。 */
+     * 复查能把这个真原因翻到登录胶囊上。只查状态，不改写已出的结论。
+     * 计划还在跑也要查——不能因为改成「只更新单场反馈」就把这条副作用丢掉。 */
     if (!S.recheckPending) {
       S.recheckPending = true;
       setTimeout(() => { S.recheckPending = false; refresh(true); }, 400);
@@ -1175,31 +1707,52 @@ function showTaskResult(task) {
   }
 }
 
-function setLogin(hours, ok, present) {
+function setLogin(hours, ok, present, anchor) {
   S.login.hours = numOrNull(hours);
   S.login.ok = ok;
   /* present 是后端 session_present 的回声：false=从没登录过，true=登录过。
    * 不传（undefined）表示这次事件没说，保留上一次的判断。 */
   if (present !== undefined) S.login.present = !!present;
-  /* 按当前时刻估算到期时间，只用于提醒，不参与判断 */
-  S.login.expireAt = S.login.hours === null ? null : Date.now() + S.login.hours * 3600000;
+  /* 估算锚点（绝对时刻）：bootstrap.login / check 事件 / 登录完成后都带同一来源的
+   * estimated_expires_at（epoch 秒）。收到就整份替换（重新登录=新锚点），
+   * 显式 null 且本机无会话时清掉旧锚点；事件没带（undefined）保持现状。
+   * 绝不按「本次收到事件的时刻 + hours」重算——那会把每次刷新都变成续期。 */
+  if (anchor && typeof anchor === "object" && "estimated_expires_at" in anchor) {
+    const at = numOrNull(anchor.estimated_expires_at);
+    S.login.expireAt = at === null ? null : at * 1000;   /* 统一存 epoch 毫秒 */
+    if (at === null) S.login.savedAt = null;
+    else if (anchor.saved_at) S.login.savedAt = anchor.saved_at;
+  }
   paintLogin();
   if (document.body) {
     paintRail();
     paintSelected();
     paintBoardActions();
+    /* 后到的校验结论要能把空态从「正在检查」改成真实状态 */
+    refreshLoginEmptyState();
   }
+}
+
+/* 当前凭证剩余小时：只从绝对锚点按 Date.now 推；没有锚点返回事件带回的静态值，
+ * 两者都没有返回 null（未知，不编 17 小时）。 */
+function loginHoursLeft() {
+  if (S.login.expireAt !== null && S.login.expireAt !== undefined) {
+    return (S.login.expireAt - Date.now()) / 3600000;
+  }
+  return S.login.hours;
 }
 
 function expiryText() {
   const at = S.login.expireAt;
-  return at === null ? "约 17 小时后" : "约到 " + whenText(at);
+  return at ? "约到 " + whenText(at) : "未知（以学校校验为准）";
 }
 
 function paintLogin() {
   const pill = $("#pill");
   const detail = $("#status-detail");
-  const h = S.login.hours;
+  /* 显示用的剩余小时每次按锚点现算：胶囊里的「约剩」随每秒走字递减，
+   * 不再用事件带回的静态小时数。 */
+  const h = loginHoursLeft();
   const ok = S.login.ok;
   let cls = "pill";
   let text = "未登录";
@@ -1228,6 +1781,13 @@ function paintLogin() {
     text = "暂时无法确认登录态";
     note = "网络或学校接口没应答；点「刷新」再试一次，暂时不用重新登录";
     state = "unknown";
+  } else if (S.login.result === "valid" && typeof h === "number" && h <= 0) {
+    /* 学校校验有效但估算已到点：仍显示有效，估算只作提醒，不得显示成失效 */
+    cls += " is-ok";
+    text = "登录有效";
+    sub = "估算已到点，以学校校验为准";
+    note = "已复用本机登录态；估算时间只是提醒，不代表失效";
+    state = "ok";
   } else if ((ok === false || (typeof h === "number" && h <= 0))
              && S.login.present !== false) {
     /* 登录过且确认失败/过期，才叫登录态失效；hours_left=0 单独出现
@@ -1274,6 +1834,9 @@ function paintLogin() {
 
 function setBusy(busy) {
   S.busy = !!busy;
+  /* 计划开跑先暂停引导（运行状态优先），收尾后从原步骤继续 */
+  if (S.busy && S.tour.open && !S.tour.paused) tourPauseNow();
+  if (!S.busy && S.tour.paused) tourResumeNow();
   paintLogin();
   updateControls();
 }
@@ -1368,19 +1931,53 @@ function toggleClockPop() {
   } else {
     html = "<h4>还没和学校对过时间</h4><p>登录有效时，「刷新」会顺带和学校服务器对一次时间。</p>";
   }
-  const expireAt = S.login.expireAt;
-  if (expireAt !== null) {
-    html += '<dl class="kv"><dt>登录约到</dt><dd>' + esc(whenText(expireAt)) + "</dd></dl>";
+  /* 生命周期提示（bootstrap.lifecycle）：上一周期结束到本次启动的固定离线间隔。
+   * abnormal 只有存活参考点可依，必须带「约」；未知不编时间。这些只是提示，
+   * 登录主状态仍按四态口径渲染。 */
+  const life = S.lifecycle || {};
+  const lifeRows = [];
+  if (typeof life.closed_for_s === "number") {
+    const approx = life.close_quality === "abnormal" ? "约 " : "";
+    lifeRows.push(["上次关闭后离线", approx + durText(life.closed_for_s) +
+                   "（" + (life.close_quality === "abnormal" ? "按最后存活时刻估算，上次未正常退出" : "从上次正常关闭到本次启动") + "）"]);
+  } else if (life.close_quality === "unknown" && life.last_heartbeat_at) {
+    lifeRows.push(["上次关闭后离线", "未知（上次没正常退出，时间对不上）"]);
+  }
+  /* 当前凭证的预计剩余与胶囊同源（S.login 锚点）：重新登录后这里跟着换新值，
+   * 不再读 bootstrap 时冻结的生命周期快照。锚点缺失显示未知，不编 17 小时。 */
+  if (S.login.present !== false) {
+    const anchor = S.login.expireAt;
+    lifeRows.push(["登录预计还剩", anchor
+      ? '<span id="clock-pop-left"></span>'
+      : "未知（以学校校验为准）"]);
+  }
+  if (lifeRows.length) {
+    /* 行值由代码生成（含倒计时 span 占位），不含用户输入，不再整体转义 */
+    html += '<dl class="kv">' + lifeRows.map((row) =>
+      "<dt>" + esc(row[0]) + "</dt><dd>" + row[1] + "</dd>").join("") + "</dl>";
   }
   html += '<div class="acts"><button class="btn btn-line" type="button" id="clock-pop-close">关闭</button></div>';
   pop.innerHTML = html;
   pop.hidden = false;
+  paintClockPopLeft();
   /* 浮层贴在顶栏时钟下方，不出视口 */
   const rect = $("#clock").getBoundingClientRect();
   pop.style.top = Math.round(rect.bottom + 8) + "px";
   pop.style.left = Math.round(Math.max(12, Math.min(window.innerWidth - pop.offsetWidth - 12, rect.right - pop.offsetWidth))) + "px";
   const closeBtn = pop.querySelector("#clock-pop-close");
   if (closeBtn) closeBtn.addEventListener("click", closeClockPop);
+}
+
+/* 浮层里的「登录预计还剩」随每秒走字递减：打开时与 tick() 都会重写这一个 dd。 */
+function paintClockPopLeft() {
+  const cell = document.querySelector("#clock-pop-left");
+  if (!cell) return;
+  const anchor = S.login.expireAt;
+  if (!anchor) { cell.textContent = "未知（以学校校验为准）"; return; }
+  const leftS = (anchor - Date.now()) / 1000;
+  cell.textContent = leftS > 0
+    ? "约 " + durText(leftS) + "（估算，以学校校验为准）"
+    : "估算已到点，以学校校验为准";
 }
 
 function setLogOpen(open, silent) {
@@ -1418,8 +2015,64 @@ function fillHelp(help) {
 
 function showHelp() {
   const dialog = $("#help");
+  const more = $("#settings");
+  /* 两个弹窗职责不同，但都是原生模态：不能叠着开 */
+  if (more && more.open) more.close();
   if (!dialog.open) dialog.showModal();
   savePrefs({ welcome_seen: true });
+}
+
+function showSettings() {
+  /* 「更多」入口任何状态都可用：未登录、出错、计划运行中都要能打开（只读动作不受忙限制） */
+  const dialog = $("#settings");
+  const help = $("#help");
+  if (help && help.open) help.close();
+  settingsStatus("");          /* 每次打开都从干净状态开始，不带上一轮的错误 */
+  if (dialog && !dialog.open) dialog.showModal();
+}
+
+/* 「更多」的局部反馈：只在这个弹窗里说下一步，不去复读到大屏或结果框。
+ * 长地址/错误原话做成可选文本，不在 WebView 里导航。 */
+function settingsStatus(text, tone) {
+  const box = $("#settings-status");
+  if (!box) return;
+  if (!text) {
+    box.hidden = true;
+    box.textContent = "";
+    return;
+  }
+  box.hidden = false;
+  box.dataset.tone = tone || "warn";
+  box.textContent = text;
+}
+
+/* 说明与「更多」两处重播共用这一条路径：先确认非忙，再关当前弹窗、
+ * 把焦点还给对应顶栏入口（退出引导时正好回到这里），最后进第 1 步。
+ * 不复制教程长文，也不在弹窗还开着时叠一层遮罩。 */
+function replayTourFrom(dialogSelector, openerSelector) {
+  if (S.busy) {
+    addLog("[i] 计划运行中：计划结束后再重看引导");
+    return false;
+  }
+  const dialog = $(dialogSelector);
+  if (dialog && dialog.open) dialog.close();
+  const opener = $(openerSelector);
+  if (opener) {
+    try { opener.focus(); } catch (err) { /* 元素不可聚焦就算了，不挡住重播 */ }
+  }
+  startTour(0);
+  return true;
+}
+
+/* 忙时两处重播都禁用，并把原因写在按钮上——不只靠 title 提示 */
+function paintReplayButtons() {
+  [["#btn-settings-tour", "重看引导"], ["#btn-help-tour", "重看引导"]].forEach((pair) => {
+    const btn = $(pair[0]);
+    if (!btn) return;
+    btn.disabled = !!S.busy;
+    btn.textContent = S.busy ? "计划结束后可重看引导" : pair[1];
+    btn.title = S.busy ? "计划结束后可重看引导" : "重新看一遍六步引导";
+  });
 }
 
 function savePrefs(patch) {
@@ -1431,6 +2084,16 @@ function savePrefs(patch) {
     S.savePending = {};
     if (hasBridge()) api("save_prefs", pending).catch(() => {});
   }, 250);
+}
+
+function savePrefsNow(patch) {
+  /* 引导完成/跳过这类不能因关窗丢失的状态：立即落盘，不等 250ms 防抖 */
+  Object.assign(S.prefs, patch || {});
+  Object.assign(S.savePending, patch || {});
+  clearTimeout(S.saveTimer);
+  const pending = S.savePending;
+  S.savePending = {};
+  if (hasBridge()) api("save_prefs", pending).catch(() => {});
 }
 
 function findItem(id) { return S.byId.get(String(id)) || null; }
@@ -1732,6 +2395,9 @@ function stateOf(item) {
   if (state.indexOf("已截止") >= 0 || state === "closed") return "closed";
   const end = toTs(item.sign_end);
   if (end !== null && end < Date.now() / 1000) return "closed";
+  /* 开放时间已知时随墙钟换组，不能一直沿用上次拉列表时的「未开放」文本 */
+  const open = toTs(item.sign_start);
+  if (open !== null) return open > Date.now() / 1000 ? "waiting" : "open";
   if (state.indexOf("开放中") >= 0 || state === "open") return "open";
   if (state.indexOf("未开放") >= 0 || state === "waiting") return "waiting";
   const left = leftOf(item);
@@ -1783,6 +2449,9 @@ function tick() {
   }
   const clock = $("#clock-time");
   if (clock) clock.textContent = new Date().toTimeString().slice(0, 8);
+  /* 登录剩余按绝对锚点走字：胶囊「约剩」与打开中的时钟浮层每秒重算显示 */
+  paintLogin();
+  paintClockPopLeft();
   /* 某一行跨过边界（开放了、截止了）才整表重画；平时只改倒计时文字 */
   let dirty = false;
   S.rowStates.forEach((state, id) => {
@@ -1806,16 +2475,30 @@ function tick() {
   }
   const nowChip = document.querySelector("#rows [data-now]");
   if (nowChip) nowChip.textContent = hm(nowMs);
+  /* 阶段在秒与秒之间会变（开放那一刻、第一次真实提交）：变了才重画摘要，
+   * 让标题与批次说法跟 LED/任务卡同步，不必每秒重建整块标题区。 */
+  const runPhase = S.busy ? executionView().phase : null;
+  if (runPhase !== S.lastRunPhase) {
+    S.lastRunPhase = runPhase;
+    paintSelected();
+  }
   paintRail();
   paintCountdown();
   paintLed();
   paintRoute();
-  /* 提交中的任务行：每秒走字（与 taskHtml 同一份 telemetry 口径） */
+  /* 未终态任务行：每秒按同一份阶段解释走字。
+   * 开放那一刻 preopen→preparing 时，标签与说明必须跟着改，
+   * 不能初次渲染正确、下一秒又被原始 submitting 文案盖回去。 */
   if (S.plan.tasks.size) {
+    const now = Date.now() / 1000;
     S.plan.tasks.forEach((task) => {
-      if (String(task.status) !== "submitting") return;
-      const row = document.querySelector('.task-row[data-task-id="' + cssEscape(String(task.task_id)) + '"] .task-detail');
-      if (row) row.textContent = submittingDetail(task);
+      if (RUNNING_STATUSES.indexOf(String(task.status)) < 0) return;
+      const row = document.querySelector('.task-row[data-task-id="' + cssEscape(String(task.task_id)) + '"]');
+      if (!row) return;
+      const detail = row.querySelector(".task-detail");
+      if (detail) detail.textContent = taskModePrefix(task) + taskDisplayDetail(task, now);
+      const label = row.querySelector(".task-state");
+      if (label) label.textContent = taskDisplayLabel(task);
     });
   }
 }
@@ -1855,6 +2538,11 @@ function failHint(text) {
 }
 
 function listErrorCopy(raw) {
+  /* 组件问题优先：缺组件时列表失败不许被翻译成「先登录/重新登录」 */
+  if (S.runtime.error) {
+    const copy = runtimeErrorCopy();
+    return { title: copy.title, text: copy.hint };
+  }
   const text = failHint(raw);
   if (S.login.present === false || S.login.result === "none") return { title: "还没登录", text };
   if (S.login.result === "expired") return { title: "登录已过期", text };
@@ -1951,16 +2639,153 @@ function cssEscape(value) {
   return String(value).replace(/(["\\])/g, "\\$1");
 }
 
+/* ---------------------------------------------------------------- 六步可重播引导 */
+/* 引导「可见」= 遮罩在场且没被计划运行暂停：只有可见时才约束键盘焦点 */
+function tourVisible() {
+  const box = $("#tour");
+  return !!(S.tour.open && !S.tour.paused && box && !box.hidden);
+}
+
+function tourShouldAutoStart() {
+  /* 只按内容版本判定：看过本版（tour_version >= TOUR_VERSION）就不再自动弹。
+   * 完成/跳过时间戳只描述「当时那一版」，不得挡住更新的内容版本；
+   * 软件版本（VERSION/1.1.0 等）变化与 TOUR_VERSION 无关。 */
+  const seen = Number(S.prefs.tour_version);
+  if (Number.isFinite(seen) && seen >= TOUR_VERSION) return false;
+  return !S.busy;
+}
+
+function startTour(at) {
+  if (S.busy) return;                 /* 计划运行中优先，引导不启动 */
+  /* 记住引导开始前焦点在哪，关闭/跳过/完成后还回去（元素还在页面上才还） */
+  const prev = document.activeElement;
+  S.tour.restoreFocus = (prev && prev !== document.body) ? prev : null;
+  S.tour.open = true;
+  S.tour.paused = false;
+  S.tour.step = Math.max(0, Math.min(Number(at) || 0, TOUR_STEPS.length - 1));
+  $("#tour").hidden = false;
+  paintTour();
+  const nextBtn = $("#tour-next");
+  if (nextBtn) nextBtn.focus();       /* 键盘焦点留在引导卡片里 */
+}
+
+/* 引导可见时的键盘约束：Tab/Shift+Tab 在卡片按钮间循环。
+ * 返回 true = 已处理（调用方直接 return），按钮清单与 aria-modal 声明一致。 */
+function tourTrapTab(event) {
+  event.preventDefault();
+  const buttons = ["#tour-skip", "#tour-prev", "#tour-next"]
+    .map((sel) => $(sel)).filter((el) => el && !el.disabled);
+  if (!buttons.length) return true;
+  const idx = buttons.indexOf(document.activeElement);
+  if (idx < 0) {
+    buttons[event.shiftKey ? buttons.length - 1 : 0].focus();
+    return true;
+  }
+  const dir = event.shiftKey ? -1 : 1;
+  buttons[(idx + dir + buttons.length) % buttons.length].focus();
+  return true;
+}
+
+function tourClose(finished) {
+  S.tour.open = false;
+  S.tour.paused = false;
+  $("#tour").hidden = true;
+  const back = S.tour.restoreFocus || null;
+  S.tour.restoreFocus = null;
+  if (back && document.body && document.body.contains(back)) {
+    try { back.focus(); } catch (err) { /* 元素已不可聚焦就算了 */ }
+  }
+  if (finished) savePrefsNow({ tour_version: TOUR_VERSION, tour_completed_at: new Date().toISOString() });
+}
+
+function tourSkip() {
+  /* 跳过=本版不再自动弹；说明页的「重新看一遍引导」随时可以重播 */
+  savePrefsNow({ tour_version: TOUR_VERSION, tour_skipped_at: new Date().toISOString() });
+  tourClose(false);
+}
+
+function tourPauseNow() {
+  S.tour.paused = true;
+  $("#tour").hidden = true;
+}
+
+function tourResumeNow() {
+  if (!S.tour.open) return;
+  S.tour.paused = false;
+  $("#tour").hidden = false;
+  paintTour();
+}
+
+function paintTour() {
+  if (!S.tour.open || S.tour.paused) return;
+  const box = $("#tour");
+  const step = TOUR_STEPS[S.tour.step];
+  const total = TOUR_STEPS.length;
+  $("#tour-step").textContent = "第 " + (S.tour.step + 1) + "/" + total + " 步";
+  $("#tour-title").textContent = step.title;
+  $("#tour-text").textContent = step.text;
+  $("#tour-prev").disabled = S.tour.step === 0;
+  $("#tour-next").textContent = S.tour.step === total - 1 ? "完成" : "下一步";
+  $("#tour-dots").innerHTML = TOUR_STEPS.map((s, i) =>
+    '<i class="' + (i === S.tour.step ? "on" : "") + '"></i>').join("");
+  /* 目标缺失/隐藏/窄窗（≤980）时不做高亮，退回底部静态说明条——
+   * 不伪造定位，也不挡运行中的操作 */
+  const target = document.querySelector('[data-tour-target="' + step.target + '"]');
+  const usable = !!target && window.innerWidth > 980 &&
+                 target.offsetWidth > 0 && target.getClientRects().length > 0;
+  box.classList.toggle("is-bottom", !usable);
+  const spot = $("#tour-spot");
+  const card = $("#tour-card");
+  card.style.top = "";
+  card.style.left = "";
+  if (!usable) {
+    spot.style.top = spot.style.left = spot.style.width = spot.style.height = "";
+    return;
+  }
+  const rect = target.getBoundingClientRect();
+  const pad = 6;
+  spot.style.top = Math.round(rect.top - pad) + "px";
+  spot.style.left = Math.round(rect.left - pad) + "px";
+  spot.style.width = Math.round(rect.width + pad * 2) + "px";
+  spot.style.height = Math.round(rect.height + pad * 2) + "px";
+  /* 卡片优先贴目标下方，放不下换上方，再放不下交回底部说明条 */
+  const cw = card.offsetWidth || 340;
+  const ch = card.offsetHeight || 200;
+  const gap = 12;
+  let top = rect.bottom + gap;
+  if (top + ch > window.innerHeight - 12) top = Math.max(12, rect.top - ch - gap);
+  if (top <= 12 && rect.top < ch + 12) {
+    box.classList.add("is-bottom");
+    return;
+  }
+  card.style.top = Math.round(top) + "px";
+  card.style.left = Math.round(Math.min(Math.max(12, rect.left), window.innerWidth - cw - 12)) + "px";
+}
+
 /* ---------------------------------------------------------------- 事件绑定 */
 window.onBackend = {
   log: (line) => addLog(line),
   check: (payload) => {
     const data = payload || {};
+    const hadRuntimeError = !!S.runtime.error;
     /* 真实校验回来了：解除「检查中」，记下四态结论（valid/none/expired/unknown） */
     S.login.checking = false;
     S.login.result = data.result || null;
+    /* FB4：组件结论按刷新轮次处理——本轮 check 报组件故障立即挂横幅并计入
+     * 故障累计（另一分支成功/普通 unknown 不得撤）；本轮 check 无故障只收口
+     * 自己的分支，撤横幅必须等本轮两分支都完成（两到达顺序语义一致） */
+    const code = data.runtime_error || null;
+    if (code && RUNTIME_ERRORS[code]) {
+      S.runtime.roundError = code;
+      S.runtime.error = code;
+      S.runtime.checkPending = false;
+    } else if (S.runtime.checkPending) {
+      S.runtime.checkPending = false;
+      if (!S.runtime.listPending) S.runtime.error = S.runtime.roundError;
+    }
     setLogin(data.hours_left, !!data.ok,
-             "session_present" in data ? !!data.session_present : undefined);
+             "session_present" in data ? !!data.session_present : undefined,
+             data);
     if (data.result === "valid") addLog("[OK] 已复用本机登录态，学校接口校验通过");
     /* check 的 text 是 grab.py cmd_check 的最后一行：有效时恰好是时钟偏差提醒 */
     const hit = String(data.text || "").match(/相差\s*([+-]?\d+)\s*秒/);
@@ -1973,8 +2798,13 @@ window.onBackend = {
       const reason = String(data.reason || data.text || "登录态检查没通过");
       addLog(reason.startsWith("[X]") ? reason : "[X] " + reason);
     }
+    paintBanners();     /* 组件横幅随 check 结论出现/撤销 */
     updateControls();
     paintChecks();
+    if (!!S.runtime.error !== hadRuntimeError) {
+      /* 组件结论出现/解除：列表空态与大屏短状态跟着切换（解除即恢复原状态） */
+      render();
+    }
   },
   activities: (payload) => applyActivities(payload, false),
   done: (payload) => handleDone(payload),
@@ -2035,6 +2865,10 @@ $("#banners").addEventListener("click", (event) => {
     S.sleepGap = 0;
     paintBanners();
   }
+  if (event.target.closest('[data-act="runtime-refresh"]')) {
+    /* 横幅上的「重新检查」= 一次完整刷新：check 事件带回组件结论，恢复即撤横幅 */
+    refresh(false);
+  }
 });
 $("#headed").addEventListener("change", (event) => savePrefs({ headed: event.target.checked }));
 /* 计划级重试策略：改完即存偏好，下一个计划生效（运行中的计划不受影响） */
@@ -2060,15 +2894,74 @@ $("#max-attempts").addEventListener("change", (event) => {
 });
 $("#btn-log-toggle").addEventListener("click", () => setLogOpen(!S.logOpen));
 $("#btn-log-clear").addEventListener("click", () => { $("#log").textContent = ""; $("#log-last").textContent = "还没有记录"; });
+/* 六步引导：跳过/上一步/下一步；说明页重播入口；GitHub 最新版本外链（点击才打开） */
+$("#tour-skip").addEventListener("click", tourSkip);
+$("#tour-prev").addEventListener("click", () => {
+  if (S.tour.step > 0) { S.tour.step -= 1; paintTour(); }
+});
+$("#tour-next").addEventListener("click", () => {
+  if (S.tour.step >= TOUR_STEPS.length - 1) { tourClose(true); return; }
+  S.tour.step += 1;
+  paintTour();
+});
+/* 辅助入口：说明与「更多」各自有重播按钮，共用 replayTourFrom 一条路径；
+ * 计划运行中禁用重播（不打断计划），弹窗本身任何状态都能打开。 */
+$("#btn-settings").addEventListener("click", showSettings);
+$("#btn-settings-tour").addEventListener("click", () => replayTourFrom("#settings", "#btn-settings"));
+$("#btn-help-tour").addEventListener("click", () => replayTourFrom("#help", "#btn-help"));
+$("#btn-settings-latest").addEventListener("click", () => {
+  /* 用户点击才打开外链：后端用系统默认浏览器打开固定的 releases/latest 地址；
+   * 打不开时把地址摆成可选文本（局部反馈），不在 WebView 里跳转 */
+  settingsStatus("");
+  api("open_latest_release").then((res) => {
+    if (!res || res.ok === false) {
+      settingsStatus("发布页没能打开（系统浏览器可能被拦）。地址：" + RELEASES_LATEST_URL, "warn");
+    }
+  }).catch((err) => {
+    settingsStatus("发布页没能打开：" + msg(err) + "。地址：" + RELEASES_LATEST_URL, "warn");
+  });
+});
+$("#btn-settings-data").addEventListener("click", () => {
+  settingsStatus("");
+  api("open_data").catch((err) => {
+    settingsStatus("打不开数据目录：" + msg(err) + "。可以先再试一次，或在系统里手动打开本机数据目录。", "bad");
+  });
+});
+/* 窗口尺寸或内部滚动变化时重新定位高亮与卡片 */
+window.addEventListener("resize", () => { if (S.tour.open && !S.tour.paused) paintTour(); });
+document.addEventListener("scroll", () => { if (S.tour.open && !S.tour.paused) paintTour(); }, true);
 $("#empty-action").addEventListener("click", () => {
-  if (S.items.length) { S.filter = { q: "", status: "all", time: "all", sort: "open", checkin: "all", checkout: "all" }; applyPrefs({ filter: S.filter, log_open: S.logOpen, headed: $("#headed").checked }); savePrefs({ filter: S.filter }); render(); }
+  /* 只按 paintEmpty 写下的动作意图分派：
+   * 「有缓存 + 列表失败」的空态写的是 refresh，不能被 items.length 猜成清筛选。 */
+  if ($("#empty-action").dataset.action === "clear-filters") clearFilters();
   else refresh(false);
 });
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "F5") { event.preventDefault(); refresh(false); return; }
-  /* Ctrl+F 或 / 跳到搜索框 */
   const typing = event.target.closest && event.target.closest("input, select, textarea");
+  /* 引导可见时键盘约束在卡片内：Esc=跳过、Tab 在卡片按钮间循环，
+   * 背景 Ctrl+F / `/` / Enter 不移焦点、不触发开始计划；
+   * 计划运行把引导暂停（tourVisible=false）时全部放行——停止操作不受影响。 */
+  if (tourVisible()) {
+    if (event.key === "Escape") { event.preventDefault(); tourSkip(); return; }
+    if (event.key === "Tab") { tourTrapTab(event); return; }
+    if ((event.ctrlKey && (event.key === "f" || event.key === "F")) ||
+        (event.key === "/" && !typing)) { event.preventDefault(); return; }
+    if (event.key === "Enter" && !typing) {
+      const inCard = event.target.closest && event.target.closest("#tour-card");
+      if (!inCard) { event.preventDefault(); return; }   /* 背景回车不开始计划 */
+      return;   /* 卡片内回车：交给按钮原生激活（click 监听照常触发） */
+    }
+  }
+  /* 任意弹窗（说明/设置/停止确认）打开时：Enter/Esc 只属于弹窗——
+   * 不穿透到背景开始计划、不清空选择、不误跳引导；停止确认弹窗的
+   * Esc/「继续等待」=不停止 的原生语义不变 */
+  if ((event.key === "Enter" || event.key === "Escape") &&
+      ["#help", "#settings", "#dlg-stop"].some((sel) => { const d = $(sel); return !!d && d.open; })) {
+    return;
+  }
+  /* Ctrl+F 或 / 跳到搜索框 */
   if ((event.ctrlKey && (event.key === "f" || event.key === "F")) || (event.key === "/" && !typing)) {
     event.preventDefault();
     $("#q").focus();
@@ -2076,7 +2969,8 @@ document.addEventListener("keydown", (event) => {
     return;
   }
   if (event.key === "Escape") {
-    /* 依次：关浮层 → 退输入 → 收起结论 → 清空选择；弹窗由浏览器自己收 */
+    /* 依次：关引导 → 关浮层 → 退输入 → 收起结论 → 清空选择；弹窗由浏览器自己收 */
+    if (tourVisible()) { tourSkip(); return; }
     const pop = $("#clock-pop");
     if (pop && !pop.hidden) { pop.hidden = true; return; }
     if (typing) { event.target.blur(); return; }

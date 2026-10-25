@@ -14,6 +14,8 @@
 | 规范 | 覆盖 |
 |---|---|
 | [copywriting.md](copywriting.md) | 全界面短文案规则与现行用词表 |
+| [versioning-and-release.md](versioning-and-release.md) | 版本线（已发布 v1.0.2 → 候选 v1.1.0）、升版口径与资产绑定 |
+| [assistance-panels.md](assistance-panels.md) | 辅助入口：说明 / 更多 / 六步引导的职责、线框、文案与状态矩阵 |
 
 ## 写作约定
 

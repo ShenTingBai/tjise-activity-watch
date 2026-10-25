@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import webview
@@ -37,11 +37,101 @@ from runtime_paths import DATA_DIR, SESSION_FILE, UI_STATE_FILE, ensure_data_dir
 HERE = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", HERE))
 UI = RESOURCE_ROOT / "ui" / "index.html"
-GRAB = HERE / ("grab-worker.exe" if getattr(sys, "frozen", False) else "grab.py")
+
+
+def resolve_worker_path(frozen: bool, here: Path, resource_root: Path) -> Path:
+    """worker 唯一来源（纯函数，供契约测试）：源码态跑 here/grab.py；
+    冻结态只用打包进资源根的 grab-worker.exe——绝不退回 EXE 旁的旧文件，
+    也不依赖启动 cwd：独立单 EXE 被拷到任何空目录都必须自足。"""
+    if frozen:
+        return resource_root / "grab-worker.exe"
+    return here / "grab.py"
+
+
+GRAB = resolve_worker_path(getattr(sys, "frozen", False), HERE, RESOURCE_ROOT)
 PREFS = UI_STATE_FILE
 TOKEN_LIFETIME_H = 17.5
+# GitHub 最新版本页：用户点「GitHub 最新版本」时由系统默认浏览器打开，
+# 启动时不自动联网检查，也不在 WebView 里跳转
+RELEASES_LATEST_URL = "https://github.com/ShenTingBai/tjise-activity-watch/releases/latest"
+
+
+def read_version() -> str:
+    """读唯一的版本源 VERSION：源码从项目根、绿色版从脚本旁、冻结程序从打包资源根。
+
+    版本格式只认 major.minor.patch；文件缺失或格式非法直接启动失败并给开发者
+    可读错误——把版本读取失败静默成旧版本，会发布出 GUI、文件名、tag 对不上号的包。
+    不能依赖启动 cwd：三种形态各有一个固定候选路径，按序取第一个存在的。
+    """
+    candidates = [
+        RESOURCE_ROOT / "VERSION",   # 冻结程序：build_exe --add-data 打进资源根
+        HERE / "VERSION",            # 绿色版：make_portable 复制到 app.py 旁
+        HERE.parent / "VERSION",     # 源码：仓库根
+    ]
+    for path in candidates:
+        if path.is_file():
+            text = path.read_text(encoding="utf-8").strip()
+            if re.fullmatch(r"\d+\.\d+\.\d+", text):
+                return text
+            raise SystemExit("[X] VERSION 内容不是 major.minor.patch：%r（%s）"
+                             % (text, path))
+    raise SystemExit("[X] 找不到 VERSION 文件（尝试过 %s）；版本号只有一个来源，不回退写死值"
+                     % "、".join(str(p) for p in candidates))
+
+
+APP_VERSION = read_version()
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+# 组件诊断：结构化错误码 → 人话主文案。技术细节只进运行记录（日志），
+# 主提示保持一句话——用户要的是「该做什么」，不是 WinError 2。
+WORKER_PROBLEM_TEXT = {
+    "worker_missing": "程序组件缺失，请重新下载完整版本",
+    "worker_permission": "程序组件无法读取，请重新下载完整版本",
+    "spawn_failed": "程序组件启动失败，请重新下载完整版本",
+}
+# 离线自检（--runtime-check）给内置 worker --help 的时限
+RUNTIME_CHECK_TIMEOUT_S = 60
+
+
+def worker_problem() -> str:
+    """启动 worker 前的组件自检：返回结构化错误码，组件齐备返回空串。
+
+    源码态要求 grab.py 可读；冻结态要求资源根里的 grab-worker.exe 存在且可执行。
+    只看文件事实，不发起任何进程/网络动作——调用方据此决定拒绝还是放行。
+    """
+    if getattr(sys, "frozen", False):
+        if not GRAB.is_file():
+            return "worker_missing"
+        if not os.access(GRAB, os.R_OK | os.X_OK):
+            return "worker_permission"
+        return ""
+    if not GRAB.is_file():
+        return "worker_missing"
+    if not os.access(GRAB, os.R_OK):
+        return "worker_permission"
+    return ""
+
+
+def _component_error(exc: Exception) -> str:
+    """把**进程创建**抛出的异常归类为结构化组件错误码（check/list/login 收尾共用）。
+
+    只对进程启动阶段的 OSError 调用：文件/权限/其他 OS 层失败才有资格归组件码。
+    数据/解析等普通异常不进这里——数据坏了不是组件坏了，不得诱导重新下载。
+    """
+    if isinstance(exc, FileNotFoundError):
+        return "worker_missing"
+    if isinstance(exc, PermissionError):
+        return "worker_permission"
+    return "spawn_failed"
+
+
+class _ClosingError(RuntimeError):
+    """Api 关闭屏障拒绝新 worker 创建：属「取消/正在关闭」语义。
+
+    调用方必须把它与组件异常分开处理——关闭拒绝不得归类为 worker_* 组件码
+    （重下/重检都解决不了「程序正在退出」），也不得冒充报名失败向上抛。
+    """
 
 # --demo：用假数据起界面，方便调样式、截图，不需要登录
 DEMO = False
@@ -99,25 +189,45 @@ def _env() -> dict:
 
 
 def worker_command(*args: str) -> list[str]:
-    """普通 Python 调 grab.py；冻结主程序改调同目录的独立 worker exe。"""
+    """普通 Python 调 grab.py；冻结主程序改调资源根里内置的 worker exe。"""
     if getattr(sys, "frozen", False):
         return [str(GRAB)] + list(args)
     return [sys.executable, str(GRAB)] + list(args)
 
 
-def load_prefs() -> dict:
+def load_prefs_from(path: Path) -> dict:
     try:
-        return json.loads(PREFS.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
-def save_prefs(prefs: dict) -> None:
-    # 偏好与登录态同根：先确保统一数据目录存在，避免首次保存时目录还没建
-    ensure_data_dir()
-    tmp = PREFS.with_suffix(".tmp")
+def load_prefs() -> dict:
+    return load_prefs_from(PREFS)
+
+
+def _atomic_write_prefs(path: Path, prefs: dict) -> None:
+    """临时文件 + os.replace 原子落盘：断电/崩溃不留半个 ui.json。
+
+    目录随写入确保（测试里 path 指向临时目录，不会碰到真实数据根）。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(prefs, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, PREFS)
+    os.replace(tmp, path)
+
+
+# 界面偏好与生命周期心跳共用的持久化锁：读-合并-写必须串行，
+# 否则心跳的整份快照会覆盖用户刚存的筛选/引导状态（反之亦然）
+_PREFS_LOCK = threading.Lock()
+
+
+def update_prefs(patch: dict) -> None:
+    """统一的原子读-合并-写（Api.save_prefs 与生命周期心跳共用同一把锁）。"""
+    with _PREFS_LOCK:
+        prefs = load_prefs()
+        prefs.update(patch or {})
+        _atomic_write_prefs(PREFS, prefs)
 
 
 def token_hours_left() -> float | None:
@@ -137,19 +247,197 @@ def login_state() -> dict:
     「没有登录」= session.json 不存在、无法解析或缺少 token；
     只有 token 还在但已过期才叫登录态失效。缺 token 时 hours_left
     必须是 None——按 saved_at 报一个假的小时数会把空壳会话显示成有效。
+    saved_at / estimated_expires_at 只是估算提醒（saved_at + TOKEN_LIFETIME_H），
+    登录有效性永远以学校真实校验为准，二者绝不参与放行或拦截。
     """
-    state = {"session_present": False, "session_expired": False, "hours_left": None}
+    state = {"session_present": False, "session_expired": False, "hours_left": None,
+             "saved_at": None, "estimated_expires_at": None}
     try:
         data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
         token = str(data.get("token") or "").strip()
+        saved_text = str(data.get("saved_at") or "").strip()
     except Exception:
         return state
     if not token:
         return state
     state["session_present"] = True
+    saved = _parse_local_time(saved_text)
+    if saved is not None:
+        state["saved_at"] = saved_text
+        state["estimated_expires_at"] = saved.timestamp() + TOKEN_LIFETIME_H * 3600.0
     state["hours_left"] = token_hours_left()
     state["session_expired"] = state["hours_left"] is not None and state["hours_left"] <= 0
     return state
+
+
+def _parse_local_time(text) -> "datetime | None":
+    """ui.json / session.json 里的本地时间文本（YYYY-MM-DD HH:MM:SS）→ datetime。"""
+    try:
+        return datetime.strptime(str(text or "").strip(), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def _now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _latest_moment(*moments) -> "datetime | None":
+    """取若干可解析时刻里最近的一个；全缺失返回 None（供生命周期参考点推导）。"""
+    valid = [m for m in moments if m is not None]
+    return max(valid) if valid else None
+
+
+def compute_lifecycle(prev: dict, started_at: datetime) -> dict:
+    """由上一运行周期的 ui.json 快照推导关闭时长与质量（纯函数，供契约测试）。
+
+    周期以 run_open 标记区分（本周期启动写 true，正常关闭写 false）：
+    - clean：上一周期 run_open=false，且关闭时刻不早于该周期启动、心跳不晚于关闭
+      → 关闭记录确实属于最近这个周期，可给精确时长；
+    - abnormal：上一周期 run_open=true（启动后没走正常关闭就没了）→ 只能拿
+      「最近有效心跳（无则该周期启动时刻）」给「约」值，绝不能拿更早周期的
+      关闭时间冒充本周期正常退出；
+    - unknown：首次运行 / 时间不可解析，或系统时钟回拨（参考点晚于本次启动）。
+    旧格式 ui.json 没有 run_open：按时间戳兼容推导，但关闭记录早于上一周期
+    启动时刻时必须降级为 abnormal——它属于更早的周期，不是最近周期的正常关闭。
+    """
+    closed = _parse_local_time(prev.get("last_closed_at"))
+    beat = _parse_local_time(prev.get("last_heartbeat_at"))
+    started_prev = _parse_local_time(prev.get("last_started_at"))
+    run_open = prev.get("run_open")
+    result = {
+        "last_closed_at": str(prev.get("last_closed_at") or ""),
+        "last_heartbeat_at": str(prev.get("last_heartbeat_at") or ""),
+        "closed_for_s": None,
+        "close_quality": "unknown",
+    }
+
+    def finish(ref: datetime, quality: str) -> None:
+        if started_at - ref < timedelta(0):
+            return   # 系统时钟回拨/坏时间：精确与约值都不可信，退回未知
+        result["closed_for_s"] = round((started_at - ref).total_seconds(), 1)
+        result["close_quality"] = quality
+
+    if run_open is True:
+        # 显式存活标记仍在：上一周期没有正常关闭，只有存活参考点可依
+        ref = _latest_moment(beat, started_prev)
+        if ref is not None:
+            finish(ref, "abnormal")
+        return result
+    if run_open is False:
+        # 显式正常关闭。时间矛盾（关闭早于本周期启动，如系统回拨后关机）时
+        # 精确值不可信，退 unknown——正常关闭标记不能覆盖时间顺序矛盾；
+        # 同一秒关闭与启动允许等号。心跳晚于关闭同样按异常处理：正常关闭后
+        # 不应再有心跳，出现即说明关闭记录可能被迟到写入污染。
+        if closed is not None and started_prev is not None and closed < started_prev:
+            return result
+        if closed is not None and (beat is None or beat <= closed):
+            finish(closed, "clean")
+        elif beat is not None:
+            finish(beat, "abnormal")
+        return result
+    # 旧格式（无 run_open 标记）：时间戳兼容推导
+    if closed is not None and (started_prev is None or closed >= started_prev) \
+            and (beat is None or beat <= closed):
+        finish(closed, "clean")
+        return result
+    ref = _latest_moment(beat, started_prev)
+    if ref is not None:
+        finish(ref, "abnormal")
+    return result
+
+
+class AppLifecycle:
+    """进程级生命周期：启动冻结上一周期 → 每分钟心跳 → 正常关闭写 last_closed_at。
+
+    生命周期字段只写 ui.json，绝不写 session.json / storage_state.json；
+    F5 重载只是页面重取 bootstrap，不会重建这里的任何状态。心跳与界面
+    save_prefs 共用 _PREFS_LOCK，做原子读-合并-写，互不覆盖。
+    """
+
+    INTERVAL_S = 60
+
+    def __init__(self, prefs_file: "Path | None" = None) -> None:
+        # 创建时定格偏好路径：测试传入临时目录后，心跳线程绝不会写回真实数据根
+        self._prefs = prefs_file or PREFS
+        with _PREFS_LOCK:
+            prev = load_prefs_from(self._prefs)
+            # 先冻结上一运行周期，再在同一原子写入里记录本次周期开始：
+            # started + 首个心跳 + run_open=true 三者一起落盘——短启动就崩溃的
+            # 周期也有「最后存活时刻」，不会回退拿更早周期的关闭时间当精确值
+            self._prev = compute_lifecycle(prev, datetime.now())
+            self._started_text = _now_text()
+            merged = dict(prev)
+            merged["last_started_at"] = self._started_text
+            merged["last_heartbeat_at"] = self._started_text
+            merged["run_open"] = True
+            self._atomic_write(merged)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._heartbeat, daemon=True,
+                                        name="lifecycle-heartbeat")
+        self._thread.start()
+
+    def _atomic_write(self, prefs: dict) -> None:
+        _atomic_write_prefs(self._prefs, prefs)
+
+    def _write_merged(self, patch: dict, force: bool = False) -> None:
+        """与 update_prefs 同一把锁的读-合并-写，但钉住创建时的偏好文件。
+
+        force=False（心跳路径）：锁内先核停止标记——finalize 已开始收尾时，
+        迟到的心跳直接放弃，绝不把 last_heartbeat_at 写到关闭时刻之后。
+        """
+        with _PREFS_LOCK:
+            if not force and self._stop.is_set():
+                return
+            prefs = load_prefs_from(self._prefs)
+            prefs.update(patch or {})
+            self._atomic_write(prefs)
+
+    def _heartbeat(self) -> None:
+        while not self._stop.wait(self.INTERVAL_S):
+            try:
+                self._write_merged({"last_heartbeat_at": _now_text()})
+            except Exception:
+                pass   # 单次心跳失败不影响界面，下一分钟再试
+
+    def snapshot(self) -> dict:
+        """bootstrap 的 lifecycle 载荷：上一周期关闭时长/质量（只读，只作提示）。
+
+        当前凭证的登录估算不在这里——bootstrap.login 与 check 事件统一带
+        login_state() 的同一份锚点，界面只认那一个来源，避免冻结快照与
+        重新登录后的实际剩余自相矛盾。
+        """
+        return {
+            "last_started_at": self._started_text,
+            "last_closed_at": self._prev["last_closed_at"],
+            "last_heartbeat_at": self._prev["last_heartbeat_at"],
+            "closed_for_s": self._prev["closed_for_s"],
+            "close_quality": self._prev["close_quality"],
+        }
+
+    def finalize(self) -> None:
+        """窗口正常关闭：先置停（拦住后续心跳），再在同一把锁内原子写
+        run_open=false 与关闭时刻——顺序反了会留下晚于关闭的心跳。
+        不持锁 join 心跳线程：持锁 join 会和心跳的锁内写入互相等死。"""
+        self._stop.set()
+        try:
+            self._write_merged({"last_closed_at": _now_text(), "run_open": False},
+                               force=True)
+        except Exception:
+            pass
+
+
+_LIFECYCLE: "AppLifecycle | None" = None
+_LIFECYCLE_LOCK = threading.Lock()
+
+
+def get_lifecycle() -> AppLifecycle:
+    """进程级单例（懒创建）：main() 启动时先建，bootstrap 重复取同一实例。"""
+    global _LIFECYCLE
+    with _LIFECYCLE_LOCK:
+        if _LIFECYCLE is None:
+            _LIFECYCLE = AppLifecycle()
+        return _LIFECYCLE
 
 
 class Api:
@@ -158,8 +446,17 @@ class Api:
         self._proc: subprocess.Popen | None = None
         self._plan: PlanCoordinator | None = None
         self._plan_procs: dict[str, subprocess.Popen] = {}
+        # check/list 这类短命 worker 的登记表：正常关闭时一并树终止，不留孤儿
+        self._aux_procs: set = set()
         self._activities: dict[str, dict] = {}
         self._lock = threading.Lock()
+        # 关闭屏障：shutdown 在同一把 _lock 内置位 _closing，而一切 worker 创建
+        # （Popen）与登记也都在这把锁里先核它——关闭先发生则零创建；创建已开始
+        # 则 shutdown 必等登记完成才能取快照，收走的进程不会漏。
+        # _closing 表达「关闭已开始」；「收尾已完成」用 Event 表达（FB2）：后到
+        # 的 shutdown 在锁外等待同一个 Event，返回即代表收尾真正完成。
+        self._closing = False
+        self._shutdown_done_event = threading.Event()
         # 刷新去重：连点「刷新」不该堆起多个 check/list 子进程
         self._checking = False
         self._listing = False
@@ -181,10 +478,13 @@ class Api:
     def bootstrap(self) -> dict:
         prefs = load_prefs()
         payload = {
-            "version": "3.0.0",
+            "version": APP_VERSION,
             "prefs": prefs,
             "help": self.help(),
             "login": login_state(),
+            # 生命周期元数据（上一周期关闭时长/质量 + 登录估算）：只作提示，
+            # 不参与任何放行/拦截；F5 重载重复调用拿到的是同一份进程级快照
+            "lifecycle": get_lifecycle().snapshot(),
             "busy": self._is_busy(),
             # demo 标记：界面据此放行演示计划（真实模式仍要求登录校验 valid）
             "demo": DEMO,
@@ -199,19 +499,25 @@ class Api:
 
     def help(self) -> dict:
         return {
-            "title": "天软活动预报名工具",
-            "subtitle": "选好多场活动，开放时按批次自动提交",
+            "title": "天软活动预报名工具怎么用",
+            "subtitle": "确认登录，选活动并开始，再看每场结果。",
+            # 版本与最新版本入口：界面据此显示「版本 1.1.0」和 GitHub 外链按钮
+            # （APP_VERSION 恒来自 read_version()，这里只是示例注释，不写死实现）
+            "version": APP_VERSION,
+            "latest_url": RELEASES_LATEST_URL,
+            # 三步只讲「怎么操作」：选中不等于开始，开始按钮必须点，结果逐场看
             "steps": [
-                {"no": 1, "title": "先登录",
-                 "text": "点「登录」完成首次登录。之后重开会自动检查，只有失效才重登。"},
-                {"no": 2, "title": "选活动",
-                 "text": "把想报的场次加入计划。活动时间重叠时只能保留其中一场；"
-                         "同刻开放但不重叠的场次可以一起提交。"},
-                {"no": 3, "title": "保持在线",
-                 "text": "电脑别睡眠、别断网；窗口可以最小化，但不要关掉。"
-                         "每场活动都会单独显示结果。"},
+                {"no": 1, "title": "确认登录",
+                 "text": "首次点「登录」，在浏览器里完成登录。重开会自动检查；"
+                         "仅在提示失效时重新登录，暂时无法确认就刷新。"},
+                {"no": 2, "title": "选活动并开始",
+                 "text": "勾选不冲突的活动，设置重试时长和最多次数，再点「开始报名计划」。"
+                         "未来场次等开放，已开放场次立即尝试。"},
+                {"no": 3, "title": "看进度与结果",
+                 "text": "电脑保持唤醒和联网，窗口可最小化。逐场看结果；"
+                         "停止会结束本机任务，不会撤销学校报名。"},
             ],
-            "note": "只给本人账号使用，不要借别人的账号；同一计划由本机统一协调。",
+            "note": "仅操作本人账号；选中活动还没有开始，报名结果以学校活动页为准。",
         }
 
     def front_ready(self) -> dict:
@@ -223,6 +529,10 @@ class Api:
         # js_api 的处理跑在 UI 线程上：一旦在这里跑 subprocess，
         # 窗口会直接"未响应"。所以只负责起线程，结果用事件推回去。
         with self._lock:
+            if self._closing:
+                # 关闭拒绝是取消语义：不给组件码，不再起线程
+                return {"ok": False, "queued": False,
+                        "text": "程序正在关闭，已取消本次检查"}
             if self._checking:
                 return {"ok": True, "queued": True, "skipped": "已在检查登录态"}
             self._checking = True
@@ -231,6 +541,9 @@ class Api:
 
     def list_activities(self) -> dict:
         with self._lock:
+            if self._closing:
+                return {"ok": False, "queued": False,
+                        "text": "程序正在关闭，已取消拉取活动列表"}
             if self._listing:
                 return {"ok": True, "queued": True, "skipped": "已经在拉活动列表"}
             self._listing = True
@@ -239,41 +552,103 @@ class Api:
 
     def _do_check(self) -> None:
         try:
-            try:
-                res = self._run(worker_command("check"), timeout=90)
-                code, out = res["code"], res["out"]
-            except Exception as exc:  # worker 起不来（缺文件/权限）也必须给界面一个结论
-                code, out = -1, "[X] 本机脚本没能启动：%s" % type(exc).__name__
-            # 归因只信第一条 [X] 来源行：失败输出的末尾常常是「请重新登录」指引，
-            # 拿最后一行分类会把网络错误误判成登录失效。末行仍作 text 供时钟展示。
-            reason, text = _check_reason_line(out)
-            # 三态字段跟结果一起发：check 失败可能是「没登录过」也可能是「过期」，
-            # 界面只看 ok 会把首次使用误判成登录态失效。
-            state = login_state()
-            result = _check_result(state, code, reason or text)
-            self._last_check = {"result": result, "checked_at": time.time()}
-            self._emit("check", {
-                "ok": code == 0,
-                "hours_left": state["hours_left"],
-                "session_present": state["session_present"],
-                "session_expired": state["session_expired"],
-                "text": text,
-                # 来源行（附加字段）：界面日志显示真实原因，而不是末尾的登录指引
-                "reason": reason,
-                # check 只回最后一行（R16）：给界面一个可区分的错误分类，
-                # 免得把「没登录」和「断网」都笼统当失败。
-                "hint": _check_hint(reason or text, code),
-                # 四态结论（附加字段）：valid=接口确认有效 / expired=4001 失效 /
-                # none=本机无会话 / unknown=网络或接口异常——异常不得误报成重新登录
-                "result": result,
-            })
+            self._do_check_inner()
+        except Exception as exc:  # noqa: BLE001 - 兜底：结论构造中的意外也必须收尾
+            # FB3：任何 check 终态必须先同步后端判定——结论构造阶段的意外不能
+            # 让旧 valid 留作 start_plan 放行依据。先在锁内写 unknown/当前时刻
+            # 并清旧组件结论，再锁外发唯一终态（状态写入先于事件）
+            with self._lock:
+                self._last_check = {"result": "unknown", "checked_at": time.time(),
+                                    "runtime_error": ""}
+            self._emit("check", {"ok": False, "result": "unknown",
+                                 "text": "检查登录态没跑完，请点「刷新」再试一次"})
+            self._emit("log", "[X] 检查收尾异常 %s: %s" % (type(exc).__name__, exc))
         finally:
             with self._lock:
                 self._checking = False
 
+    def _do_check_inner(self) -> None:
+        err_code = ""
+        try:
+            res = self._run(worker_command("check"), timeout=90)
+            code, out = res["code"], res["out"]
+        except _ClosingError:
+            # 关闭取消：仍给恰一次终态，但属取消语义——不归类组件码、
+            # 不触碰登录四态字段，技术细节没有需要落日志的内容
+            self._emit("check", {"ok": False, "result": "unknown",
+                                 "text": "程序正在关闭，本次检查已取消"})
+            return
+        except OSError as exc:
+            # 进程创建失败（缺文件/权限/其他 OS 层）才归组件码：与登录四态分离，
+            # 一律 unknown + runtime_error 附加字段——不清会话、不指导重登
+            err_code = _component_error(exc)
+            code = -1
+            out = "[X] %s" % WORKER_PROBLEM_TEXT.get(err_code, "程序组件启动失败，请重新下载完整版本")
+            # 技术细节只进运行记录（日志），主文案保持人话
+            self._emit("log", "[X] 组件诊断 %s：%s: %s" % (err_code, type(exc).__name__, exc))
+        except Exception as exc:
+            # 数据/解析等普通异常：仍是检查失败终态，但不设 runtime_error、
+            # 不诱导重新下载——数据坏了不是组件坏了
+            code = -1
+            out = "[X] 检查登录态没跑完，请点「刷新」再试一次"
+            self._emit("log", "[X] 检查登录态异常 %s: %s" % (type(exc).__name__, exc))
+        # 归因只信第一条 [X] 来源行：失败输出的末尾常常是「请重新登录」指引，
+        # 拿最后一行分类会把网络错误误判成登录失效。末行仍作 text 供时钟展示。
+        reason, text = _check_reason_line(out)
+        # 三态字段跟结果一起发：check 失败可能是「没登录过」也可能是「过期」，
+        # 界面只看 ok 会把首次使用误判成登录态失效。
+        state = login_state()
+        result = _check_result(state, code, reason or text)
+        if err_code:
+            result = "unknown"
+        self._last_check = {"result": result, "checked_at": time.time(),
+                            "runtime_error": err_code}
+        payload = {
+            "ok": code == 0,
+            "hours_left": state["hours_left"],
+            "session_present": state["session_present"],
+            "session_expired": state["session_expired"],
+            # 当前凭证估算锚点（与 bootstrap.login 同一份 login_state 来源）：
+            # 界面据此在重新登录后立即换新锚点；只作提醒，绝不参与放行/拦截
+            "saved_at": state.get("saved_at"),
+            "estimated_expires_at": state.get("estimated_expires_at"),
+            "text": text,
+            # 来源行（附加字段）：界面日志显示真实原因，而不是末尾的登录指引
+            "reason": reason,
+            # check 只回最后一行（R16）：给界面一个可区分的错误分类，
+            # 免得把「没登录」和「断网」都笼统当失败。
+            "hint": _check_hint(reason or text, code),
+            # 四态结论（附加字段）：valid=接口确认有效 / expired=4001 失效 /
+            # none=本机无会话 / unknown=网络或接口异常——异常不得误报成重新登录
+            "result": result,
+        }
+        if err_code:
+            payload["runtime_error"] = err_code
+        self._emit("check", payload)
+
     def _do_list(self) -> None:
         try:
             self._do_list_inner()
+        except _ClosingError:
+            # 关闭取消：恰一次失败终态收尾（骨架必能结束），但属取消语义，
+            # 不归类组件码、不诱导重下/重检
+            self._emit("activities", {"ok": False,
+                                      "text": "程序正在关闭，活动列表加载已取消",
+                                      "items": []})
+        except OSError as exc:
+            # 进程创建失败（缺文件/权限/其他 OS 层）才归组件码——此前任意
+            # Exception 都会被归成 spawn_failed，数据异常被误报成「重新下载」
+            err_code = _component_error(exc)
+            self._emit("log", "[X] 组件诊断 %s：%s: %s" % (err_code, type(exc).__name__, exc))
+            self._emit("activities", {"ok": False,
+                                      "text": WORKER_PROBLEM_TEXT.get(err_code, "活动列表没能加载"),
+                                      "items": [], "runtime_error": err_code})
+        except Exception as exc:
+            # 数据/解析等普通异常：仍必给恰一次失败终态（此前 FileNotFoundError
+            # 从这里泄出导致骨架永远加载），但不是组件问题——不设 runtime_error、
+            # 不诱导重新下载或重新登录
+            self._emit("log", "[X] 列表请求异常 %s: %s" % (type(exc).__name__, exc))
+            self._emit("activities", {"ok": False, "text": "活动列表没能加载", "items": []})
         finally:
             with self._lock:
                 self._listing = False
@@ -304,6 +679,9 @@ class Api:
     # ---------- 动作 ----------
     def login(self) -> dict:
         with self._lock:
+            if self._closing:
+                # 不带 error 码：前端不得把关闭取消当成组件问题挂横幅
+                return {"ok": False, "text": "程序正在关闭，已取消本次登录"}
             if self._plan and self._plan.snapshot().get("status") in {"running", "ready"}:
                 return {"ok": False, "text": "报名计划正在运行，先停止计划再登录"}
         return self._spawn(worker_command("login"), "登录", kind="login")
@@ -328,12 +706,21 @@ class Api:
         if not isinstance(items, list) or not items:
             return {"ok": False, "text": "先至少选择一场活动"}
         with self._lock:
+            if self._closing:
+                return {"ok": False, "text": "程序正在关闭，已取消开始计划"}
             if self._is_busy_locked():
                 return {"ok": False, "text": "已有登录、报名或计划在运行，先停止后再开始"}
         # 真实计划只在学校接口确认登录有效后开始（最终防线，界面按钮门禁之外）：
         # checking / unknown / none / expired 一律拒绝并给出下一步；demo 没有真实
         # 登录态，继续走演示流程不受此限。
         if not DEMO:
+            problem = worker_problem()
+            if problem:
+                # 组件不齐的计划必然全场失败：这里就拒绝，不让用户等到点才发现；
+                # demo 模式不起 worker，不做此检查
+                return {"ok": False,
+                        "text": "%s；计划没法开始" % WORKER_PROBLEM_TEXT[problem],
+                        "error": problem}
             with self._lock:
                 checking = self._checking
                 last = dict(self._last_check)
@@ -413,12 +800,34 @@ class Api:
                 if spec.activity_id.endswith("career"):
                     return {"status": "failed", "code": 2, "reason": "演示：名额已满"}
                 return {"status": "success", "code": 0, "reason": "演示：报名成功"}
-            return self._run_plan_task(spec, cancel_event, status)
+            try:
+                return self._run_plan_task(spec, cancel_event, status)
+            except _ClosingError:
+                # 关闭拒绝落到协调器里就是取消：不冒充报名失败，也不让异常
+                # 冲出 runner 污染任务状态（协调器业务不改）
+                return {"status": "canceled", "code": None,
+                        "reason": "程序正在关闭，本场次未启动"}
 
         coordinator = PlanCoordinator(plan_id, specs, runner, emit)
         with self._lock:
+            # FB1 最终接纳点：从开头的 busy 检查到这里隔着校验与构建，期间
+            # 可能已有别的请求预留计划、或关闭已开始——同一临界区内重检并
+            # 只允许一个请求预留唯一协调器，未接纳的请求不启动、不覆盖
+            if self._closing:
+                return {"ok": False, "text": "程序正在关闭，已取消开始计划"}
+            if self._is_busy_locked():
+                return {"ok": False, "text": "已有登录、报名或计划在运行，先停止后再开始"}
             self._plan = coordinator
-        coordinator.start()
+        try:
+            # start 在 Api 锁外：协调器启动会 emit 回调（plan 事件要拿 _lock），
+            # 锁内调用会双向等死
+            coordinator.start()
+        except Exception:
+            # 启动失败只撤销本请求仍持有的预留，不碰别的计划，不残留 busy
+            with self._lock:
+                if self._plan is coordinator:
+                    self._plan = None
+            return {"ok": False, "text": "计划没能开始，请再试一次"}
         return {"ok": True, "queued": True, "plan_id": plan_id}
 
     def cancel_task(self, plan_id: str, task_id: str) -> dict:
@@ -448,6 +857,50 @@ class Api:
         for proc in procs:
             _kill_tree(proc)
 
+    def shutdown(self) -> None:
+        """窗口正常关闭的进程收尾：先同锁置关闭屏障并取快照，再停协调器、树终止**仅本 Api 登记**的 worker。
+
+        关闭屏障：_closing 与一切 worker 创建/登记共用 _lock——快照取到时，
+        任何「已开始创建」的进程必然已登记完成（创建若还没进锁，随后会被
+        _closing 拒绝），因此快照是完备的，收走不会漏；锁外调用 plan.stop 与
+        树终止：协调器回调与任务线程的登记/清理都需要 _lock，锁内等待会互相
+        等死。重复/并发 shutdown：后到调用在锁外等待首次收尾的完成 Event，
+        返回即代表收尾真正完成——入口置位不算 done，主正常退出不会先于收尾
+        完成继续 finalize。
+        覆盖登录/单活动（_proc）、计划任务（_plan_procs）与 check/list（_aux_procs）；
+        onefile 主程序退出后运行期资源根即消失，留下还握着它的孤儿 worker 只会
+        拿着旧资源继续跑——必须先收干净再 finalize 生命周期。
+        绝不按进程名扫杀：用户可能同时开着别的实例或别的程序，只动自己登记的进程。
+        """
+        with self._lock:
+            if self._closing:
+                # 已有收尾在进行：后到调用不重取快照、不重复 stop/kill，
+                # 在锁外等同一个完成 Event——返回即代表收尾真正完成（FB2）
+                done_event = self._shutdown_done_event
+            else:
+                done_event = None
+                self._closing = True
+                plan = self._plan
+                plan_procs = list(self._plan_procs.values())
+                aux_procs = list(self._aux_procs)
+                proc = self._proc
+        if done_event is not None:
+            done_event.wait()
+            return
+        try:
+            if plan:
+                try:
+                    plan.stop()
+                except Exception:
+                    pass   # 窗口已在关闭，收尾尽力而为，不让异常挡住生命周期写入
+            for orphan in plan_procs + aux_procs:
+                _kill_tree(orphan)
+            if proc and proc.poll() is None:
+                _kill_tree(proc)
+        finally:
+            # 完成信号在收尾 finally 发出：提前置位会让后到调用先于真正收尾返回
+            self._shutdown_done_event.set()
+
     def stop(self) -> dict:
         with self._lock:
             plan = self._plan
@@ -466,10 +919,22 @@ class Api:
         os.startfile(str(path))            # noqa: S606 - Windows 桌面工具
         return {"ok": True}
 
+    def open_latest_release(self) -> dict:
+        """用户点「GitHub 最新版本」时用系统默认浏览器打开固定的 releases/latest 页。
+
+        只打开常量地址：不收任意 URL、不在 WebView 内替换工具页面、
+        启动时也不自动访问 GitHub——版本检查是人的事，不是工具的网络行为。
+        """
+        try:
+            os.startfile(RELEASES_LATEST_URL)   # noqa: S606 - 系统默认浏览器
+            return {"ok": True, "url": RELEASES_LATEST_URL}
+        except Exception as exc:  # noqa: BLE001 - 打不开也要给界面一个可读结论
+            return {"ok": False, "text": "没能打开浏览器（%s）" % type(exc).__name__,
+                    "url": RELEASES_LATEST_URL}
+
     def save_prefs(self, prefs: dict) -> dict:
-        merged = load_prefs()
-        merged.update(prefs or {})
-        save_prefs(merged)
+        # 与生命周期心跳共用同一把锁的原子读-合并-写（update_prefs）
+        update_prefs(prefs or {})
         return {"ok": True}
 
     # ---------- 内部 ----------
@@ -508,11 +973,15 @@ class Api:
             args += ["--sign-end", spec.sign_end]
         if spec.headed:
             args.append("--headed")
-        proc = subprocess.Popen(
-            args, cwd=str(HERE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", bufsize=1,
-            env=_env(), creationflags=CREATE_NO_WINDOW)
         with self._lock:
+            # 关闭屏障：Popen 与登记同临界区——关闭先发生则零创建（取消语义）；
+            # 创建已开始则 shutdown 必等登记完成才能取快照，收走不会漏
+            if self._closing:
+                raise _ClosingError("程序正在关闭，本场次未启动")
+            proc = subprocess.Popen(
+                args, cwd=str(HERE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                env=_env(), creationflags=CREATE_NO_WINDOW)
             self._plan_procs[spec.task_id] = proc
         if status:
             # run_started_at 必须在子进程创建之后记录：这是 worker 真正启动
@@ -639,25 +1108,59 @@ class Api:
             pass
 
     def _run(self, args: list[str], timeout: int) -> dict:
+        """同步跑一个短命 worker（check/list）：创建、登记与关闭屏障同锁。
+
+        Popen 在锁内：关闭先发生则拒绝创建（_ClosingError，取消语义）；
+        创建已开始则 shutdown 必等登记完成才能取快照，不会留下未登记孤儿。
+        OSError（缺文件/权限）原样抛给调用方归类成结构化组件错误。
+        """
+        with self._lock:
+            if self._closing:
+                raise _ClosingError("程序正在关闭，已取消本次 worker 调用")
+            proc = subprocess.Popen(
+                args, cwd=str(HERE), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                env=_env(), creationflags=CREATE_NO_WINDOW)
+            self._aux_procs.add(proc)
         try:
-            res = subprocess.run(args, cwd=str(HERE), capture_output=True,
-                                 text=True, encoding="utf-8", errors="replace",
-                                 env=_env(), timeout=timeout,
-                                 creationflags=CREATE_NO_WINDOW)
-        except subprocess.TimeoutExpired:
-            return {"code": -1, "out": "[X] 执行超时（%d 秒）" % timeout}
-        out = (res.stdout or "") + (res.stderr or "")
-        return {"code": res.returncode, "out": out}
+            try:
+                out, err = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # 超时同样按进程树终止：onefile 引导进程死后真实 worker 可能还活着
+                _kill_tree(proc)
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
+                return {"code": -1, "out": "[X] 执行超时（%d 秒）" % timeout}
+        finally:
+            with self._lock:
+                self._aux_procs.discard(proc)
+        return {"code": proc.returncode, "out": (out or "") + (err or "")}
 
     def _spawn(self, args: list[str], label: str, kind: str = "grab") -> dict:
-        with self._lock:
-            if self._is_busy_locked():
-                return {"ok": False, "text": "已经有一个任务在跑，先等它结束"}
-            self._proc = subprocess.Popen(
-                args, cwd=str(HERE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace", bufsize=1,
-                env=_env(), creationflags=CREATE_NO_WINDOW)
-            proc = self._proc
+        problem = worker_problem()
+        if problem:
+            # 组件不齐：同步给结构化失败——不占 busy 位、不写 _proc 占位
+            self._emit("log", "[X] 组件诊断 %s：组件路径 %s" % (problem, GRAB))
+            return {"ok": False, "text": WORKER_PROBLEM_TEXT[problem], "error": problem}
+        try:
+            with self._lock:
+                if self._closing:
+                    # 关闭拒绝不带 error 码：不是组件损坏，前端不得挂横幅
+                    return {"ok": False, "text": "程序正在关闭，已取消本次「%s」" % label}
+                if self._is_busy_locked():
+                    return {"ok": False, "text": "已经有一个任务在跑，先等它结束"}
+                self._proc = subprocess.Popen(
+                    args, cwd=str(HERE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace", bufsize=1,
+                    env=_env(), creationflags=CREATE_NO_WINDOW)
+                proc = self._proc
+        except OSError as exc:
+            # Popen 竞态失败（文件在自检后被删/被锁）：同样给结构化结论，不冒充成功
+            err_code = _component_error(exc)
+            self._emit("log", "[X] 组件诊断 %s：%s: %s" % (err_code, type(exc).__name__, exc))
+            return {"ok": False, "text": WORKER_PROBLEM_TEXT[err_code], "error": err_code}
 
         threading.Thread(target=self._pump, args=(proc, label, kind),
                          daemon=True).start()
@@ -830,7 +1333,73 @@ def _check_hint(text: str, code: int) -> str:
     return "error"
 
 
+def _runtime_check_main(argv: list[str]) -> int:
+    """离线自检 CLI（--runtime-check --report <绝对JSON路径>）。
+
+    在 GUI/数据根/生命周期**之前**分发：只验证「冻结程序能按真实解析路径启动
+    内置 worker --help 并正常退出」，不访问学校、不读凭证、不初始化统一数据根。
+    缺 TJISE_DATA_DIR 直接拒绝——worker 自身启动会建数据根，验收必须显式指定
+    临时目录，绝不摸到真实登录态。窗口版没有控制台：结论只经 JSON 文件与
+    进程退出码表达（成功 0 / 失败 1 / 报告写不出去 2）。
+    """
+    report = ""
+    for i, part in enumerate(argv):
+        if part == "--report" and i + 1 < len(argv):
+            report = argv[i + 1]
+    result = {
+        "version": APP_VERSION,
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "worker": str(GRAB),
+        "ok": False,
+        "exit_code": None,
+    }
+    if not report:
+        print("[X] runtime-check 缺少 --report <绝对JSON路径>", file=sys.stderr)
+        return 2
+    try:
+        report_path = Path(report)
+        if not report_path.is_absolute():
+            raise ValueError("--report 需要绝对路径（窗口版没有可依赖的 cwd）")
+        if not os.environ.get("TJISE_DATA_DIR", "").strip():
+            raise ValueError("缺少 TJISE_DATA_DIR：离线自检必须显式指定临时数据根，"
+                             "拒绝触碰真实登录态")
+        problem = worker_problem()
+        if problem:
+            result["component"] = problem
+            raise RuntimeError(WORKER_PROBLEM_TEXT[problem])
+        proc = subprocess.Popen(
+            worker_command("--help"), cwd=str(HERE),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            env=_env(), creationflags=CREATE_NO_WINDOW)
+        try:
+            proc.communicate(timeout=RUNTIME_CHECK_TIMEOUT_S)
+            result["exit_code"] = proc.returncode
+            result["ok"] = proc.returncode == 0
+            if not result["ok"]:
+                result["error"] = "worker --help 退出码 %s" % proc.returncode
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            result["error"] = "worker --help 超时（%d 秒）" % RUNTIME_CHECK_TIMEOUT_S
+    except Exception as exc:  # noqa: BLE001 - 结论一律落 JSON，不向上抛
+        result.setdefault("error", str(exc))
+    try:
+        rp = Path(report)
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = rp.with_name(rp.name + ".tmp")
+        tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, rp)
+    except Exception as exc:
+        print("[X] runtime-check 报告写不出去：%s" % exc, file=sys.stderr)
+        return 2
+    return 0 if result["ok"] else 1
+
+
 def main() -> int:
+    # --runtime-check 先于一切副作用分发：不建数据根、不起生命周期、不开窗口
+    if "--runtime-check" in sys.argv:
+        return _runtime_check_main(sys.argv)
     if os.name == "nt":
         try:
             import ctypes
@@ -845,6 +1414,9 @@ def main() -> int:
     if not UI.exists():
         print("找不到界面文件：%s" % UI, file=sys.stderr)
         return 1
+    # 进程级生命周期：冻结上一运行周期并开始心跳（F5 重载不重置；
+    # 懒创建兜底——bootstrap 先被调用时也能拿到同一实例）
+    lifecycle = get_lifecycle()
     api = Api()
     window = webview.create_window(
         "天软活动预报名工具", str(UI),
@@ -853,6 +1425,11 @@ def main() -> int:
     )
     api._window = window
     webview.start(debug=False)
+    # 窗口已关（正常路径）：先收本实例登记的 worker（计划/登录/单活动/check/list）——
+    # onefile 退出后运行期资源根即消失，绝不能留下还握着它的孤儿进程；
+    # 再停心跳并落关闭时刻，clean/abnormal 的分界不变
+    api.shutdown()
+    lifecycle.finalize()
     return 0
 
 

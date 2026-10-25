@@ -38,10 +38,10 @@ GET_PIP = "https://bootstrap.pypa.io/get-pip.py"
 PIP_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
 PIP_PACKAGES = ["playwright>=1.40", "pillow>=9.0", "pywebview>=5.0"]
 
-# 应用本体：脚本 + 双击入口 + 说明
+# 应用本体：脚本 + 双击入口 + 说明（runtime_paths.py 是 app/grab 的数据根依赖，漏掉直接 ImportError）
 APP_FILES = [
-    "grab.py", "app.py", "signup_plan.py", "install.bat", "_py.bat", "1-登录.bat",
-    "2-抢活动.bat", "3-检查登录和活动.bat", "4-图形界面.bat",
+    "grab.py", "app.py", "signup_plan.py", "runtime_paths.py", "install.bat", "_py.bat",
+    "1-登录.bat", "2-抢活动.bat", "3-检查登录和活动.bat", "4-图形界面.bat",
     "requirements.txt", "config.example.json", "README.md", "gui-preview.png",
     "启动不了点我.txt",
 ]
@@ -200,6 +200,11 @@ def copy_app(out: Path) -> None:
     ui_src = HERE / UI_DIR
     if ui_src.is_dir():
         shutil.copytree(ui_src, out / UI_DIR, dirs_exist_ok=True)
+    # 版本唯一来源：绿色版把根 VERSION 放到 app.py 旁边（app.read_version 的第二候选），
+    # 与 app.py 的读取口径一致，不依赖启动 cwd
+    version_src = HERE.parent / "VERSION"
+    if version_src.is_file():
+        shutil.copy2(version_src, out / "VERSION")
     # 协议跟仓库同源：绿色版也要能看出"能做什么、不能做什么"
     lic = HERE.parent / "LICENSE"
     if lic.exists():

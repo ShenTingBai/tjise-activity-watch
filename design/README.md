@@ -8,12 +8,13 @@
 
 | 目录 | 放什么 |
 |---|---|
-| [decisions/](decisions/) | **已敲定的产品决策**：为什么这样定、用户看到什么（7 份记录） |
+| [decisions/](decisions/) | **已敲定的产品决策**：为什么这样定、用户看到什么（10 份记录） |
 | [flows/](flows/) | **当前用户流程**：首次使用 → 选活动 → 混合计划运行 → 停止与结果（4 份流程） |
-| [specs/](specs/) | **交互规范**：组件、状态、文案、响应式行为 |
+| [specs/](specs/) | **交互规范**：组件、状态、文案、响应式行为（辅助入口见 [specs/assistance-panels.md](specs/assistance-panels.md)） |
 | [proposals/](proposals/) | **新方案提案**：尚未实现、未进入实现计划的想法 |
 | [archive/](archive/) | **历史原型说明**：prototype/ 与 shots/ 的定位与边界 |
 | [prototype/](prototype/) · [shots/](shots/) | 2026-10-22 视觉原型与截图资产（原路径未动，链接不失效） |
+| [current-ui/](current-ui/) | **当前实现的真实渲染截图**（mock 数据，2026-10-24 生成，待用户验收） |
 | [check_refs.py](check_refs.py) | 校验本页历史基线章节里的代码引用（用法见文末） |
 
 ## 三层职责：design / docs / local
@@ -46,6 +47,9 @@
 | 签到 / 签退三态筛选 | implemented | [005](decisions/005-attendance-filters.md) |
 | 登录态持久化与启动校验（四态 / 4001 / 迁移） | implemented | [006](decisions/006-session-persistence.md) |
 | 运行时间线（真实事件 + 原定参考 + 统一截止） | implemented（真机验收待用户） | [007](decisions/007-runtime-timeline.md) |
+| 应用生命周期、版本单一来源与发布资产 | implemented（构建/上传待授权，真机验收待用户） | [008](decisions/008-lifecycle-version-release.md) |
+| 六步可重播功能引导 | implemented（mock 截图见 [current-ui/](current-ui/)，真机验收待用户） | [009](decisions/009-replayable-product-tour.md) |
+| 独立可用单 EXE 与辅助入口（现行入口：说明 + 更多） | pending（源码已落地，运行验证/实包验收待授权） | [010](decisions/010-standalone-exe-and-settings.md) · [规范](specs/assistance-panels.md) |
 
 状态口径见 [decisions/README.md](decisions/README.md)：confirmed 只表示规则已敲定，
 implemented 另要求代码落地并有证据，proposed 一律放 [proposals/](proposals/)。
@@ -57,7 +61,9 @@ implemented 另要求代码落地并有证据，proposed 一律放 [proposals/](
 | 有效登录下的真机验收（开放前 100 秒真实开页 / 前 5 秒盯按钮 / 混合计划 / 重启恢复 / 停止链路） | 只有用户能做 | [007 已知限制](decisions/007-runtime-timeline.md) |
 | 真实已截止活动视觉（demo 无样本）、真实断网确认 | 只有用户能做 | 同上；断网另有模拟证据 |
 | EXE 重开复用登录态真机确认 | 只有用户能做 | [006 已知限制](decisions/006-session-persistence.md) |
-| 可重播分步功能引导 | 新方案，未实现 | [proposals/replayable-product-tour.md](proposals/replayable-product-tour.md) |
+| 可重播分步功能引导 | 已实现（mock 截图 ≠ 有效登录验收），待用户真机过一遍 | [009 已知限制](decisions/009-replayable-product-tour.md) |
+| 生命周期提示 / 版本查看 / Release 入口真机确认 | 只有用户能做 | [008 已知限制](decisions/008-lifecycle-version-release.md) |
+| 五项体验缺陷 UX-01～05（空态误导 / 三步缺开始 / 已知零显示破折号 / 运行目标读旧选择 / 单场成功染整屏） | 源码已修、回归已定义，**运行验证与用户验收待授权** | [UI_SPEC §5.14](../docs/UI_SPEC.md) · [辅助入口规范](specs/assistance-panels.md) |
 
 ## 历史原型说明
 

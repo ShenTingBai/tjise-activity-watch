@@ -15,6 +15,15 @@
 | [005](005-attendance-filters.md) | 签到 / 签退三态筛选 | implemented |
 | [006](006-session-persistence.md) | 登录态持久化与启动校验 | implemented |
 | [007](007-runtime-timeline.md) | 运行时间线：真实事件 + 原定参考 + 统一截止 | implemented（真机验收待用户） |
+| [008](008-lifecycle-version-release.md) | 应用生命周期、版本单一来源与 EXE/ZIP 发布资产 | pending（实现待验收） |
+| [009](009-replayable-product-tour.md) | 六步可重播功能引导（说明/更多两处重播，内容版本 2） | pending（实现待验收；现行入口见 [../specs/assistance-panels.md](../specs/assistance-panels.md)） |
+| [010](010-standalone-exe-and-settings.md) | 独立可用单 EXE 与辅助入口 | pending（源码已落地，运行验证/实包验收待授权；入口名称与视觉已被 2026-10-25 返修取代，见 [../specs/assistance-panels.md](../specs/assistance-panels.md)） |
+
+> 008/009/010 的产品规则已确认（confirmed）；实现分轮落地、均尚无有效登录真机验收证据，
+> 按状态口径标 pending。规则确认与实现验收分列，
+> 不把「accepted 的提案」或「代码已写」当成「用户验收通过」。
+> 010 部分取代 008 的旧资产口径（外置 worker 定位与五成员 ZIP 已标历史）。
+> 2026-10-25 返修轮只取代 010 的**辅助入口名称与视觉**（设置 → 更多），资产形态与组件闭环不变。
 
 ## 每份记录必须包含
 

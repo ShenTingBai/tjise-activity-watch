@@ -429,5 +429,364 @@ class PlanRestoreContractTests(unittest.TestCase):
         self.assertEqual(task.get("retry_for_s"), 600, "恢复的重试策略不得丢")
 
 
+class LifecycleContractTests(unittest.TestCase):
+    """应用生命周期元数据：关闭时长、异常退出、登录估算（ui.json 独占，不碰登录文件）。
+
+    覆盖：compute_lifecycle 纯函数三态（clean/abnormal/unknown）与时钟回拨；
+    AppLifecycle 临时目录闭环（心跳/正常关闭/偏好合并不丢键）；登录估算按
+    saved_at + TOKEN_LIFETIME_H 绝对墙钟计算且不改动 session 文件内容与 mtime。
+    """
+
+    def _app(self):
+        sys.path.insert(0, str(LOCAL))
+        try:
+            import app as local_app
+        except Exception as exc:
+            self.skipTest("无法导入 local/app.py：%s" % exc)
+        finally:
+            sys.path.pop(0)
+        return local_app
+
+    @staticmethod
+    def _stamp(dt: datetime) -> str:
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    def test_clean_close_gives_exact_duration(self):
+        """正常关闭（有 last_closed_at 且心跳不晚于它）：精确关闭时长。"""
+        app = self._app()
+        closed = datetime.now() - timedelta(hours=1)
+        prev = {"last_closed_at": self._stamp(closed),
+                "last_heartbeat_at": self._stamp(closed - timedelta(seconds=5))}
+        life = app.compute_lifecycle(prev, datetime.now())
+        self.assertEqual(life["close_quality"], "clean")
+        self.assertAlmostEqual(life["closed_for_s"], 3600.0, delta=5.0)
+
+    def test_abnormal_exit_only_heartbeat_approx(self):
+        """异常退出（只有心跳）：只能给约值，质量标 abnormal。"""
+        app = self._app()
+        beat = datetime.now() - timedelta(hours=2)
+        life = app.compute_lifecycle({"last_heartbeat_at": self._stamp(beat)},
+                                     datetime.now())
+        self.assertEqual(life["close_quality"], "abnormal")
+        self.assertAlmostEqual(life["closed_for_s"], 7200.0, delta=5.0)
+        # 心跳晚于关闭时间（关闭后又跑过片刻）同样按 abnormal 的约值处理
+        closed = datetime.now() - timedelta(hours=3)
+        life2 = app.compute_lifecycle(
+            {"last_closed_at": self._stamp(closed),
+             "last_heartbeat_at": self._stamp(closed + timedelta(minutes=10))},
+            datetime.now())
+        self.assertEqual(life2["close_quality"], "abnormal")
+
+    def test_first_run_and_bad_values_are_unknown(self):
+        """首次运行 / 字段不可解析：未知，不给编造的时长。"""
+        app = self._app()
+        life = app.compute_lifecycle({}, datetime.now())
+        self.assertEqual(life["close_quality"], "unknown")
+        self.assertIsNone(life["closed_for_s"])
+        bad = app.compute_lifecycle({"last_closed_at": "not-a-time"}, datetime.now())
+        self.assertEqual(bad["close_quality"], "unknown")
+
+    def test_clock_rollback_is_unknown(self):
+        """系统时钟回拨（参考点晚于本次启动）：精确/约值都不可信。"""
+        app = self._app()
+        future = datetime.now() + timedelta(hours=2)
+        life = app.compute_lifecycle({"last_closed_at": self._stamp(future)},
+                                     datetime.now())
+        self.assertEqual(life["close_quality"], "unknown")
+        self.assertIsNone(life["closed_for_s"])
+
+    def test_lifecycle_writes_only_ui_json(self):
+        """生命周期记录只写 ui.json；session/storage_state 内容与 mtime 均不变。"""
+        import tempfile
+        app = self._app()
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            session = root / "session.json"
+            storage = root / "storage_state.json"
+            session.write_text('{"token": "t", "saved_at": "2026-10-25 08:00:00"}',
+                               encoding="utf-8")
+            storage.write_text('{"cookies": []}', encoding="utf-8")
+            # 旧 ui.json 只有界面偏好（缺生命周期字段）：必须平滑启动且偏好不丢
+            (root / "ui.json").write_text(
+                '{"filter": {"q": "讲座"}, "welcome_seen": true}', encoding="utf-8")
+            before = (session.read_bytes(), storage.read_bytes(),
+                      session.stat().st_mtime_ns, storage.stat().st_mtime_ns)
+            life = app.AppLifecycle(prefs_file=root / "ui.json")
+            try:
+                after = (session.read_bytes(), storage.read_bytes(),
+                         session.stat().st_mtime_ns, storage.stat().st_mtime_ns)
+                self.assertEqual(before, after,
+                                 "生命周期记录不得改动登录凭证文件（内容与 mtime）")
+                prefs = json.loads((root / "ui.json").read_text(encoding="utf-8"))
+                self.assertEqual(prefs["filter"]["q"], "讲座", "已有偏好不得被覆盖")
+                self.assertEqual(prefs["welcome_seen"], True)
+                self.assertIn("last_started_at", prefs, "启动必须写入本次开始时间")
+                # F5 语义：重复 snapshot 拿到同一份进程级生命周期（started 不变）
+                snap1 = life.snapshot()
+                snap2 = life.snapshot()
+                self.assertEqual(snap1["last_started_at"], snap2["last_started_at"])
+                self.assertEqual(snap1["close_quality"], "unknown", "旧 ui.json 缺字段=未知")
+            finally:
+                life.finalize()
+            closed = json.loads((root / "ui.json").read_text(encoding="utf-8"))["last_closed_at"]
+            self.assertTrue(closed, "正常关闭必须写入 last_closed_at")
+            life._thread.join(2)
+            self.assertFalse(life._thread.is_alive(), "关闭后心跳线程必须退出")
+
+    def test_heartbeat_merge_keeps_prefs_keys(self):
+        """心跳是读-合并-写：不能把用户偏好（筛选/引导状态）整份覆盖掉。"""
+        import tempfile
+        app = self._app()
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            life = app.AppLifecycle(prefs_file=root / "ui.json")
+            try:
+                # 模拟界面在心跳之后保存了一个筛选偏好，再看心跳会不会把它覆盖掉
+                life._write_merged({"filter": {"q": "志愿", "status": "all"}})
+                life._write_merged({"last_heartbeat_at": self._stamp(datetime.now())})
+                prefs = json.loads((root / "ui.json").read_text(encoding="utf-8"))
+                self.assertEqual(prefs["filter"]["q"], "志愿",
+                                 "心跳不得覆盖界面偏好（必须共用读-合并-写）")
+                self.assertIn("last_started_at", prefs)
+                self.assertIn("last_heartbeat_at", prefs)
+            finally:
+                life.finalize()
+
+    def test_run_open_false_with_contradictory_times_unknown(self):
+        """FG3：正常关闭标记下关闭早于本周期启动（如系统回拨后关机）→ 退未知，不伪造精确值。"""
+        app = self._app()
+        # 上一周期 20:00 启动、19:01 心跳、19:02 关闭；本次 19:03 启动：
+        # run_open=false 但时间顺序矛盾，closed<started_prev → unknown 且无时长
+        prev = {"run_open": False,
+                "last_started_at": "2026-10-24 20:00:00",
+                "last_heartbeat_at": "2026-10-24 19:01:00",
+                "last_closed_at": "2026-10-24 19:02:00"}
+        life = app.compute_lifecycle(prev, datetime(2026, 10, 24, 19, 3, 0))
+        self.assertEqual(life["close_quality"], "unknown",
+                         "时间矛盾时正常关闭标记不能覆盖顺序校验")
+        self.assertIsNone(life["closed_for_s"], "矛盾时间不给精确关闭时长")
+
+    def test_run_open_false_same_second_or_later_stays_clean(self):
+        """关闭不早于本周期启动（含同一秒等号）且心跳不晚于关闭：维持精确值主流程。"""
+        app = self._app()
+        prev = {"run_open": False,
+                "last_started_at": "2026-10-24 20:00:00",
+                "last_heartbeat_at": "2026-10-24 20:30:00",
+                "last_closed_at": "2026-10-24 21:00:00"}
+        life = app.compute_lifecycle(prev, datetime(2026, 10, 24, 23, 0, 0))
+        self.assertEqual(life["close_quality"], "clean")
+        self.assertAlmostEqual(life["closed_for_s"], 7200.0, delta=1.0)
+        same_second = app.compute_lifecycle(
+            dict(prev, last_heartbeat_at="2026-10-24 20:00:00",
+                 last_closed_at="2026-10-24 20:00:00"),
+            datetime(2026, 10, 24, 23, 0, 0))
+        self.assertEqual(same_second["close_quality"], "clean",
+                         "同一秒关闭与启动允许等号，仍按正常关闭")
+
+    def test_two_run_cycle_abnormal_then_clean(self):
+        """跨运行周期闭环：崩溃退出（不 finalize）→ 下次报「约」；正常关闭 → 再下次报精确。"""
+        import tempfile
+        app = self._app()
+        with tempfile.TemporaryDirectory() as name:
+            prefs_file = Path(name) / "ui.json"
+            # 第一次运行：2 小时前启动并留有心跳，然后像崩溃一样消失（不写关闭、run_open 残留 true）。
+            # 直接改文件模拟：_write_merged 在置停后会被停止标记拦下，不能用它伪造迟到心跳。
+            past = datetime.now() - timedelta(hours=2)
+            prefs_file.write_text(json.dumps({
+                "last_started_at": self._stamp(past),
+                "last_heartbeat_at": self._stamp(past),
+                "run_open": True,
+            }, ensure_ascii=False), encoding="utf-8")
+            # 第二次运行：run_open=true 只能给「约」，参考点是心跳（2 小时前）
+            life2 = app.AppLifecycle(prefs_file=prefs_file)
+            try:
+                snap2 = life2.snapshot()
+                self.assertEqual(snap2["close_quality"], "abnormal",
+                                 "run_open 残留 true 的上一周期必须按异常退出处理")
+                self.assertAlmostEqual(snap2["closed_for_s"], 7200.0, delta=5.0)
+            finally:
+                life2.finalize()   # 这次是正常关闭
+            # 第三次运行：run_open=false + 关闭时间不早于该周期启动 → 精确（很短的）时长
+            life3 = app.AppLifecycle(prefs_file=prefs_file)
+            try:
+                snap3 = life3.snapshot()
+                self.assertEqual(snap3["close_quality"], "clean",
+                                 "正常关闭后的重开必须拿到精确关闭时长")
+                self.assertIsNotNone(snap3["closed_for_s"])
+                self.assertLess(snap3["closed_for_s"], 60.0,
+                                "紧邻重开的关闭时长应接近 0，而不是心跳粒度的约值")
+            finally:
+                life3.finalize()
+
+    def test_run_open_marker_prevents_stale_clean(self):
+        """R3 主场景：A 正常关闭后 B 重开即崩，C 不得把 A 的关闭时间当 B 的正常退出。"""
+        app = self._app()
+        closed_a = datetime.now() - timedelta(hours=3)
+        started_b = datetime.now() - timedelta(minutes=10)
+        prev = {"last_closed_at": self._stamp(closed_a),
+                "last_started_at": self._stamp(started_b),
+                "last_heartbeat_at": self._stamp(started_b),
+                "run_open": True}       # B 崩溃：没人写 false
+        life = app.compute_lifecycle(prev, datetime.now())
+        self.assertEqual(life["close_quality"], "abnormal",
+                         "上一周期 run_open=true 只能是异常退出")
+        self.assertAlmostEqual(life["closed_for_s"], 600.0, delta=5.0,
+                               msg="参考点必须是 B 的存活时刻（约 10 分钟），不是 A 的 3 小时前关闭")
+
+    def test_run_open_with_bad_heartbeat_falls_back_to_start(self):
+        """run_open=true 且心跳不可解析：退该周期启动时刻，仍给「约」。"""
+        app = self._app()
+        started = datetime.now() - timedelta(minutes=5)
+        life = app.compute_lifecycle({"run_open": True,
+                                      "last_started_at": self._stamp(started),
+                                      "last_heartbeat_at": "garbage"},
+                                     datetime.now())
+        self.assertEqual(life["close_quality"], "abnormal")
+        self.assertAlmostEqual(life["closed_for_s"], 300.0, delta=5.0)
+
+    def test_same_second_close_reopen_marker_decides(self):
+        """同一秒关闭→重开：关闭记录属于谁由 run_open 标记区分，不再靠秒级比大小。"""
+        app = self._app()
+        at = datetime.now() - timedelta(minutes=1)
+        base = {"last_closed_at": self._stamp(at),
+                "last_started_at": self._stamp(at),
+                "last_heartbeat_at": self._stamp(at)}
+        clean = app.compute_lifecycle(dict(base, run_open=False), datetime.now())
+        self.assertEqual(clean["close_quality"], "clean", "run_open=false = 正常关闭，同秒也是精确")
+        crash = app.compute_lifecycle(dict(base, run_open=True), datetime.now())
+        self.assertEqual(crash["close_quality"], "abnormal", "run_open=true = 没走正常关闭，同秒也只是约值")
+
+    def test_legacy_stale_closed_degrades_to_abnormal(self):
+        """旧格式（无 run_open）：关闭记录早于上一周期启动 → 降级 abnormal，参考最近存活时刻。"""
+        app = self._app()
+        prev = {"last_closed_at": self._stamp(datetime.now() - timedelta(hours=3)),
+                "last_started_at": self._stamp(datetime.now() - timedelta(minutes=10)),
+                "last_heartbeat_at": self._stamp(datetime.now() - timedelta(minutes=11))}
+        life = app.compute_lifecycle(prev, datetime.now())
+        self.assertEqual(life["close_quality"], "abnormal",
+                         "旧关闭记录属于更早周期，不得冒充最近周期的正常关闭")
+        self.assertAlmostEqual(life["closed_for_s"], 600.0, delta=5.0,
+                               msg="参考点取最近存活时刻（启动后 10 分钟），而不是 3 小时前的旧关闭")
+
+    def test_finalize_ignores_straggler_heartbeat(self):
+        """finalize 之后迟到的心跳必须被停止标记拦下：关闭记录不被覆写。"""
+        import tempfile
+        app = self._app()
+        with tempfile.TemporaryDirectory() as name:
+            prefs_file = Path(name) / "ui.json"
+            life = app.AppLifecycle(prefs_file=prefs_file)
+            life.finalize()
+            closed_prefs = json.loads(prefs_file.read_text(encoding="utf-8"))
+            self.assertIs(closed_prefs.get("run_open"), False, "正常关闭必须写 run_open=false")
+            self.assertTrue(closed_prefs.get("last_closed_at"))
+            # 已置停后的心跳写入：锁内核验停止标记，必须直接放弃
+            life._write_merged({"last_heartbeat_at":
+                                self._stamp(datetime.now() + timedelta(hours=1))})
+            after = json.loads(prefs_file.read_text(encoding="utf-8"))
+            self.assertEqual(after, closed_prefs,
+                             "置停后的心跳不得写入（last_heartbeat_at 不得晚于关闭时刻）")
+            life._thread.join(2)
+            self.assertFalse(life._thread.is_alive())
+
+    def test_finalize_concurrent_with_heartbeat_no_deadlock(self):
+        """心跳写入与 finalize 并发：不死锁，最终文件里心跳不晚于关闭。"""
+        import tempfile
+        app = self._app()
+        with tempfile.TemporaryDirectory() as name:
+            prefs_file = Path(name) / "ui.json"
+            life = app.AppLifecycle(prefs_file=prefs_file)
+            # 缩短心跳间隔制造真实并发，再立刻收尾
+            life.INTERVAL_S = 0.01
+            try:
+                life.finalize()   # 不持锁 join：若实现持锁 join，这里会卡死超时
+            finally:
+                life._thread.join(5)
+            self.assertFalse(life._thread.is_alive(), "关闭后心跳线程必须能退出（无死锁）")
+            prefs = json.loads(prefs_file.read_text(encoding="utf-8"))
+            self.assertIs(prefs.get("run_open"), False)
+            beat = app._parse_local_time(prefs.get("last_heartbeat_at"))
+            closed = app._parse_local_time(prefs.get("last_closed_at"))
+            self.assertIsNotNone(closed)
+            if beat is not None:
+                self.assertLessEqual(beat, closed,
+                                     "最后一次心跳不得晚于关闭时刻（锁内核验停止标记）")
+
+    def test_check_anchor_switches_on_relogin_and_never_writes(self):
+        """R4 后端侧：估算锚点跟当前会话走（旧→新 saved_at 切换）；读会话不写文件。"""
+        import tempfile
+        app = self._app()
+        with tempfile.TemporaryDirectory() as name:
+            session = Path(name) / "session.json"
+            old_saved = datetime.now() - timedelta(hours=12)
+            session.write_text(json.dumps(
+                {"token": "t-old", "saved_at": self._stamp(old_saved)}), encoding="utf-8")
+            with mock.patch.object(app, "SESSION_FILE", session):
+                first = app.login_state()
+                self.assertAlmostEqual(
+                    first["estimated_expires_at"],
+                    old_saved.timestamp() + app.TOKEN_LIFETIME_H * 3600.0, delta=5.0)
+                # 重复校验不延长、不写文件（login_state 只读）
+                before = (session.read_bytes(), session.stat().st_mtime_ns)
+                app.login_state()
+                app.login_state()
+                self.assertEqual(before, (session.read_bytes(), session.stat().st_mtime_ns),
+                                 "读取登录估算不得改动会话文件")
+                # 窗口内重新登录：新 saved_at → 新锚点（旧锚点立即作废）
+                new_saved = datetime.now() - timedelta(minutes=1)
+                session.write_text(json.dumps(
+                    {"token": "t-new", "saved_at": self._stamp(new_saved)}), encoding="utf-8")
+                second = app.login_state()
+                self.assertGreater(second["estimated_expires_at"], first["estimated_expires_at"] + 3600.0,
+                                   "重登后估算必须按新 saved_at 起算")
+            # 生命周期快照不再携带登录估算（唯一来源是 login_state 载荷）
+            src = (LOCAL / "app.py").read_text(encoding="utf-8")
+            self.assertIn('"estimated_expires_at": state.get("estimated_expires_at")', src,
+                          "check 事件必须带当前会话的估算锚点（与 bootstrap 同源）")
+            self.assertNotIn('"login": {', src[src.index("def snapshot"):src.index("def finalize")],
+                             "lifecycle 快照不得再内嵌登录估算（避免冻结旧值第二来源）")
+
+    def test_saved_at_estimate_survives_overnight_gap(self):
+        """saved_at 跨关闭间隔继续计算：估算只看绝对墙钟，不看本进程跑了多久。"""
+        app = self._app()
+        # 12 小时前保存的会话 + 中间关机 10 小时：剩余仍按 saved_at 起算 ≈ 5.5 小时
+        saved = datetime.now() - timedelta(hours=12)
+        life = app.compute_lifecycle({"last_closed_at": self._stamp(datetime.now() - timedelta(hours=10))},
+                                     datetime.now())
+        self.assertEqual(life["close_quality"], "clean")
+        self.assertAlmostEqual(life["closed_for_s"], 36000.0, delta=5.0,
+                               msg="关闭时长覆盖整段关机间隔（这里 10 小时）")
+        est = saved.timestamp() + app.TOKEN_LIFETIME_H * 3600.0
+        self.assertAlmostEqual((est - datetime.now().timestamp()) / 3600.0, 5.5, delta=0.01,
+                               msg="登录剩余与进程是否运行无关，按 saved_at 绝对墙钟计算")
+
+    def test_login_estimate_absolute_clock(self):
+        """登录估算 = saved_at + TOKEN_LIFETIME_H（绝对墙钟，跨关闭间隔继续计算）。"""
+        import tempfile
+        app = self._app()
+        with tempfile.TemporaryDirectory() as name:
+            session = Path(name) / "session.json"
+            saved = datetime.now() - timedelta(hours=10)
+            session.write_text(json.dumps(
+                {"token": "t", "saved_at": self._stamp(saved)}), encoding="utf-8")
+            with mock.patch.object(app, "SESSION_FILE", session):
+                state = app.login_state()
+            self.assertEqual(state["saved_at"], self._stamp(saved))
+            expect = saved.timestamp() + app.TOKEN_LIFETIME_H * 3600.0
+            self.assertAlmostEqual(state["estimated_expires_at"], expect, delta=1.0)
+            self.assertAlmostEqual(state["hours_left"], 7.5, delta=0.01)
+            # 估算到期（25 小时前登录）也不清理会话：登录有效性只由学校校验决定
+            stale = datetime.now() - timedelta(hours=25)
+            session.write_text(json.dumps(
+                {"token": "t", "saved_at": self._stamp(stale)}), encoding="utf-8")
+            body = session.read_text(encoding="utf-8")
+            with mock.patch.object(app, "SESSION_FILE", session):
+                expired = app.login_state()
+            self.assertEqual(session.read_text(encoding="utf-8"), body,
+                             "login_state 不得改写 session 文件")
+            self.assertTrue(expired["session_present"])
+            self.assertEqual(expired["hours_left"], 0.0)
+            self.assertLess(expired["estimated_expires_at"], datetime.now().timestamp())
+
+
 if __name__ == "__main__":
     unittest.main()
