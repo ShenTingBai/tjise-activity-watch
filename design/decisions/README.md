@@ -19,6 +19,7 @@
 | [009](009-replayable-product-tour.md) | 六步可重播功能引导（统一帮助内重播，内容版本2） | implemented（用户真机待验收，现行入口见011） |
 | [010](010-standalone-exe-and-settings.md) | 独立可用单EXE与组件诊断 | implemented（离线实包已通过，辅助入口由011取代） |
 | [011](011-unified-help-and-manual-update.md) | 单帮助入口、主题对齐与手动检查更新 | confirmed（代码已落地，技术与用户验收分列） |
+| [012](012-independent-beijing-clock.md) | 独立北京时间贯穿界面/计划/worker/登录估算（006/007/008 受影响条款就地修订） | confirmed + implemented（隔离验收见 20261026-independent-beijing-clock result；真实学校验收 pending） |
 
 > 008/009/010 机制已有隔离运行证据；有效登录真机验收和正式发行仍各自待确认。
 > 不应把用户验收未完成混写成代码尚未实现，规则确认与实现验收分列，

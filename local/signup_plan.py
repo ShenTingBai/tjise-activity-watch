@@ -15,8 +15,21 @@ import threading
 import time
 from typing import Callable, Iterable
 
+# 学校时间只有一份解析口径（UTC+8）；本机 saved_at/生命周期文本不走这里。
+# 源码态 local/ 在 sys.path 上时用裸导入（与 grab.py 一致）；作为
+# local.signup_plan 包导入（测试/工具）时退回相对导入。
+try:
+    from time_contract import TIME_FORMAT, parse_school_time, school_epoch, default_now
+except ImportError:  # pragma: no cover - 取决于导入方式
+    from .time_contract import (TIME_FORMAT, parse_school_time, school_epoch,
+                                default_now)
+# 校时失效由 business_clock 定义；协调器只捕获这一种，不吞其它异常
+try:
+    from business_clock import ClockUnavailable
+except ImportError:  # pragma: no cover
+    from .business_clock import ClockUnavailable
 
-TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
 TERMINAL_TASK_STATES = {"success", "already_signed", "failed", "canceled"}
 
 # 报名模式三分类：预报名 / 立即报名（抢名额）/ 已截止，都是正式产品模式
@@ -28,13 +41,12 @@ CHECKPOINT_FIELDS = ("run_started_at", "page_opened_at", "watch_started_at", "re
 
 
 def parse_timestamp(value: object) -> datetime | None:
-    """解析学校返回的本地时间；缺失、非法值都返回 None，不猜当前日期。"""
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        return datetime.strptime(value.strip(), TIME_FORMAT)
-    except ValueError:
-        return None
+    """解析学校返回的时间；缺失、非法值都返回 None，不猜当前日期。
+
+    返回带东八区时区的 datetime：同一串学校时间在任何本机时区下
+    `.timestamp()` 都必须相等。
+    """
+    return parse_school_time(value)
 
 
 def classify_signup_mode(sign_start: str, sign_end: str,
@@ -48,7 +60,7 @@ def classify_signup_mode(sign_start: str, sign_end: str,
     截止缺失沿用 worker 的安全回退，不误当成已截止；
     活动举办时间 act_start/act_end 不参与分类——它只用于冲突检查。
     """
-    now = time.time() if now is None else now
+    now = default_now() if now is None else now
     end = parse_timestamp(sign_end)
     if end is not None and end.timestamp() <= now:
         return "closed"
@@ -87,25 +99,39 @@ class TaskSpec:
     # 预报名提前准备窗口（秒）：协调器在 sign_start-lead_s 启动 worker，
     # worker 先打开详情页、开放前 5 秒进入盯按钮；快照携带，重载不丢
     lead_s: int = 100
+    # 计划接纳时冻结的重试窗口起点（epoch 秒）：未来场=原定开放，
+    # 已开放场=接纳时刻。worker 用它当 --retry-start——鉴权、解包、页面加载
+    # 花掉的时间都消耗这段预算，慢页面不得把截止整体后移（R04）
+    retry_started_at: float = 0.0
 
     @classmethod
     def from_activity(cls, activity: dict, task_id: str, headed: bool = False,
                       retry_for_s: int = 120, max_attempts: int = 0,
                       now: float | None = None, lead_s: int = 100) -> "TaskSpec":
+        sign_start = str(activity.get("sign_start") or "")
+        sign_end = str(activity.get("sign_end") or "")
+        # 接纳时刻只取一次：同一计划里所有场次共用同一个 accepted_at，
+        # 不能每场各取一次 time.time()（那会让先构建的场次窗口更长）
+        accepted = float(default_now() if now is None else now)
+        mode = classify_signup_mode(sign_start, sign_end, accepted)
+        start_epoch = school_epoch(sign_start)
+        # 未来场固定从原定开放起算；已开放场从计划接纳时刻起算
+        frozen_start = start_epoch if (mode == "pre_register" and start_epoch is not None) \
+            else accepted
         return cls(
             task_id=str(task_id),
             activity_id=str(activity.get("id") or ""),
             name=str(activity.get("name") or "活动"),
-            sign_start=str(activity.get("sign_start") or ""),
+            sign_start=sign_start,
             act_start=str(activity.get("act_start") or ""),
             act_end=str(activity.get("act_end") or ""),
             headed=bool(headed),
-            sign_end=str(activity.get("sign_end") or ""),
+            sign_end=sign_end,
             retry_for_s=int(retry_for_s),
             max_attempts=int(max_attempts),
-            signup_mode=classify_signup_mode(str(activity.get("sign_start") or ""),
-                                             str(activity.get("sign_end") or ""), now),
+            signup_mode=mode,
             lead_s=int(lead_s),
+            retry_started_at=float(frozen_start),
         )
 
     def as_dict(self) -> dict:
@@ -122,6 +148,7 @@ class TaskSpec:
             "max_attempts": self.max_attempts,
             "signup_mode": self.signup_mode,
             "lead_s": self.lead_s,
+            "retry_started_at": self.retry_started_at,
         }
 
 
@@ -132,7 +159,7 @@ def validate_plan(activities: Iterable[dict], now: float | None = None) -> dict:
     活动举办时间只用于冲突与完整性检查，不因举办时间已开始/结束而拦截。
     """
     rows = list(activities or [])
-    now_ts = time.time() if now is None else now
+    now_ts = default_now() if now is None else now
     errors: list[dict] = []
     conflicts: list[dict] = []
     specs: list[TaskSpec] = []
@@ -165,7 +192,8 @@ def validate_plan(activities: Iterable[dict], now: float | None = None) -> dict:
             errors.append({"kind": "activity_time_unknown", "activity_id": aid, "name": name})
         elif end <= start:
             errors.append({"kind": "activity_time_invalid", "activity_id": aid, "name": name})
-        specs.append(TaskSpec.from_activity(activity, "", bool(activity.get("headed"))))
+        specs.append(TaskSpec.from_activity(activity, "", bool(activity.get("headed")),
+                                            now=now_ts))
 
     for index, left in enumerate(specs):
         left_start = parse_timestamp(left.act_start)
@@ -219,7 +247,7 @@ class PlanCoordinator:
         self.specs = list(specs)
         self.runner = runner
         self.emit = emit
-        self.now = now or time.time
+        self.now = now or default_now
         self.sleep = sleep or time.sleep
         self._stop = threading.Event()
         self._lock = threading.RLock()
@@ -266,47 +294,91 @@ class PlanCoordinator:
         with self._lock:
             return self._plan_payload(self._plan_status())
 
+    def next_prepare_epoch(self) -> "float | None":
+        """仍未终态场次里最早的准备时刻（业务 epoch）；没有返回 None。
+        供父层在最早准备点前 20 秒请求一次时钟重校（决策 012）。"""
+        with self._lock:
+            pending = [spec for spec in self.specs
+                       if self._states.get(spec.task_id) not in TERMINAL_TASK_STATES]
+            if not pending:
+                return None
+            return min(self._prepare_ts(spec) for spec in pending)
+
     def _run(self) -> None:
         # 每场按自己的准备时刻调度：instant_signup 在计划启动后立即拉起
         # worker，pre_register 在原定开放前 lead_s 秒拉起（提前打开详情页，
         # 开放前 5 秒进入盯按钮）；同一准备时刻的任务仍同时启动。
         # 不再「按 sign_start 分组阻塞等待 + join 整批」——那会让 --lead 失效，
         # 也会让第一场的重试把后面所有批次推迟过自己的准备时刻。
-        self._started_at = self.now()
-        pending = [spec for spec in self.specs
-                   if self._states.get(spec.task_id) not in TERMINAL_TASK_STATES]
-        for spec in pending:
-            self._set_state(spec.task_id, "waiting")
-        pending.sort(key=self._prepare_ts)
+        # 校时失效：不启动新 worker，取消未启动场次并保留已发生事实；
+        # 无论走哪条路径都只在 finally 里发一次 plan_done。
         threads: list[threading.Thread] = []
-        index = 0
-        while index < len(pending) and not self._stop.is_set():
-            prepare_ts = self._prepare_ts(pending[index])
-            while self.now() < prepare_ts and not self._stop.is_set():
-                if all(self._events[s.task_id].is_set() for s in pending[index:]):
-                    break                     # 剩余任务全部取消：不再等这个时刻
-                self.sleep(min(0.2, max(0.01, prepare_ts - self.now())))
-            if self._stop.is_set():
-                break
-            while index < len(pending) and self._prepare_ts(pending[index]) == prepare_ts:
-                spec = pending[index]
-                index += 1
-                if self._events[spec.task_id].is_set():
-                    continue                  # 已取消/停止：cancel 路径已置终态
-                thread = threading.Thread(target=self._run_one, args=(spec,),
-                                          name="signup-task-%s" % spec.task_id, daemon=True)
-                threads.append(thread)
-                thread.start()
-        # 不在批次间 join：任务线程独立跑完（重试中的场次不阻塞后续调度）；
-        # 收尾统一等待全部落定，再发唯一一次 plan_done。
+        clock_lost = ""
+        try:
+            self._started_at = self.now()
+            pending = [spec for spec in self.specs
+                       if self._states.get(spec.task_id) not in TERMINAL_TASK_STATES]
+            for spec in pending:
+                self._set_state(spec.task_id, "waiting")
+            pending.sort(key=self._prepare_ts)
+            index = 0
+            while index < len(pending) and not self._stop.is_set():
+                prepare_ts = self._prepare_ts(pending[index])
+                while self.now() < prepare_ts and not self._stop.is_set():
+                    if all(self._events[s.task_id].is_set() for s in pending[index:]):
+                        break                     # 剩余任务全部取消：不再等这个时刻
+                    self.sleep(min(0.2, max(0.01, prepare_ts - self.now())))
+                if self._stop.is_set():
+                    break
+                while index < len(pending) and self._prepare_ts(pending[index]) == prepare_ts:
+                    spec = pending[index]
+                    index += 1
+                    if self._events[spec.task_id].is_set():
+                        continue                  # 已取消/停止：cancel 路径已置终态
+                    thread = threading.Thread(target=self._run_one, args=(spec,),
+                                              name="signup-task-%s" % spec.task_id,
+                                              daemon=True)
+                    threads.append(thread)
+                    thread.start()
+        except ClockUnavailable as exc:
+            clock_lost = str(exc)
+            # 不启动新 worker；未启动场次如实标「本场未启动」，不冒充学校拒绝
+            for task_id, state in list(self._states.items()):
+                if state in {"queued", "waiting"}:
+                    self._set_state(task_id, "canceled",
+                                    {"reason": "北京时间暂不可用，本场未启动"})
+            # 已启动场次由各自 worker 的时钟门禁收尾；这里只唤醒等待者
+            for event in self._events.values():
+                event.set()
+        finally:
+            # 不在批次间 join：任务线程独立跑完（重试中的场次不阻塞后续调度）；
+            # 收尾统一等待全部落定，再发唯一一次 plan_done。校时失效时 join 有界，
+            # 不让一个永不结束的等待把 plan_done 藏起来。
+            self._join_threads(threads, None if not clock_lost
+                               else max(60.0, float(max(
+                                   [int(spec.retry_for_s or 0) for spec in self.specs] or [0])))
+                               + 30.0)
+            self.emit("plan_done", {
+                "plan_id": self.plan_id,
+                "status": self._plan_status(),
+                "ok": self._plan_status() == "completed",
+                "clock_unavailable": clock_lost or None,
+                "summary": self._summary(),
+            })
+
+    @staticmethod
+    def _join_threads(threads: list, timeout_s: "float | None" = None) -> None:
+        """默认等全部场次落定；给了 timeout_s 时按总时长有界等待（失效收尾用）。"""
+        if timeout_s is None:
+            for thread in threads:
+                thread.join()
+            return
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
         for thread in threads:
-            thread.join()
-        self.emit("plan_done", {
-            "plan_id": self.plan_id,
-            "status": self._plan_status(),
-            "ok": self._plan_status() == "completed",
-            "summary": self._summary(),
-        })
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(remaining)
 
     def _prepare_ts(self, spec: TaskSpec) -> float:
         """任务的 worker 启动时刻（支持注入 now 的 fake clock）。

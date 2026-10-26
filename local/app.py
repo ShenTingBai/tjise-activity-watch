@@ -14,21 +14,36 @@
 """
 from __future__ import annotations
 
+import atexit
+import contextlib
+import ctypes
 import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
+
+# 演示模式的数据根隔离必须在导入 runtime_paths 之前完成：
+# DATA_DIR 是导入期常量，晚一步就已经指向真实 %LOCALAPPDATA%，bootstrap 会读真实凭证。
+# 只认显式 --demo；不覆盖用户自己指定的 TJISE_DATA_DIR。
+if "--demo" in sys.argv and not os.environ.get("TJISE_DATA_DIR", "").strip():
+    _demo_root = tempfile.mkdtemp(prefix="tjise-demo-")
+    os.environ["TJISE_DATA_DIR"] = _demo_root
+    atexit.register(shutil.rmtree, _demo_root, True)
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import webview
 
 from signup_plan import PlanCoordinator, TaskSpec, classify_signup_mode, validate_plan
+from business_clock import BusinessClock, ClockUnavailable
+from time_contract import school_epoch, school_time_text, configure_time_source
 from update_check import check_latest_release
 
 # 登录态/偏好统一数据根：开发用 local/data，冻结 EXE 用 %LOCALAPPDATA%
@@ -162,11 +177,12 @@ def demo_items() -> list[dict]:
     }
     out = []
     for i, (aid, name, kind, place, s_off, e_off, act_s_off, act_e_off, signed) in enumerate(raw):
-        start = datetime.fromtimestamp(now + s_off).strftime("%Y-%m-%d %H:%M:%S")
-        end = datetime.fromtimestamp(now + e_off).strftime("%Y-%m-%d %H:%M:%S")
+        # 样例时间也按学校东八区格式化：界面按 UTC+8 解析，用本机时区写会错位
+        start = school_time_text(now + s_off)
+        end = school_time_text(now + e_off)
         # 举办时间未公布时保持空串，和 grab.py list --json 的缺失形态一致
-        act_start = "" if act_s_off is None else datetime.fromtimestamp(now + act_s_off).strftime("%Y-%m-%d %H:%M:%S")
-        act_end = "" if act_e_off is None else datetime.fromtimestamp(now + act_e_off).strftime("%Y-%m-%d %H:%M:%S")
+        act_start = "" if act_s_off is None else school_time_text(now + act_s_off)
+        act_end = "" if act_e_off is None else school_time_text(now + act_e_off)
         checkin_required, checkout_required = flags.get(aid, (None, None))
         out.append({"index": i + 1, "id": aid, "name": name, "type": kind,
                     "place": place, "sign_start": start, "sign_end": end,
@@ -179,6 +195,10 @@ def demo_items() -> list[dict]:
     return out
 
 
+# main 建立 BusinessClock 后登记快照路径与 owner（_env 给 worker 用）
+_CLOCK_ENV = {"path": "", "owner": ""}
+
+
 def _env() -> dict:
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
@@ -186,6 +206,10 @@ def _env() -> dict:
     # 把主程序解析好的数据根传给 worker：即使 worker 所在目录不同，
     # 两侧也会读写同一份 session/storage_state
     env["TJISE_DATA_DIR"] = str(DATA_DIR)
+    # 同实例时钟快照：worker 复用父进程校时结果，不各自另选源（决策 012）
+    if _CLOCK_ENV.get("path"):
+        env["TJISE_CLOCK_SNAPSHOT"] = _CLOCK_ENV["path"]
+        env["TJISE_CLOCK_OWNER"] = _CLOCK_ENV["owner"]
     return env
 
 
@@ -218,31 +242,196 @@ def _atomic_write_prefs(path: Path, prefs: dict) -> None:
     os.replace(tmp, path)
 
 
-# 界面偏好与生命周期心跳共用的持久化锁：读-合并-写必须串行，
-# 否则心跳的整份快照会覆盖用户刚存的筛选/引导状态（反之亦然）
-_PREFS_LOCK = threading.Lock()
+# ---- 独立北京时间（决策 012）-----------------------------------------------
+# 生产 main 恒注入 BusinessClock；未注入时这里是显式不可用，绝不回退本机墙钟。
+# 测试需要可读时钟时必须显式注入 Fake（见 local/tests/fixtures/business_clock.py）。
+class _UnavailableClock:
+    """未配置时钟：所有业务读数显式失败，不提供任何墙钟替身。"""
+
+    owner_id = ""
+    generation = 0
+
+    def now(self) -> float:
+        raise ClockUnavailable("业务时钟未配置")
+
+    def bounds(self):
+        raise ClockUnavailable("业务时钟未配置")
+
+    def elapsed_s(self) -> float:
+        return time.monotonic()      # 仅用于本地监督，不当作业务时刻
+
+    def state(self) -> str:
+        return "unavailable"
+
+    @property
+    def reason(self) -> str:
+        return "业务时钟未配置"
+
+    def request_resync(self) -> None:
+        pass
+
+    def snapshot(self) -> dict:
+        raise ClockUnavailable("业务时钟未配置")
 
 
-def update_prefs(patch: dict) -> None:
-    """统一的原子读-合并-写（Api.save_prefs 与生命周期心跳共用同一把锁）。"""
-    with _PREFS_LOCK:
-        prefs = load_prefs()
-        prefs.update(patch or {})
-        _atomic_write_prefs(PREFS, prefs)
+def _credential_id(token: str) -> str:
+    """本机内部凭证摘要：只用于把 v2 锚点和具体凭证绑定，不输出到日志。"""
+    import hashlib
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()[:16]
 
 
-def token_hours_left() -> float | None:
-    """按 session.json 的 saved_at 估算剩余时间（足够给界面显示，不参与判断）。"""
+def token_hours_left(clock=None) -> "float | None":
+    """登录剩余时间估算（只显示，不参与判断）。
+
+    只有 ui.json 里存在与当前凭证匹配的 session_timing_v2 锚点（新登录且有可信
+    北京时间时建立）且本次读得到可信业务时刻才报数；旧 saved_at 是本机墙钟文本，
+    无法反推真实 UTC，绝不拿系统当前时间减它冒充准确小时数。
+    返回 None = 「暂无法估算」，登录有效性永远由学校真实校验决定。
+    """
     try:
         data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
-        saved = datetime.strptime(data["saved_at"], "%Y-%m-%d %H:%M:%S")
+        token = str(data.get("token") or "").strip()
     except Exception:
         return None
-    used = (datetime.now() - saved).total_seconds() / 3600.0
+    if not token:
+        return None
+    timing = {}
+    try:
+        timing = (load_prefs() or {}).get("session_timing_v2") or {}
+    except Exception:
+        timing = {}
+    if not isinstance(timing, dict) or timing.get("credential_id") != _credential_id(token):
+        return None
+    saved_epoch = timing.get("saved_epoch")
+    if not isinstance(saved_epoch, (int, float)):
+        return None
+    if clock is None:
+        return None          # 无业务时钟就不报数，不拿系统时间冒充北京时间
+    try:
+        now = clock.now()
+    except Exception:
+        return None
+    used = (float(now) - float(saved_epoch)) / 3600.0
     return max(0.0, TOKEN_LIFETIME_H - used)
 
 
-def login_state() -> dict:
+def save_session_timing_anchor(token: str, epoch: float, uncertainty_s: float = 0.0) -> None:
+    """新登录成功且有可信北京时间时建立 v2 锚点；换凭证必须换新锚点。"""
+    if not token:
+        return
+    update_prefs({"session_timing_v2": {
+        "credential_id": _credential_id(token),
+        "saved_epoch": float(epoch),
+        "time_source": "ntp",
+        "uncertainty_s": round(float(uncertainty_s), 3)}})
+
+
+# 界面偏好与生命周期心跳共用的持久化锁：读-合并-写必须串行，
+# 否则心跳的整份快照会覆盖用户刚存的筛选/引导状态（反之亦然）
+_PREFS_LOCK = threading.Lock()
+_PREFS_LOCK_TIMEOUT_S = 1.0      # 生命周期元数据：拿不到就放弃本次写入
+_PREFS_SAVE_TIMEOUT_S = 3.0      # 用户偏好：给正在收尾的另一个进程留出时间
+
+
+class _PrefsLockTimeout(RuntimeError):
+    """同一偏好文件的跨进程短时锁在期限内没有拿到。"""
+
+
+def _acquire_prefs_file_lock(handle, timeout_s: float) -> None:
+    """给已打开的锁文件加排他锁（标准库：Windows msvcrt / POSIX fcntl）。
+
+    只用 1 字节区域锁表达「正在读-核验-写」；不写入业务内容，也不依赖锁文件
+    内容本身。轮询而非阻塞，才能在窗口关闭路径上有界放弃。
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    if sys.platform == "win32":
+        import msvcrt
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")        # 区域锁需要文件里至少有一个字节
+            handle.flush()
+        while True:
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise _PrefsLockTimeout("偏好文件正被另一个进程写入")
+                time.sleep(0.005)
+    else:
+        import fcntl
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise _PrefsLockTimeout("偏好文件正被另一个进程写入")
+                time.sleep(0.005)
+
+
+def _release_prefs_file_lock(handle) -> None:
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _prefs_transaction(path: Path, *, timeout_s: float = _PREFS_LOCK_TIMEOUT_S):
+    """同一 prefs 路径的进程内 + 跨进程短时排他事务。
+
+    进程内沿用 _PREFS_LOCK；跨进程用与 ui.json 同目录的 ``ui.json.lock`` 区域锁。
+    事务只覆盖「读-核验-合并-原子写」，调用方不得持锁联网或等待子进程。
+    拿不到跨进程锁时抛 _PrefsLockTimeout：宁可放弃这次元数据写入，也不写回
+    一份未核验归属的旧快照。
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    if not _PREFS_LOCK.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        raise _PrefsLockTimeout("偏好文件正在写入")
+    try:
+        lock_path = Path(str(path) + ".lock")
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(lock_path, "a+b")
+        except OSError:
+            raise _PrefsLockTimeout("偏好锁文件不可创建")
+        try:
+            _acquire_prefs_file_lock(handle, max(0.0, deadline - time.monotonic()))
+            try:
+                yield
+            finally:
+                _release_prefs_file_lock(handle)
+        finally:
+            handle.close()
+    finally:
+        _PREFS_LOCK.release()
+
+
+def update_prefs(patch: dict) -> bool:
+    """统一的原子读-合并-写（Api.save_prefs 与生命周期心跳共用同一把锁）。
+
+    拿不到跨进程锁就返回失败：绕过文件锁写入会覆盖另一个实例刚保存的周期。
+    调用方可重试用户偏好；可选登录估算落盘失败也不影响真实登录成功。
+    """
+    try:
+        with _prefs_transaction(PREFS, timeout_s=_PREFS_SAVE_TIMEOUT_S):
+            prefs = load_prefs()
+            prefs.update(patch or {})
+            _atomic_write_prefs(PREFS, prefs)
+        return True
+    except _PrefsLockTimeout:
+        return False
+
+
+def login_state(clock=None) -> dict:
     """登录三态快照：界面靠它区分「从没登录过」和「登录过期」。
 
     「没有登录」= session.json 不存在、无法解析或缺少 token；
@@ -265,8 +454,13 @@ def login_state() -> dict:
     saved = _parse_local_time(saved_text)
     if saved is not None:
         state["saved_at"] = saved_text
-        state["estimated_expires_at"] = saved.timestamp() + TOKEN_LIFETIME_H * 3600.0
-    state["hours_left"] = token_hours_left()
+    # 剩余时间只信 v2 锚点：旧 saved_at 是本机墙钟文本，宁可显示「暂无法估算」
+    state["hours_left"] = token_hours_left(clock)
+    if state["hours_left"] is not None and clock is not None:
+        try:
+            state["estimated_expires_at"] = clock.now() + state["hours_left"] * 3600.0
+        except Exception:
+            state["estimated_expires_at"] = None
     state["session_expired"] = state["hours_left"] is not None and state["hours_left"] <= 0
     return state
 
@@ -348,6 +542,46 @@ def compute_lifecycle(prev: dict, started_at: datetime) -> dict:
     return result
 
 
+def compute_lifecycle_v2(prev_v2: "dict | None", started_epoch: float) -> "dict | None":
+    """决策 012：以可信业务 epoch 记账的跨关闭时长（v2）。
+
+    prev_v2 = {"run_open": bool, "started_epoch", "heartbeat_epoch", "closed_epoch",
+               "quality": "ready"|"unknown"}
+    全部由业务时钟写入：业务重校只影响单个读数的不确定度，不改变两次业务读数
+    之差——系统墙钟跳变无法污染关闭时长。旧墙钟文本不迁移成 v2（不可反推）。
+    quality=unknown（上一周期没有可信锚点）时不给任何精确/约值。
+    返回 None = 无 v2 记账，调用方退回旧文本路径。
+    """
+    if not isinstance(prev_v2, dict) or "run_open" not in prev_v2:
+        return None
+    if prev_v2.get("quality") == "unknown":
+        return {"closed_for_s": None, "close_quality": "unknown", "close_source": "v2"}
+    started_prev = prev_v2.get("started_epoch")
+    beat = prev_v2.get("heartbeat_epoch")
+    closed = prev_v2.get("closed_epoch")
+    result = {"closed_for_s": None, "close_quality": "unknown", "close_source": "v2"}
+
+    def finish(ref, quality):
+        if not isinstance(ref, (int, float)) or started_epoch - ref < 0:
+            return
+        result["closed_for_s"] = round(float(started_epoch) - float(ref), 1)
+        result["close_quality"] = quality
+
+    if prev_v2.get("run_open") is True:
+        ref = beat if isinstance(beat, (int, float)) else started_prev
+        finish(ref, "abnormal")
+        return result
+    # run_open False：正常关闭
+    if isinstance(closed, (int, float)) and isinstance(started_prev, (int, float)) \
+            and closed < started_prev:
+        return result
+    if isinstance(closed, (int, float)) and (beat is None or beat <= closed):
+        finish(closed, "clean")
+    elif isinstance(beat, (int, float)):
+        finish(beat, "abnormal")
+    return result
+
+
 class AppLifecycle:
     """进程级生命周期：启动冻结上一周期 → 每分钟心跳 → 正常关闭写 last_closed_at。
 
@@ -358,48 +592,179 @@ class AppLifecycle:
 
     INTERVAL_S = 60
 
-    def __init__(self, prefs_file: "Path | None" = None) -> None:
+    def __init__(self, prefs_file: "Path | None" = None, now_fn=None) -> None:
+        # now_fn = 业务时钟：v2 记账用可信 epoch；None 时只走旧文本路径（旧测试）
+        self._now_fn = now_fn
         # 创建时定格偏好路径：测试传入临时目录后，心跳线程绝不会写回真实数据根
         self._prefs = prefs_file or PREFS
-        with _PREFS_LOCK:
-            prev = load_prefs_from(self._prefs)
-            # 先冻结上一运行周期，再在同一原子写入里记录本次周期开始：
-            # started + 首个心跳 + run_open=true 三者一起落盘——短启动就崩溃的
-            # 周期也有「最后存活时刻」，不会回退拿更早周期的关闭时间当精确值
-            self._prev = compute_lifecycle(prev, datetime.now())
-            self._started_text = _now_text()
-            merged = dict(prev)
-            merged["last_started_at"] = self._started_text
-            merged["last_heartbeat_at"] = self._started_text
-            merged["run_open"] = True
-            self._atomic_write(merged)
+        # 本进程归属与本地经过时长起点：首校时迟到时据此倒推本次启动 epoch，
+        # 而不是把「校准时刻」当成启动时刻（也不是永久放弃 v2）
+        self._run_id = uuid.uuid4().hex[:12]
+        self._start_mono = time.monotonic()
+        self._v2_lock = threading.Lock()
+        self._foreign_owner = False   # 看到更新的 run_id 后，本实例停止写生命周期
+        # 时钟读数在事务外完成：绝不持偏好锁联网或等待授时
+        self._started_epoch = None
+        if self._now_fn is not None:
+            try:
+                self._started_epoch = self._now_fn()
+            except Exception:
+                self._started_epoch = None   # 保留 now_fn：迟到校准仍可恢复
+        self._started_text = _now_text()
+        self._prev_v2 = None
+        try:
+            with _prefs_transaction(self._prefs):
+                self._load_and_claim(load_prefs_from(self._prefs))
+        except _PrefsLockTimeout:
+            # 跨进程锁拿不到：本次启动元数据写入整体放弃。界面仍可用，下一次
+            # 心跳或启动会重新读取；宁可少记一次，也不覆盖另一个实例的周期。
+            self._load_and_claim(load_prefs_from(self._prefs), write=False)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._heartbeat, daemon=True,
                                         name="lifecycle-heartbeat")
         self._thread.start()
 
+    def _load_and_claim(self, raw: dict, *, write: bool = True) -> None:
+        """在事务内冻结上一周期并写入本次周期；调用方保证排他。
+
+        started + 首个心跳 + run_open=true 三者一起落盘——短启动就崩溃的周期
+        也有「最后存活时刻」，不会回退拿更早周期的关闭时间当精确值。
+        """
+        self._prev = compute_lifecycle(raw, datetime.now())
+        self._prev_v2 = raw.get("lifecycle_v2")
+        if self._now_fn is not None:
+            # 生产时钟路径：缺 v2 或质量不足一律 unknown，绝不退回旧墙钟差值。
+            if self._started_epoch is None:
+                v2 = {"closed_for_s": None, "close_quality": "unknown",
+                      "close_source": "clock_unavailable"}
+            else:
+                v2 = compute_lifecycle_v2(self._prev_v2, self._started_epoch)
+                if v2 is None:
+                    v2 = {"closed_for_s": None, "close_quality": "unknown",
+                          "close_source": "v2_missing"}
+            self._prev = dict(self._prev, **v2)
+        if not write:
+            return
+        merged = dict(raw)
+        merged["last_started_at"] = self._started_text
+        merged["last_heartbeat_at"] = self._started_text
+        merged["run_open"] = True
+        if self._now_fn is not None:
+            merged["lifecycle_v2"] = {
+                "run_id": self._run_id,
+                "run_open": True,
+                "started_epoch": self._started_epoch,
+                "heartbeat_epoch": self._started_epoch,
+                "quality": "ready" if self._started_epoch is not None else "unknown"}
+        self._atomic_write(merged)
+
     def _atomic_write(self, prefs: dict) -> None:
         _atomic_write_prefs(self._prefs, prefs)
 
-    def _write_merged(self, patch: dict, force: bool = False) -> None:
+    def _write_merged(self, patch: dict, force: bool = False) -> bool:
         """与 update_prefs 同一把锁的读-合并-写，但钉住创建时的偏好文件。
 
         force=False（心跳路径）：锁内先核停止标记——finalize 已开始收尾时，
         迟到的心跳直接放弃，绝不把 last_heartbeat_at 写到关闭时刻之后。
+        归属核验与写回在同一事务内：文件里的 lifecycle_v2 已属于别的 run_id 时
+        整份放弃（返回 False），不先清空再写成自己的记录。
         """
-        with _PREFS_LOCK:
-            if not force and self._stop.is_set():
-                return
-            prefs = load_prefs_from(self._prefs)
-            prefs.update(patch or {})
-            self._atomic_write(prefs)
+        try:
+            with _prefs_transaction(self._prefs):
+                if not force and self._stop.is_set():
+                    return False
+                prefs = load_prefs_from(self._prefs)
+                incoming = patch or {}
+                if "lifecycle_v2" in incoming:
+                    stored = prefs.get("lifecycle_v2")
+                    if isinstance(stored, dict) and \
+                            stored.get("run_id") not in (None, self._run_id):
+                        self._foreign_owner = True
+                        return False
+                prefs.update(incoming)
+                self._atomic_write(prefs)
+                return True
+        except _PrefsLockTimeout:
+            return False
 
     def _heartbeat(self) -> None:
         while not self._stop.wait(self.INTERVAL_S):
             try:
-                self._write_merged({"last_heartbeat_at": _now_text()})
+                self._beat_once()
             except Exception:
                 pass   # 单次心跳失败不影响界面，下一分钟再试
+
+    def _beat_once(self) -> bool:
+        """一次心跳：心跳时刻在锁外读取，读-核验-合并-写在偏好事务内完成。"""
+        patch = {"last_heartbeat_at": _now_text()}
+        record = None
+        if self._now_fn is not None:
+            epoch = None
+            try:
+                epoch = self._now_fn()
+            except Exception:
+                epoch = None
+            with self._v2_lock:
+                if self._foreign_owner:
+                    return False
+                if epoch is not None:
+                    self._recover_started_epoch(epoch)
+                # 校时失效时保持本周期归属、质量降为 unknown，不编心跳
+                record = self._v2_record(run_open=True, epoch=epoch)
+            if record is None:
+                return False
+            patch["lifecycle_v2"] = record
+        return self._write_merged(patch)
+
+    def _recover_started_epoch(self, epoch: float) -> None:
+        """首校时迟到：用本进程经过时长倒推本次启动 epoch，并重算上一周期。
+
+        只在仍缺起点时执行一次；调用方必须持有 _v2_lock。生产时钟路径下
+        没有 v2 旧记录时同样只能 unknown，不退回旧墙钟文本的精确/约值。
+        """
+        if self._started_epoch is not None or self._now_fn is None:
+            return
+        elapsed = max(0.0, time.monotonic() - self._start_mono)
+        self._started_epoch = float(epoch) - elapsed
+        v2 = compute_lifecycle_v2(self._prev_v2, self._started_epoch)
+        if v2 is None:
+            v2 = {"closed_for_s": None, "close_quality": "unknown",
+                  "close_source": "v2_missing"}
+        self._prev = dict(self._prev, **v2)
+
+    def _v2_record(self, *, run_open: bool, epoch=None, closed_epoch=None) -> dict:
+        """本周期 v2 记录：缺本次可信时刻就记 unknown，不沿用旧心跳凑可信事实。
+
+        run_id 归属隔离：文件里的记录属于别的进程实例时返回 None，由调用方
+        整体放弃本次生命周期写入，免得迟到的旧写覆盖更新的周期事实。
+        调用方必须持有 _v2_lock。
+        """
+        stored = self._read_v2() or {}
+        if stored and stored.get("run_id") not in (None, self._run_id):
+            self._foreign_owner = True
+            return None
+        record = dict(stored)
+        record.update({"run_id": self._run_id, "run_open": bool(run_open),
+                       "started_epoch": self._started_epoch})
+        # 「有起点」不等于「此刻可信」：本次心跳/关闭取时失败时必须 unknown，
+        # 否则下一次启动会把旧 heartbeat 解释成约值、把旧 closed 当精确值。
+        trusted_now = epoch is not None or closed_epoch is not None
+        if self._started_epoch is None or not trusted_now:
+            record["quality"] = "unknown"
+            return record
+        record["quality"] = "ready"
+        if run_open and epoch is not None:
+            record["heartbeat_epoch"] = float(epoch)
+        if closed_epoch is not None:
+            record["closed_epoch"] = float(closed_epoch)
+        return record
+
+    def _read_v2(self) -> "dict | None":
+        try:
+            v2 = (load_prefs_from(self._prefs) or {}).get("lifecycle_v2")
+            return v2 if isinstance(v2, dict) else None
+        except Exception:
+            return None
 
     def snapshot(self) -> dict:
         """bootstrap 的 lifecycle 载荷：上一周期关闭时长/质量（只读，只作提示）。
@@ -419,11 +784,36 @@ class AppLifecycle:
     def finalize(self) -> None:
         """窗口正常关闭：先置停（拦住后续心跳），再在同一把锁内原子写
         run_open=false 与关闭时刻——顺序反了会留下晚于关闭的心跳。
-        不持锁 join 心跳线程：持锁 join 会和心跳的锁内写入互相等死。"""
+        不持锁 join 心跳线程：持锁 join 会和心跳的锁内写入互相等死。
+        取 epoch 失败也必须落「正常关闭」文本事实，v2 质量记 unknown，不跳过收尾；
+        但若文件已被另一个 run_id 接管，本实例整体让位，不改写新周期的记录。"""
         self._stop.set()
+        patch = {"last_closed_at": _now_text(), "run_open": False}
+        write = True
+        if self._now_fn is not None:
+            epoch = None
+            try:
+                epoch = self._now_fn()
+            except Exception:
+                epoch = None
+            try:
+                with self._v2_lock:
+                    if self._foreign_owner:
+                        return
+                    if epoch is not None:
+                        self._recover_started_epoch(epoch)
+                    record = self._v2_record(
+                        run_open=False, epoch=epoch, closed_epoch=epoch)
+                    if record is None:
+                        return       # 归属已被新实例接管：不写回旧周期
+                    patch["lifecycle_v2"] = record
+            except Exception:
+                patch["lifecycle_v2"] = {
+                    "run_id": self._run_id, "run_open": False,
+                    "started_epoch": self._started_epoch,
+                    "quality": "unknown"}
         try:
-            self._write_merged({"last_closed_at": _now_text(), "run_open": False},
-                               force=True)
+            self._write_merged(patch, force=True)
         except Exception:
             pass
 
@@ -432,21 +822,27 @@ _LIFECYCLE: "AppLifecycle | None" = None
 _LIFECYCLE_LOCK = threading.Lock()
 
 
-def get_lifecycle() -> AppLifecycle:
+def get_lifecycle(now_fn=None) -> AppLifecycle:
     """进程级单例（懒创建）：main() 启动时先建，bootstrap 重复取同一实例。"""
     global _LIFECYCLE
     with _LIFECYCLE_LOCK:
         if _LIFECYCLE is None:
-            _LIFECYCLE = AppLifecycle()
+            _LIFECYCLE = AppLifecycle(now_fn=now_fn)
         return _LIFECYCLE
 
 
 class Api:
-    def __init__(self) -> None:
+    def __init__(self, clock=None) -> None:
+        # 独立北京时间（决策 012）：生产 main 注入 BusinessClock；
+        # 未注入时显式不可用，绝不回退本机时间。测试必须显式注入 Fake。
+        self._clock = clock if clock is not None else _UnavailableClock()
+        self._clock_syncing = False
         self._window: webview.Window | None = None
         self._proc: subprocess.Popen | None = None
         self._plan: PlanCoordinator | None = None
         self._plan_procs: dict[str, subprocess.Popen] = {}
+        # 最近一个已结束计划的快照（只读展示用；_plan 只表示当前计划）
+        self._last_plan: dict | None = None
         # check/list 这类短命 worker 的登记表：正常关闭时一并树终止，不留孤儿
         self._aux_procs: set = set()
         self._activities: dict[str, dict] = {}
@@ -461,17 +857,133 @@ class Api:
         # 刷新去重：连点「刷新」不该堆起多个 check/list 子进程
         self._checking = False
         self._listing = False
+        # 在途请求 ID：去重跳过时界面才能对上账（R11）
+        self._check_request_id = ""
+        self._list_request_id = ""
+        self._check_last = {"request_id": "", "payload": None}
+        self._list_last = {"request_id": "", "payload": None}
         # 最近一次 check 的四态结论：start_plan 的放行/拒绝只信它
         self._last_check: dict = {}
         # 更新检查独立于登录/报名，只由帮助按钮触发；页面重载复用内存中的在途请求。
         self._updating = False
         self._update_request_id = ""
         self._update_result: dict | None = None
+        # 开始请求登记（R11）：request_id → {state, plan_id, result}。
+        # 只留最近有限条，活跃请求不驱逐；不存凭证、不写外部数据。
+        self._start_requests: dict[str, dict] = {}
+        self._start_order: list[str] = []
+        # 计划接纳代次与最近接纳计划（P1）：plan/task/plan_done 事件与终态快照
+        # 只归属「最近接纳的计划」。槽为空（_plan=None）不代表迟到回调属于最新
+        # 计划——较新的计划可能已经结束；归属以接纳代次为准，不随 _plan 清空遗失。
+        self._plan_generation = 0
+        self._latest_plan_id = ""
+        # 已提交过终态的计划（重复 plan_done 幂等：已定结论不被重复包改写）
+        self._finished_plan_ids: dict[str, bool] = {}
+
+    # ---------- 独立北京时间 ----------
+    def _clock_now(self) -> float:
+        if DEMO:
+            # 演示离线：与 bootstrap 的「演示时间」快照同源（OS 时刻，仅演示）
+            return time.time()
+        return self._clock.now()
+
+    def _clock_ready(self) -> bool:
+        """开始门禁只认 ready/holdover 且 bounds 可读：syncing/未知不放行。"""
+        try:
+            if self._clock.state() not in ("ready", "holdover"):
+                return False
+            lower, upper = self._clock.bounds()
+        except Exception:
+            return False
+        return bool(upper >= lower)
+
+    def _clock_payload(self) -> dict:
+        """bootstrap 的时钟载荷：demo 离线给显式标注的「演示时间」快照，
+        不冒充真实授时；正常模式返回当前业务时钟快照。"""
+        if DEMO:
+            return {"schema": 1, "owner_id": "demo-clock", "generation": 1,
+                    "state": "ready", "epoch_s": time.time(), "tick_s": 0,
+                    "sampled_tick_s": 0, "uncertainty_s": None,
+                    "source": "演示时间（离线，非真实授时）", "age_s": 0,
+                    "reason": "演示模式不联网：顶栏时间仅供演示"}
+        return self.clock_snapshot()
+
+    def clock_snapshot(self) -> dict:
+        """当前业务时钟快照（无凭证）：bootstrap 与「重新校时」共用。"""
+        try:
+            return self._clock.snapshot()
+        except Exception as exc:
+            return {"schema": 1, "state": "unavailable", "reason": str(exc)}
+
+    def sync_clock(self) -> dict:
+        """界面「重新校时」：去重后台重校，完成后推 business_clock 事件。"""
+        with self._lock:
+            if self._clock_syncing:
+                return {"ok": True, "queued": True, "dedup": True}
+            self._clock_syncing = True
+
+        def run():
+            try:
+                # demo 完全离线：不发起 NTP，直接确认「演示时间」快照
+                state = "ready" if DEMO else self._clock.sync()
+            except Exception:
+                state = "unavailable"
+            with self._lock:
+                self._clock_syncing = False
+            self._emit("business_clock",
+                       self._clock_payload() if DEMO else self.clock_snapshot())
+            return state
+
+        threading.Thread(target=run, name="clock-resync", daemon=True).start()
+        return {"ok": True, "queued": True}
+
+    def _start_clock_monitor(self) -> None:
+        """有未来任务时在最早准备点前 20 秒请求一次后台重校（尊重源冷却）。"""
+        if getattr(self, "_clock_monitor_started", False):
+            return
+        self._clock_monitor_started = True
+
+        def monitor():
+            requested_for = None
+            while True:
+                time.sleep(5)
+                try:
+                    with self._lock:
+                        plan = self._plan
+                    if plan is None:
+                        requested_for = None
+                        continue
+                    nxt = plan.next_prepare_epoch()
+                    if nxt is None:
+                        continue
+                    left = nxt - self._clock_now()
+                    if 0 < left <= 20 and requested_for != plan.plan_id:
+                        self._clock.request_resync()
+                        requested_for = plan.plan_id
+                except Exception:
+                    continue
+
+        threading.Thread(target=monitor, name="clock-monitor", daemon=True).start()
 
     # ---------- 事件推送 ----------
     def _emit(self, kind: str, payload) -> None:
         if not self._window:
             return
+        # check/activities 统一带上本轮请求 ID：界面按 ID 丢弃迟到的旧轮事件，
+        # 不靠「最后一次谁先到」猜（R11）
+        if isinstance(payload, dict) and "request_id" not in payload:
+            if kind == "check":
+                payload = dict(payload, request_id=self._check_request_id)
+            elif kind == "activities":
+                payload = dict(payload, request_id=self._list_request_id)
+        # 终态快照留档：去重跳过时若原操作已经结束，直接把结果交回去，
+        # 不让界面等一个永远不会再发的旧 ID 事件（C06）
+        if isinstance(payload, dict) and kind == "check":
+            self._check_last = {"request_id": str(payload.get("request_id") or ""),
+                                "payload": dict(payload)}
+        elif isinstance(payload, dict) and kind == "activities":
+            self._list_last = {"request_id": str(payload.get("request_id") or ""),
+                               "payload": dict(payload)}
         js = "window.onBackend && window.onBackend.%s(%s)" % (
             kind, json.dumps(payload, ensure_ascii=False))
         try:
@@ -482,27 +994,53 @@ class Api:
     # ---------- 读数据 ----------
     def bootstrap(self) -> dict:
         prefs = load_prefs()
+        if DEMO:
+            # 演示模式不读 session/storage_state，也不碰真实生命周期文件（C07）
+            login_info = {"hours_left": None, "session_present": None,
+                          "estimated_expires_at": None, "saved_at": None,
+                          "demo": True}
+            lifecycle_info = {"close_quality": "unknown", "closed_for_s": None,
+                              "last_heartbeat_at": None, "demo": True}
+        else:
+            login_info = login_state(self._clock)
+            lifecycle_info = get_lifecycle().snapshot()
         payload = {
             "version": APP_VERSION,
             "prefs": prefs,
+            "business_clock": self._clock_payload(),
             "help": self.help(),
-            "login": login_state(),
+            "login": login_info,
             # 生命周期元数据（上一周期关闭时长/质量 + 登录估算）：只作提示，
             # 不参与任何放行/拦截；F5 重载重复调用拿到的是同一份进程级快照
-            "lifecycle": get_lifecycle().snapshot(),
-            "busy": self._is_busy(),
+            "lifecycle": lifecycle_info,
             # demo 标记：界面据此放行演示计划（真实模式仍要求登录校验 valid）
             "demo": DEMO,
         }
+        # busy 与计划快照必须在同一临界区取：分两次拿锁会出现「busy=true 但
+        # plan 是上一份终态快照」或反过来的错配，F5 恢复就会把已完成的计划
+        # 画成运行中（FR05）。
         with self._lock:
+            payload["busy"] = self._is_busy_locked()
             plan = self._plan
+            last_plan = self._last_plan
             payload["update_check"] = {"checking": self._updating,
                                        "request_id": self._update_request_id,
                                        "result": self._update_result}
-        if plan is not None:
-            # 页面重载会丢掉 plan/task 事件：把计划快照一并交给 bootstrap，
-            # 界面才能恢复任务列表和「停止」按钮；计划本身不会重复提交。
-            payload["plan"] = plan.snapshot()
+            if plan is not None:
+                # 页面重载会丢掉 plan/task 事件：把计划快照一并交给 bootstrap，
+                # 界面才能恢复任务列表和「停止」按钮；计划本身不会重复提交。
+                payload["plan"] = plan.snapshot()
+            elif last_plan is not None:
+                # 计划已结束：仍要把最后一份终态快照交回去，F5 才能保留结论与次数
+                payload["plan"] = last_plan
+            if isinstance(payload.get("plan"), dict):
+                # F5 权威快照携带接纳代次与请求 ID：界面据此建立归属，后到的
+                # 旧计划事件不得覆盖恢复出来的计划（P1）
+                boot_plan = payload["plan"]
+                boot_plan["plan_generation"] = self._plan_generation
+                boot_plan.setdefault("request_id",
+                                     next((key for key, value in self._start_requests.items()
+                                           if value.get("plan_id") == boot_plan.get("plan_id")), ""))
         return payload
 
     def help(self) -> dict:
@@ -515,17 +1053,18 @@ class Api:
             "latest_url": RELEASES_LATEST_URL,
             # 三步只讲「怎么操作」：选中不等于开始，开始按钮必须点，结果逐场看
             "steps": [
-                {"no": 1, "title": "确认登录",
-                 "text": "首次点「登录」，在浏览器里完成登录。重开会自动检查；"
-                         "仅在提示失效时重新登录，暂时无法确认就刷新。"},
-                {"no": 2, "title": "选活动并开始",
-                 "text": "勾选不冲突的活动，设置重试时长和最多次数，再点「开始报名计划」。"
-                         "未来场次等开放，已开放场次立即尝试。"},
-                {"no": 3, "title": "看进度与结果",
-                 "text": "电脑保持唤醒和联网，窗口可最小化。逐场看结果；"
-                         "停止会结束本机任务，不会撤销学校报名。"},
+                {"no": 1, "title": "登录账号",
+                 "text": "选择「登录」，在打开的浏览器中完成登录。下次启动会检查已保存的登录状态；"
+                         "只有提示失效时才需要重新登录。"},
+                {"no": 2, "title": "设置报名计划",
+                 "text": "选择活动，设置尝试时长和最多提交次数，再选择「开始报名计划」。"
+                         "预报名会在开放后尝试提交，已开放活动会在计划启动后尝试提交。"},
+                {"no": 3, "title": "查看报名结果",
+                 "text": "运行期间可最小化窗口，但需保持电脑唤醒与联网。结束后查看各活动的报名结果；"
+                         "开始计划不代表报名成功。"},
             ],
-            "note": "仅操作本人账号，报名结果以学校活动页为准。",
+            "note": "适用于天津市大学软件学院（天软）专升本学生使用的活动中心。"
+                    "活动要求与报名结果以学校活动页为准。",
         }
 
     def front_ready(self) -> dict:
@@ -573,30 +1112,44 @@ class Api:
             if not closing:
                 self._emit("update", result)
 
-    def check(self) -> dict:
+    def check(self, request_id: str = "") -> dict:
         # js_api 的处理跑在 UI 线程上：一旦在这里跑 subprocess，
         # 窗口会直接"未响应"。所以只负责起线程，结果用事件推回去。
         with self._lock:
             if self._closing:
                 # 关闭拒绝是取消语义：不给组件码，不再起线程
-                return {"ok": False, "queued": False,
+                return {"ok": False, "queued": False, "request_id": request_id,
                         "text": "程序正在关闭，已取消本次检查"}
             if self._checking:
-                return {"ok": True, "queued": True, "skipped": "已在检查登录态"}
+                # 去重必须带上在途请求 ID：界面按 ID 对账，不能把旧轮当新轮
+                answer = {"ok": True, "queued": True, "skipped": "已在检查登录态",
+                          "request_id": self._check_request_id}
+                last = self._check_last
+                if last.get("payload") and last.get("request_id") == self._check_request_id:
+                    # 原操作刚好已经结束：把终态直接带回去，界面不用干等
+                    answer["result"] = last["payload"]
+                return answer
             self._checking = True
+            self._check_request_id = request_id or ""
         threading.Thread(target=self._do_check, daemon=True).start()
-        return {"ok": True, "queued": True}
+        return {"ok": True, "queued": True, "request_id": request_id}
 
-    def list_activities(self) -> dict:
+    def list_activities(self, request_id: str = "") -> dict:
         with self._lock:
             if self._closing:
-                return {"ok": False, "queued": False,
+                return {"ok": False, "queued": False, "request_id": request_id,
                         "text": "程序正在关闭，已取消拉取活动列表"}
             if self._listing:
-                return {"ok": True, "queued": True, "skipped": "已经在拉活动列表"}
+                answer = {"ok": True, "queued": True, "skipped": "已经在拉活动列表",
+                          "request_id": self._list_request_id}
+                last = self._list_last
+                if last.get("payload") and last.get("request_id") == self._list_request_id:
+                    answer["result"] = last["payload"]
+                return answer
             self._listing = True
+            self._list_request_id = request_id or ""
         threading.Thread(target=self._do_list, daemon=True).start()
-        return {"ok": True, "queued": True}
+        return {"ok": True, "queued": True, "request_id": request_id}
 
     def _do_check(self) -> None:
         try:
@@ -616,6 +1169,23 @@ class Api:
                 self._checking = False
 
     def _do_check_inner(self) -> None:
+        if DEMO:
+            # 演示模式完全离线：不读 session.json/storage_state、不起 worker、
+            # 不碰学校。状态明确写「演示模式」，绝不伪装成真实登录有效（R20）
+            self._last_check = {"result": "demo", "checked_at": time.time(),
+                                "runtime_error": ""}
+            self._emit("check", {
+                "ok": True, "result": "demo", "demo": True,
+                "text": "演示模式：使用内存样例，不检查真实登录",
+                "hours_left": None, "session_present": None,
+                "session_expired": False, "saved_at": None,
+                "estimated_expires_at": None, "reason": "", "hint": "",
+                "clock": {"source": "http_date", "state": "unknown",
+                          "checked_at": None, "offset_s": None,
+                          "uncertainty_s": None, "rtt_s": None,
+                          "detail": "演示模式不做校时"},
+            })
+            return
         err_code = ""
         try:
             res = self._run(worker_command("check"), timeout=90)
@@ -645,12 +1215,19 @@ class Api:
         reason, text = _check_reason_line(out)
         # 三态字段跟结果一起发：check 失败可能是「没登录过」也可能是「过期」，
         # 界面只看 ok 会把首次使用误判成登录态失效。
-        state = login_state()
+        state = login_state(self._clock)
         result = _check_result(state, code, reason or text)
         if err_code:
             result = "unknown"
         self._last_check = {"result": result, "checked_at": time.time(),
                             "runtime_error": err_code}
+        # 粗校时只作提示：没有样本时也给 unknown 字段，界面不会把上一轮的
+        # warn 无限保留（R08）
+        clock = _parse_clock_line(out) or {
+            "source": "http_date", "checked_at": None, "state": "unknown",
+            "offset_s": None, "uncertainty_s": None, "rtt_s": None,
+            "detail": "本轮没有校时结论",
+        }
         payload = {
             "ok": code == 0,
             "hours_left": state["hours_left"],
@@ -669,6 +1246,8 @@ class Api:
             # 四态结论（附加字段）：valid=接口确认有效 / expired=4001 失效 /
             # none=本机无会话 / unknown=网络或接口异常——异常不得误报成重新登录
             "result": result,
+            # 本轮粗校时结论：ok/warn/unknown 都带，界面逐轮替换而不是累积
+            "clock": clock,
         }
         if err_code:
             payload["runtime_error"] = err_code
@@ -718,7 +1297,11 @@ class Api:
             self._emit("activities", {"ok": False,
                                       "text": "活动列表解析失败", "items": []})
             return
-        now = time.time()
+        now = None
+        try:
+            now = self._clock_now()      # 列表「距开放」按业务北京时间
+        except Exception:
+            now = None                   # 校时不可用：显示未知，不用系统时间补
         for it in items:
             it["seconds_to_open"] = _seconds_until(it.get("sign_start"), now)
         self._activities = {str(it.get("id")): dict(it) for it in items if it.get("id")}
@@ -726,6 +1309,11 @@ class Api:
 
     # ---------- 动作 ----------
     def login(self) -> dict:
+        if DEMO:
+            # 演示模式不打开学校登录页、不写 session（R20）
+            return {"ok": False, "demo": True,
+                    "text": "演示模式不联网：这里不会打开学校登录页。"
+                            "要看真实登录，请不带 --demo 启动。"}
         with self._lock:
             if self._closing:
                 # 不带 error 码：前端不得把关闭取消当成组件问题挂横幅
@@ -743,19 +1331,168 @@ class Api:
             args.append("--headed")
         return self._spawn(args, "等待并抢报名：%s" % name, kind="grab")
 
-    def start_plan(self, items: list[dict], headed: bool = False,
-                   retry_policy: dict | None = None) -> dict:
-        """校验并启动计划；同一开放批次由协调器并发拉起单活动脚本。
+    START_KEEP = 32
 
-        retry_policy 是计划级重试策略：{retry_for_s, max_attempts}，
-        0 分别表示「直到报名截止」和「不限次数」；非法值回落默认
-        （120 秒 / 不限），不让脏输入把 worker 挂成无限重试。
+    # 已完成计划的留档上限：重复终态幂等只看这段窗口，足够覆盖迟到回调
+    FINISHED_PLAN_KEEP = 32
+
+    def _prune_finished_plans_locked(self) -> None:
+        """已完成计划登记只留最近有限条（调用方持锁）。"""
+        if len(self._finished_plan_ids) <= self.FINISHED_PLAN_KEEP:
+            return
+        for plan_id in list(self._finished_plan_ids)[:-self.FINISHED_PLAN_KEEP]:
+            self._finished_plan_ids.pop(plan_id, None)
+
+    def _remember_start(self, request_id: str, state: str, **extra) -> None:
+        """登记开始请求的结论（调用方持锁）。只保留最近 32 条，pending 不驱逐。"""
+        record = dict(self._start_requests.get(request_id) or {})
+        record.update({"state": state, "at": record.get("at") or time.time()})
+        record.update(extra)
+        self._start_requests[request_id] = record
+        if request_id in self._start_order:
+            self._start_order.remove(request_id)
+        self._start_order.append(request_id)
+        while len(self._start_order) > self.START_KEEP:
+            victim = next((rid for rid in self._start_order
+                           if self._start_requests.get(rid, {}).get("state") != "pending"), None)
+            if victim is None:
+                break
+            self._start_order.remove(victim)
+            self._start_requests.pop(victim, None)
+
+    def _start_replay(self, record: dict, request_id: str) -> dict:
+        """同一 request_id 重放：返回原结论，绝不另建计划。"""
+        state = record.get("state")
+        if state in {"accepted", "rejected"}:
+            return dict(record.get("result") or {}, request_id=request_id, duplicate=True)
+        if state == "canceled":
+            return {"ok": False, "text": "这次开始已取消，可以重新发起。",
+                    "request_id": request_id, "canceled": True}
+        return {"ok": True, "queued": True, "pending": True, "request_id": request_id,
+                "text": "正在确认是否启动，请稍候"}
+
+    def start_request_state(self, request_id: str) -> dict:
+        """只读对账：这次开始到底是 pending / accepted / rejected / canceled。"""
+        rid = str(request_id or "")
+        with self._lock:
+            record = self._start_requests.get(rid)
+            plan = self._plan
+            # 代次只在该请求的计划仍是最近接纳计划时给出：对旧请求对账不得
+            # 伪造成最新接纳代次（P1）
+            generation = (self._plan_generation
+                          if str(record.get("plan_id") or "") == self._latest_plan_id
+                          else 0) if record else 0
+        if not record:
+            return {"ok": True, "state": "unknown", "request_id": rid,
+                    "text": "没有这次开始的记录，可能程序重启过"}
+        state = str(record.get("state") or "unknown")
+        plan_id = str(record.get("plan_id") or "")
+        payload = {"ok": True, "state": state, "plan_id": plan_id, "request_id": rid,
+                   "plan_generation": generation}
+        if state == "accepted":
+            if plan is not None and plan.plan_id == plan_id:
+                snapshot = plan.snapshot()
+                payload["running"] = snapshot.get("status") in {"ready", "running"}
+                payload["snapshot"] = snapshot
+            else:
+                # 计划已经收尾：返回这次请求自己的终态快照，不借别的较新计划
+                payload["running"] = False
+                payload["finished"] = True
+                payload["snapshot"] = record.get("snapshot") or {
+                    "status": record.get("final_status") or "unknown",
+                    "summary": {}, "tasks": []}
+            payload["status"] = (payload.get("snapshot") or {}).get("status")
+        else:
+            payload["text"] = str((record.get("result") or {}).get("text") or "")
+        return payload
+
+    def cancel_start_request(self, request_id: str) -> dict:
+        """放弃一次还在 pending 的开始；已有结论的请求不能取消。"""
+        rid = str(request_id or "")
+        with self._lock:
+            record = self._start_requests.get(rid)
+            if not record:
+                return {"ok": False, "text": "没有这次开始的记录"}
+            if record.get("state") == "pending":
+                record["state"] = "canceled"
+                return {"ok": True, "state": "canceled", "request_id": rid}
+            if record.get("state") == "accepted":
+                # 已被接纳就不能再答复「取消成功」：给出真实 plan_id 让界面去停止
+                return {"ok": False, "state": "accepted",
+                        "plan_id": str(record.get("plan_id") or ""),
+                        "request_id": rid,
+                        "text": "这次开始已经被接纳，请用「停止计划」结束"}
+            return {"ok": False, "state": record.get("state"),
+                    "text": "这次开始已经有结论，不能再取消"}
+
+    def start_plan(self, items: list[dict], headed: bool = False,
+                   retry_policy: dict | None = None, request_id: str = "") -> dict:
+        """校验并启动计划；带 request_id 时按进程内登记实现幂等（R11）。
+
+        UI 的超时不能靠「清掉正在提交」来放行第二次开始——那可能真的重复报名。
+        这里按 request_id 记住接纳/拒绝结论：同 ID 再来返回原结论，
+        另提供只读对账与取消接纳，让界面能问清楚「到底启没启」。
         """
+        rid = request_id if isinstance(request_id, str) else ""
+        if rid and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", rid):
+            return {"ok": False, "text": "开始请求标识无效，请重试。"}
+        if rid:
+            # 查重与占位必须在同一临界区：分成两段锁会让两个同 ID 请求
+            # 都读到「不存在」，然后各自去建计划（C04）
+            with self._lock:
+                known = self._start_requests.get(rid)
+                if known is not None:
+                    replay = self._start_replay(known, rid)
+                else:
+                    self._remember_start(rid, "pending")
+                    replay = None
+            if replay is not None:
+                return replay
+        try:
+            result = self._start_plan_inner(items, headed, retry_policy, rid)
+        except Exception as exc:  # noqa: BLE001 - 本机异常也要留下真实结论
+            with self._lock:
+                record = self._start_requests.get(rid) or {}
+                if rid and record.get("state") not in {"accepted", "canceled"}:
+                    self._remember_start(rid, "rejected",
+                                         result={"ok": False,
+                                                 "text": "开始计划时本机异常：%s"
+                                                         % type(exc).__name__})
+            return {"ok": False, "text": "开始计划时本机异常：%s" % type(exc).__name__,
+                    "request_id": rid}
+        if rid:
+            with self._lock:
+                record = self._start_requests.get(rid) or {}
+                state = record.get("state")
+                if state == "canceled":
+                    # 取消先赢：如实返回取消，不把结论覆盖成 accepted/rejected
+                    result = {"ok": False, "text": "这次开始已取消，可以重新发起。",
+                              "canceled": True}
+                elif state == "accepted":
+                    # inner 已在线性化点写过接纳结论，外层不得覆盖
+                    result = dict(record.get("result") or result)
+                else:
+                    self._remember_start(
+                        rid, "accepted" if result.get("ok") else "rejected",
+                        plan_id=str(result.get("plan_id") or ""), result=dict(result))
+        return dict(result, request_id=rid) if rid else result
+
+    def _start_plan_inner(self, items: list[dict], headed: bool,
+                          retry_policy: dict | None, request_id: str = "") -> dict:
         if not isinstance(items, list) or not items:
             return {"ok": False, "text": "先至少选择一场活动"}
+        # 北京时间门禁（决策 012）：时钟不可用时不新启自动报名（demo 离线豁免）；
+        # 计划接纳时刻只取一次业务 now——开始后的校时/鉴权/开页不后移 instant 窗口
+        if not DEMO and not self._clock_ready():
+            return {"ok": False,
+                    "text": "北京时间还没有校准，暂不能开始自动报名；稍后点「重新校时」再试。"}
+        accepted_at = self._clock_now()
         with self._lock:
             if self._closing:
                 return {"ok": False, "text": "程序正在关闭，已取消开始计划"}
+            if not DEMO and not self._clock_ready():
+                return {"ok": False,
+                        "text": "北京时间在开始前失去校准，这次没有启动；稍后重试。"}
             if self._is_busy_locked():
                 return {"ok": False, "text": "已有登录、报名或计划在运行，先停止后再开始"}
         # 真实计划只在学校接口确认登录有效后开始（最终防线，界面按钮门禁之外）：
@@ -796,20 +1533,48 @@ class Api:
         retry_for_s = _policy_int(policy.get("retry_for_s"), 120)
         max_attempts = _policy_int(policy.get("max_attempts"), 0)
 
+        # 前端只提交「选了哪一场」：资格与时间一律以本进程缓存为准，
+        # 陈旧前端快照绝不能覆盖更新的 signed/截止时间（R05）。
         normalized = []
-        for item in items:
-            current = dict(self._activities.get(str(item.get("id")), item))
-            # 前端快照可能没有最新 seconds_to_open，但计划校验只信关键时间字段。
-            current.update({key: item.get(key) for key in
-                            ("id", "name", "sign_start", "sign_end", "act_start", "act_end", "signed")
-                            if key in item})
-            normalized.append(current)
+        seen_ids: set = set()
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                return {"ok": False,
+                        "text": "计划里有格式不对的活动项，请刷新列表后重新选择。",
+                        "errors": [{"kind": "bad_item", "index": index}]}
+            aid = str(item.get("id") or "").strip()
+            if not aid:
+                return {"ok": False,
+                        "text": "计划里有缺少 id 的活动，请刷新列表后重新选择。",
+                        "errors": [{"kind": "missing_id", "index": index}]}
+            if aid in seen_ids:
+                return {"ok": False, "text": "同一活动被选了两遍，去掉重复的那一条。",
+                        "errors": [{"kind": "duplicate_id", "activity_id": aid}]}
+            seen_ids.add(aid)
+            cached = self._activities.get(aid)
+            if not cached:
+                # 列表还没加载过/被清空：没有权威快照就没有放行依据
+                return {"ok": False,
+                        "text": "列表里找不到这一场活动，请点「刷新」重新加载后再选。",
+                        "errors": [{"kind": "unknown_activity", "activity_id": aid}]}
+            changed = [key for key in ("sign_start", "sign_end", "act_start", "act_end")
+                       if key in item and str(item.get(key) or "") != str(cached.get(key) or "")]
+            if "signed" in item and bool(item.get("signed")) != bool(cached.get("signed")):
+                changed.append("signed")
+            if changed:
+                # 不静默换成另一个时间开始：让用户刷新后重新确认
+                return {"ok": False,
+                        "text": "活动信息已变化，请刷新后重新确认。",
+                        "errors": [{"kind": "activity_changed", "activity_id": aid,
+                                    "name": cached.get("name"), "fields": changed}]}
+            normalized.append(dict(cached))
         # 报名截止是硬门禁（前端复选/校验之外的后端最终防线）：
         # 已截止活动不能进入 worker；pre_register 与 instant_signup 是两个
         # 正式模式，混合计划允许共存，逐场按各自模式运行。
         closed = [item for item in normalized
                   if classify_signup_mode(str(item.get("sign_start") or ""),
-                                          str(item.get("sign_end") or "")) == "closed"]
+                                          str(item.get("sign_end") or ""),
+                                          accepted_at) == "closed"]
         if closed:
             names = "、".join("「%s」" % (item.get("name") or "活动") for item in closed[:3])
             more = " 等 %d 场" % len(closed) if len(closed) > 3 else ""
@@ -819,22 +1584,85 @@ class Api:
                     "errors": [{"kind": "sign_end_passed", "activity_id": item.get("id"),
                                 "name": item.get("name"), "sign_end": item.get("sign_end")}
                                for item in closed]}
-        checked = validate_plan(normalized)
+        checked = validate_plan(normalized, now=accepted_at)
         if not checked["ok"]:
             return {"ok": False, "text": "计划里有不能同时报名的活动", "conflicts": checked["conflicts"],
                     "errors": checked["errors"]}
 
         plan_id = uuid.uuid4().hex[:12]
         specs = [TaskSpec.from_activity(item, "task-%02d-%s" % (i + 1, item["id"]), headed,
-                                        retry_for_s=retry_for_s, max_attempts=max_attempts)
+                                        retry_for_s=retry_for_s, max_attempts=max_attempts,
+                                        now=accepted_at)
                  for i, item in enumerate(normalized)]
 
+        # 接纳代次在下方最终接纳的同一临界区赋值；emit 闭包捕获自己的代次，
+        # 事件与终态快照的归属都按代次判定，不以 _plan 槽为空推断（P1）
+        accepted_generation = [0]
+
+        def annotated(payload: dict) -> dict:
+            """内部桥接事件统一携带 plan_id/plan_generation/request_id（P1）。"""
+            data = dict(payload) if isinstance(payload, dict) else {}
+            data.setdefault("plan_id", plan_id)
+            data["plan_generation"] = accepted_generation[0]
+            if "request_id" not in data:
+                rid = next((key for key, value in self._start_requests.items()
+                            if value.get("plan_id") == plan_id), "")
+                if rid:
+                    data["request_id"] = rid
+            return data
+
         def emit(kind: str, payload: dict) -> None:
-            self._emit(kind, payload)
-            if kind == "plan_done":
+            if kind != "plan_done":
+                # 旧计划迟到的进度事件不得广播到当前界面：事件只属于最近
+                # 接纳的计划；历史计划的进度仍可按 request_id 只读对账（P1）
                 with self._lock:
-                    if self._plan is coordinator:
-                        self._plan = None
+                    is_latest = self._latest_plan_id == plan_id
+                    forward = annotated(payload) if is_latest else None
+                if is_latest:
+                    self._emit(kind, forward)
+                return
+            # 完成状态先提交、再发布：收到 plan_done 的同步回调（测试、未完成的
+            # bootstrap、开始对账）必须当场就看到 _plan 已清空、终态快照与
+            # request_id 记录已可读；先发事件再改状态会留下可观察的中间态（FR05）。
+            with self._lock:
+                owns_slot = self._plan is coordinator
+                if owns_slot:
+                    self._plan = None
+                elif (self._plan is None
+                      and self._latest_plan_id == plan_id):
+                    # 关闭/停止已把当前计划清空：只有「这就是最近接纳的计划」
+                    # 时才算它的收尾。槽为空≠归属——较新计划已结束后，旧计划
+                    # 的迟到完成不得覆盖它的终态快照（P1）
+                    owns_slot = True
+                first_done = not self._finished_plan_ids.get(plan_id)
+                try:
+                    snapshot = coordinator.snapshot()
+                except Exception:
+                    snapshot = None
+                if owns_slot and first_done:
+                    # 终态快照只写一次：重复终态不得把已定结论改成另一状态；
+                    # 旧计划迟到的 plan_done 不得覆盖后来计划或它的终态快照
+                    self._finished_plan_ids[plan_id] = True
+                    self._prune_finished_plans_locked()
+                    self._last_plan = snapshot
+                if first_done:
+                    # 终态快照按 request_id 留档：ack 丢了也要能核实「已经结束」（C05）
+                    rid = next((key for key, value in self._start_requests.items()
+                                if value.get("plan_id") == plan_id), "")
+                    if rid:
+                        final_status = str(payload.get("status")
+                                           or (snapshot or {}).get("status") or "")
+                        self._remember_start(
+                            rid, "accepted", plan_id=plan_id, finished=True,
+                            final_status=final_status,
+                            snapshot={"status": final_status,
+                                      "summary": payload.get("summary") or {},
+                                      "tasks": (snapshot or {}).get("tasks") or []})
+                forward_done = self._latest_plan_id == plan_id
+                forward_payload = annotated(payload) if forward_done else None
+            # 先提交后发布（顺序保留，FR05）；旧计划的完成事件不广播（P1）
+            if forward_done:
+                self._emit("plan_done", forward_payload)
 
         def runner(spec: TaskSpec, cancel_event: threading.Event,
                    status: callable) -> dict:
@@ -850,22 +1678,48 @@ class Api:
                 return {"status": "success", "code": 0, "reason": "演示：报名成功"}
             try:
                 return self._run_plan_task(spec, cancel_event, status)
+            except _SpawnFailure as exc:
+                # 没拿到进程树所有权就不会有网络或浏览器动作：这一场如实记成
+                # 「本机没能启动」，既不冒充学校拒绝，也不静默降级成无主进程。
+                return {"status": "failed", "code": None,
+                        "reason": "本场没能启动：%s" % exc,
+                        "stop_reason": "spawn_failed", "attempts": 0}
             except _ClosingError:
                 # 关闭拒绝落到协调器里就是取消：不冒充报名失败，也不让异常
                 # 冲出 runner 污染任务状态（协调器业务不改）
                 return {"status": "canceled", "code": None,
                         "reason": "程序正在关闭，本场次未启动"}
 
-        coordinator = PlanCoordinator(plan_id, specs, runner, emit)
+        coordinator = PlanCoordinator(plan_id, specs, runner, emit,
+                                      now=self._clock_now)
         with self._lock:
             # FB1 最终接纳点：从开头的 busy 检查到这里隔着校验与构建，期间
             # 可能已有别的请求预留计划、或关闭已开始——同一临界区内重检并
             # 只允许一个请求预留唯一协调器，未接纳的请求不启动、不覆盖
             if self._closing:
                 return {"ok": False, "text": "程序正在关闭，已取消开始计划"}
+            if not DEMO and not self._clock_ready():
+                return {"ok": False,
+                        "text": "北京时间在开始前失去校准，这次没有启动；稍后重试。"}
             if self._is_busy_locked():
                 return {"ok": False, "text": "已有登录、报名或计划在运行，先停止后再开始"}
+            # 取消接纳与最终预留同一临界区：pending 期间点了取消，
+            # 这里必须拒绝，绝不能先占位再补一个「已取消」的计划
+            if request_id and self._start_requests.get(request_id, {}).get("state") == "canceled":
+                return {"ok": False, "text": "这次开始已取消，可以重新发起。",
+                        "canceled": True}
             self._plan = coordinator
+            self._last_plan = None
+            # 接纳代次与最近接纳计划在同一临界区赋值：此后所有事件/快照的
+            # 归属判定都以这一线性化点为基准（P1）
+            self._plan_generation += 1
+            accepted_generation[0] = self._plan_generation
+            self._latest_plan_id = plan_id
+            if request_id:
+                # 接纳与预留同一线性化点：此后取消只能回报真实 plan_id（C04）
+                self._remember_start(request_id, "accepted", plan_id=plan_id,
+                                     result={"ok": True, "queued": True,
+                                             "plan_id": plan_id})
         try:
             # start 在 Api 锁外：协调器启动会 emit 回调（plan 事件要拿 _lock），
             # 锁内调用会双向等死
@@ -875,8 +1729,13 @@ class Api:
             with self._lock:
                 if self._plan is coordinator:
                     self._plan = None
+                if request_id:
+                    self._remember_start(request_id, "rejected", plan_id="",
+                                         result={"ok": False,
+                                                 "text": "计划没能开始，请再试一次"})
             return {"ok": False, "text": "计划没能开始，请再试一次"}
-        return {"ok": True, "queued": True, "plan_id": plan_id}
+        return {"ok": True, "queued": True, "plan_id": plan_id,
+                "plan_generation": accepted_generation[0]}
 
     def cancel_task(self, plan_id: str, task_id: str) -> dict:
         with self._lock:
@@ -982,7 +1841,9 @@ class Api:
 
     def save_prefs(self, prefs: dict) -> dict:
         # 与生命周期心跳共用同一把锁的原子读-合并-写（update_prefs）
-        update_prefs(prefs or {})
+        if not update_prefs(prefs or {}):
+            return {"ok": False, "error": "prefs_busy",
+                    "text": "设置暂未保存，另一个窗口正在保存数据。"}
         return {"ok": True}
 
     # ---------- 内部 ----------
@@ -1006,12 +1867,21 @@ class Api:
         # 是「at + 120 秒」，开放超过 2 分钟的 at 会让循环一次都不进、
         # 直接报「名额已满」。这里把过期的 at 换成现在，窗口从现在起算。
         at_text = spec.sign_start
+        # 学校时间一律按 UTC+8 解析：本机时区不同也不能差 8 小时
+        at_ts = school_epoch(spec.sign_start)
+        # 是否「已开放」只由业务北京时间判断：错误 OS 日期不得把未来场次改写成现在
         try:
-            at_ts = datetime.strptime(spec.sign_start, "%Y-%m-%d %H:%M:%S").timestamp()
-        except (ValueError, TypeError):
-            at_ts = None
-        if at_ts is None or at_ts <= time.time():
-            at_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            business_now = self._clock_now()
+        except ClockUnavailable:
+            business_now = None
+        if at_ts is not None and business_now is not None and at_ts <= business_now:
+            # 已开放场次把 --at 换成「现在」只是让等待逻辑立即通过；
+            # 窗口长度由下面冻结的 --retry-start 决定，不随这一刻后移
+            at_text = school_time_text(epoch=business_now)
+        elif at_ts is None and business_now is not None and not spec.sign_start:
+            at_text = school_time_text(epoch=business_now)
+        # 业务时刻读不到时保持原定开放：worker 会按自己的时钟门禁收成
+        # clock_unavailable，绝不把系统日期当成北京时间
         args = worker_command("grab", "--activity-id", spec.activity_id, "--name", spec.name,
                               "--at", at_text,
                               "--lead", str(max(0, int(spec.lead_s or 0))),
@@ -1019,26 +1889,41 @@ class Api:
                               "--max-attempts", str(spec.max_attempts))
         if spec.sign_end:
             args += ["--sign-end", spec.sign_end]
+        # 计划接纳时冻结的重试起点：worker 解码/鉴权/校时/开页都消耗这段预算，
+        # 慢启动不会把用户设的窗口整体后移（R04）。前端不提交这个锚点。
+        if getattr(spec, "retry_started_at", 0):
+            args += ["--retry-start", "%.3f" % float(spec.retry_started_at)]
         if spec.headed:
             args.append("--headed")
         with self._lock:
-            # 关闭屏障：Popen 与登记同临界区——关闭先发生则零创建（取消语义）；
-            # 创建已开始则 shutdown 必等登记完成才能取快照，收走不会漏
+            # 关闭屏障：创建与登记同临界区——关闭先发生则零创建（取消语义）；
+            # 创建已开始则 shutdown 必等登记完成才能取快照，收走不会漏。
+            # 创建本身也在这里完成：worker 先挂起、归属 Job、再恢复，所以
+            # 任何进度回调与日志都发生在「所有权已确定」之后（FR02）。
             if self._closing:
                 raise _ClosingError("程序正在关闭，本场次未启动")
-            proc = subprocess.Popen(
-                args, cwd=str(HERE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace", bufsize=1,
-                env=_env(), creationflags=CREATE_NO_WINDOW)
+            tree = spawn_owned_worker(args, cwd=str(HERE), env=_env())
+            proc = tree.proc
             self._plan_procs[spec.task_id] = proc
-        if status:
-            # run_started_at 必须在子进程创建之后记录：这是 worker 真正启动
-            # 的时刻，不能提前写成计划启动时刻（预报名要靠它区分准备窗口）
-            status("submitting", {"run_started_at": time.time()})
+        if status and business_now is not None:
+            # Popen 只是「父进程把 worker 拉起来了」，不是 worker 自己的入口时间：
+            # run_started_at 必须等 [checkpoint] worker_started 到达再写（R10）。
+            # 业务时刻读不到就不填，绝不拿系统时间补一个假节点。
+            status("submitting", {"worker_spawned_at": business_now})
         self._emit("log", "▶ [%s] 等待并抢报名" % spec.name)
 
+        # 父层监督：到期后收走本场进程树，不让「不 EOF 的管道」把任务永远挂着。
+        # 所有权在进程恢复执行前就已取得（Job Object）：onefile 引导进程先退出时，
+        # 解压出的真实 worker 仍属于这个 job，收走不依赖一个还活着的父 PID。
+        supervised = {"fired": False}
+        observed = {"attempts": 0}
+        deadline = _task_deadline(spec)
+        cancel_watch = threading.Event()
         lines: queue.Queue[str] = queue.Queue()
         reader_done = threading.Event()
+        tail: list[str] = []
+        canceled = False
+        killed = False
 
         def read_output() -> None:
             try:
@@ -1047,48 +1932,110 @@ class Api:
             finally:
                 reader_done.set()
 
-        threading.Thread(target=read_output, name="signup-output", daemon=True).start()
-        tail: list[str] = []
-        canceled = False
-        killed = False
+        reader = threading.Thread(target=read_output, name="signup-output", daemon=True)
+        reader.start()
+
+        def _watchdog() -> None:
+            """到「有效截止 + 清理余量」就收走本场树。
+
+            等待用 Event 而不是 time.sleep：正常收尾/取消/关闭都在 finally
+            置位，线程立刻退出，不把一个睡到截止的后台线程留在进程里。
+            退出条件不看父进程是否还活着：父已退出、孙进程握着 stdout 时，
+            仍然必须由这里结束监控。
+            """
+            if watch_delay is None:
+                return
+            if cancel_watch.wait(watch_delay):
+                return
+            supervised["fired"] = True
+            tree.terminate()
+
+        # 延迟只算一次，看门狗与主循环共用同一个上限：各算各的会在
+        # 「截止已过」时出现主循环认为已超时、看门狗还在等 grace 的分叉
+        # 监督上限按业务时刻换算成一次性延迟：重校向后纠正不得延长已接纳的时长。
+        # 校时失效时退回「本场最长可能时长 + grace」的独立经过时长上限——
+        # 只用于收走本场进程树，不重写树所有权，也不把系统时间当业务时刻。
+        if deadline:
+            if business_now is not None:
+                watch_delay = max(0.0, deadline - business_now) + SUPERVISE_GRACE_S
+            else:
+                watch_delay = float(spec.retry_for_s or 120) + SUPERVISE_GRACE_S
+        else:
+            watch_delay = None
+        watchdog = None
+        if watch_delay is not None:
+            watchdog = threading.Thread(target=_watchdog, name="signup-watchdog",
+                                        daemon=True)
+            watchdog.start()
 
         def feed(line: str) -> None:
-            """输出行统一入口：落日志、存尾巴，并把 checkpoint 与 telemetry 推成任务 detail。
+            """输出行统一入口：落日志、存尾巴，并把源事件时间与遥测推成任务 detail。
 
-            时间戳取事件实际到达时刻（time.time()），前端据此显示真实节点；
-            缺事件时才由前端按模式安全回退，这里不伪造。"""
+            节点时间只认 worker 自己记录的 [checkpoint] 源时间：日志转发慢 2 秒，
+            「页面已打开」也不会被记成晚 2 秒的接收时刻（R10）。没有结构化事件
+            就不填，让界面老实显示「待打开/待发生」。
+            """
             tail.append(line)
             del tail[:-40]
             self._emit("log", "[%s] %s" % (spec.name, line))
-            if status and "详情页已加载" in line:
-                status("submitting", {"page_opened_at": time.time()})
-            if status and "开始盯按钮" in line:
-                status("submitting", {"watch_started_at": time.time()})
+            checkpoint = _parse_checkpoint_line(line)
+            if checkpoint and status:
+                kind, at = checkpoint
+                field = {"worker_started": "run_started_at",
+                         "page_opened": "page_opened_at",
+                         "watch_started": "watch_started_at"}[kind]
+                status("submitting", {field: at})
             hit = _ATTEMPT_RE.match(line)
-            if hit and status:
-                # 只数真正发起 signUp 的行；刷新 / is_joined 查询不会长这样
-                status("submitting", {"attempts": int(hit.group(1)),
-                                      "last_reason": hit.group(2).strip()})
+            if hit:
+                observed["attempts"] = max(observed["attempts"], int(hit.group(1)))
+                if status:
+                    # 只数真正发起 signUp 的行；刷新 / is_joined 查询不会长这样
+                    status("submitting", {"attempts": int(hit.group(1)),
+                                          "last_reason": hit.group(2).strip()})
             parsed = _parse_retry_line(line)
+            if parsed:
+                # 结构化提交行也要计数：人话行可能被日志转发吞掉，次数不能
+                # 因此归零；两路按「已承认的最大值」归并，不重复累加。
+                raw_attempts = parsed.get("attempts")
+                if raw_attempts not in (None, ""):
+                    try:
+                        observed["attempts"] = max(observed["attempts"], int(raw_attempts))
+                    except (TypeError, ValueError):
+                        pass
             if parsed and status:
-                # 结构化 retry 行到达即写统一 detail：重试截止不必等进程收尾
-                # 才上屏，路线/任务卡/LED 与终态共用同一份 retry_deadline。
-                # attempts/last_reason 不在这里推——提交行已逐次推过、终态
-                # 事件会带最终值，再推一次只会让提交序列出现重复计数。
-                stop = _retry_payload(parsed, spec,
-                                      stop_reason=str(parsed.get("stop_reason") or ""))
-                status("submitting", {"retry_deadline": stop.get("retry_deadline")})
+                # 窗口确定/请求发起都是进度行：先把截止与次数推上去，
+                # 不必等进程收尾；终态行才带 stop_reason，由收尾逻辑消费
+                payload = {}
+                if parsed.get("retry_deadline"):
+                    payload["retry_deadline"] = str(parsed["retry_deadline"])
+                if parsed.get("attempts") and not parsed.get("stop_reason"):
+                    try:
+                        payload["attempts"] = int(parsed["attempts"])
+                    except (TypeError, ValueError):
+                        pass
+                if payload:
+                    status("submitting", payload)
 
+        code = None
         try:
-            # 正常收尾要求 reader_done（输出读完）；取消路径只要求进程死透——
-            # onefile 引导进程被树终止后，真实 worker 可能还握着 stdout 管道，
-            # 再等 EOF 这条循环就永远出不去，canceled / plan_done 都发不出去。
+            hard_stop = (time.monotonic() + watch_delay) if watch_delay is not None else None
+            # 正常收尾要求 reader_done（输出读完）；取消与父层监督只要求
+            # 进程树死透——onefile 引导进程被收走后，真实 worker 可能还握着
+            # stdout 管道，再等 EOF 这条循环就永远出不去，plan_done 也发不出去。
             while True:
-                if cancel_event.is_set() and not killed and proc.poll() is None:
+                if cancel_event.is_set() and not killed:
                     canceled = True
                     killed = True
-                    _kill_tree(proc)
+                    tree.terminate()
                 if proc.poll() is not None and (canceled or reader_done.is_set()):
+                    break
+                if supervised["fired"]:
+                    # 监督已收走进程树：不再等 EOF，也不把管道当「还活着」的证据
+                    break
+                if hard_stop is not None and time.monotonic() >= hard_stop:
+                    # 看门狗线程可能被调度延迟；主循环自己再守一次同一个上限
+                    supervised["fired"] = True
+                    tree.terminate()
                     break
                 try:
                     while True:
@@ -1098,6 +2045,8 @@ class Api:
                 except queue.Empty:
                     pass
                 time.sleep(0.05)
+            # 收走之后把队列里剩下的行读完（有界）：最后一条终态不能丢
+            reader_done.wait(1.5)
             while True:
                 try:
                     line = lines.get_nowait()
@@ -1105,41 +2054,103 @@ class Api:
                     break
                 if line:
                     feed(line)
-            code = proc.wait()
-        finally:
-            # 监控循环无论怎么退出（含异常），进程表都必须清干净——
-            # 否则 _is_busy_locked 会把界面永远锁在「计划运行中」。
-            # 顺带关掉输出管道：进程树已终止，读线程要么已 EOF 要么因关闭而退出。
             try:
-                if proc.stdout:
+                code = proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                # 父进程不退出：树已终止还等不到就按已收走处理，绝不再等
+                supervised["fired"] = True
+                tree.terminate()
+                try:
+                    code = proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    code = -1
+        finally:
+            # 监控循环无论怎么退出（含异常）都要：撤销监督、收走本场树、
+            # 清进程表、关管道。顺序是硬要求——先置取消、再有界 join 监督
+            # 线程，最后才终止/释放 Job 句柄：否则迟到的 watchdog 可能拿着
+            # 已关闭（甚至已被复用）的句柄去 TerminateJobObject（FR02）。
+            cancel_watch.set()
+            if watchdog is not None:
+                watchdog.join(timeout=2.0)
+            try:
+                tree.terminate()
+            except Exception:
+                pass
+            reader.join(timeout=2.0)     # 有界 join：不在另一线程持读锁时同步 close
+            if reader_done.is_set() and proc.stdout:
+                try:
                     proc.stdout.close()
+                except Exception:
+                    pass
+            try:
+                tree.close()
             except Exception:
                 pass
             with self._lock:
                 self._plan_procs.pop(spec.task_id, None)
-        # 结构化终态行 [retry] 是策略信息的第一来源，没有也不影响退出码语义
+        # 结构化终态行是策略信息的第一来源：只认带 stop_reason 的那一条，
+        # 进度行（窗口确定/请求发起）不得冒充终态
         stop: dict = {}
         for line in reversed(tail):
             parsed = _parse_retry_line(line)
-            if parsed:
+            if parsed and parsed.get("stop_reason"):
                 stop = parsed
                 break
 
+        # 停止只终止本地执行：它撤不回已经发出的请求，也不能推翻已经收到的
+        # 学校答复。所以「已获得的证据」优先于「本地怎么结束的」（FR03）——
+        # 先认已确认结果，再认确定失败，最后才落到取消/待核对。
+        attempts_seen = max(observed["attempts"], _attempts_of(stop))
+        if stop.get("stop_reason") == "already_signed" \
+                or any("你已经报过这个活动" in line for line in tail):
+            return {"status": "already_signed", "code": code, "reason": "你已经报过这一场",
+                    **_retry_payload(_with_attempts(stop, attempts_seen), spec,
+                                     stop_reason="already_signed")}
+        # 成功不要求退出码为 0：强杀会给出非 0，但杀之前的成功终态已经收到
+        if stop.get("stop_reason") == "success" \
+                or any("[OK] 报名成功" in line for line in tail):
+            return {"status": "success", "code": code, "reason": "报名成功",
+                    **_retry_payload(_with_attempts(stop, attempts_seen), spec,
+                                     stop_reason="success")}
         if canceled:
+            definite = str(stop.get("stop_reason") or "")
+            if definite:
+                # 取消晚到：worker 已经给出确定终态，按那个结论记，不降级成取消
+                return {"status": "failed", "code": code,
+                        "reason": "已按你的要求停止；停止前已收到确定结果",
+                        "locally_stopped": True,
+                        **_retry_payload(_with_attempts(stop, attempts_seen), spec,
+                                         stop_reason=definite)}
+            if attempts_seen > 0:
+                # 本地确实停了，但已发出的提交没有确定回应：两层事实都要保留，
+                # 次数不能归零，也不能说成「没抢到」（FR03）。
+                return {"status": "failed", "code": code,
+                        "reason": "已按你的要求停止；最后一次提交没有拿到确定回应",
+                        "locally_stopped": True,
+                        **_retry_payload(dict(stop, attempts=attempts_seen), spec,
+                                         stop_reason="unconfirmed")}
             return {"status": "canceled", "code": code, "reason": "用户取消了这一场",
                     **_retry_payload(stop, spec, stop_reason="user_stopped")}
-        if any("你已经报过这个活动" in line for line in tail) or stop.get("stop_reason") == "already_signed":
-            return {"status": "already_signed", "code": code, "reason": "你已经报过这一场",
-                    **_retry_payload(stop, spec, stop_reason="already_signed")}
-        if code == 0 and any("报名成功" in line for line in tail):
-            return {"status": "success", "code": code, "reason": "报名成功",
-                    **_retry_payload(stop, spec, stop_reason=stop.get("stop_reason") or "success")}
         reason = ""
         for line in reversed(tail):
             if line.startswith("[X] "):
                 reason = line[4:].strip()
                 break
-        stop_reason = stop.get("stop_reason") or ("login_invalid" if code == 3 else "process_error")
+        if supervised["fired"] and not stop.get("stop_reason"):
+            # 父层收走时没有终态行：保留已观察到的提交次数；
+            # 发过请求但没结论的，必须说「未确认」，不能冒充学校明确失败
+            stop = {"attempts": attempts_seen,
+                    "stop_reason": "unconfirmed" if attempts_seen else ""}
+            if not attempts_seen:
+                binding = "sign_end" if spec.sign_end and _task_deadline(spec) == school_epoch(spec.sign_end) else "retry_duration"
+                stop_reason = binding
+            else:
+                stop_reason = "unconfirmed"
+            return {"status": "failed", "code": code,
+                    "reason": "本机监督到期，已收走本场进程",
+                    **_retry_payload(stop, spec, stop_reason=stop_reason)}
+        stop_reason = stop.get("stop_reason") or (
+            "login_invalid" if code == 3 and "登录失效" in "".join(tail) else "process_error")
         return {"status": "failed", "code": code,
                 "reason": reason or "退出码 %s" % code,
                 **_retry_payload(stop, spec, stop_reason=stop_reason)}
@@ -1214,6 +2225,23 @@ class Api:
                          daemon=True).start()
         return {"ok": True}
 
+    def _anchor_login_success(self) -> None:
+        """新登录真实成功后建立 v2 锚点；没有可信时钟就不写（不拿系统时间冒充）。
+
+        只在本次 login worker 成功路径调用：check/refresh/bootstrap 都不续期，
+        也不改 session/storage_state 结构，旧有效凭证不要求重登。
+        """
+        try:
+            lower, upper = self._clock.bounds()
+            token = str(json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+                        .get("token") or "").strip()
+        except Exception:
+            return
+        if not token or not (upper >= lower):
+            return
+        save_session_timing_anchor(token, (lower + upper) / 2.0,
+                                   (upper - lower) / 2.0)
+
     def _pump(self, proc: subprocess.Popen, label: str, kind: str = "grab") -> None:
         self._emit("log", "▶ " + label)
         tail: list[str] = []
@@ -1228,6 +2256,9 @@ class Api:
         if kind == "login":
             # 登录只看退出码：grab.py login 成功时不会打印「报名成功」
             ok = proc.returncode == 0
+            if ok:
+                # 只有本次登录真实成功才建立 v2 锚点：check/refresh 不续期
+                self._anchor_login_success()
         else:
             ok = proc.returncode == 0 and any("报名成功" in t for t in tail)
         reason = ""
@@ -1244,39 +2275,408 @@ class Api:
                 self._proc = None
 
 
-def _seconds_until(ts: str | None, now: float) -> int | None:
-    if not ts:
+def _seconds_until(ts: str | None, now: "float | None") -> int | None:
+    """学校时间文本距现在多少秒；非法/缺失/时钟未知都返回 None（不猜）。"""
+    if not ts or now is None:
         return None
-    try:
-        return int(datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").timestamp() - now)
-    except Exception:
-        return None
+    epoch = school_epoch(ts)
+    return None if epoch is None else int(epoch - now)
 
 
-def _kill_tree(proc: subprocess.Popen) -> None:
-    """按进程树终止 worker：taskkill /F /T 连 Playwright node / chromium 一起收。
+def _kill_tree(proc: subprocess.Popen) -> bool:
+    """按进程树终止 worker，返回是否已确认终止。
 
     只 terminate 直接子进程的话，PyInstaller onefile 的引导进程死后，
     解压出的真实 worker 会带着浏览器继续按重试节奏跑——就是
     「停止不了、还在无限重试」的那个形态。收尸（wait）交给调用方
     的监控循环，这里只负责让它死透。
+
+    注意：本函数只在父进程还活着时有效；父进程已退出时调用方必须用
+    :class:`_ProcessTree`（Job Object）收走它留下的后代。返回值是
+    「终止是否成功」，调用方据此决定能否置「已收走」标志。
     """
     if proc.poll() is not None:
-        return
+        return True
+    killed = False
     if os.name == "nt":
         try:
-            subprocess.run(
+            done = subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                 capture_output=True, timeout=3,
                 creationflags=CREATE_NO_WINDOW)
+            killed = done.returncode == 0
         except Exception:
-            pass
+            killed = False
     if proc.poll() is None:
         # taskkill 不可用/失败时的兜底：至少终止直接子进程
         try:
             proc.kill()
+            killed = True
         except Exception:
             pass
+    return killed or proc.poll() is not None
+
+
+# ---------------------------------------------------------------- 进程树所有权
+# Windows Job Object：进程一创建就挂进去，之后它派生的一切（onefile 解压出
+# 的真实 worker、Playwright node、chromium）都自动属于这个 job。父进程先退出
+# 也不会让后代脱管——TerminateJobObject 只认 job 句柄，不认父 PID。
+#
+# 关键顺序：CREATE_SUSPENDED 建进程 → 建 Job → 归属 → ResumeThread。
+# 先跑起来再 Assign 存在真实窗口：worker 在这几毫秒里就能派生 Playwright
+# 子进程，那些后代不会自动进入 job，父进程先退出时照样脱管。
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_QUERY_INFORMATION = 0x0400
+_CREATE_SUSPENDED = 0x00000004
+_TH32CS_SNAPTHREAD = 0x00000004
+_THREAD_SUSPEND_RESUME = 0x0002
+_INVALID_HANDLE_VALUE = (1 << 64) - 1
+_RESUME_FAILED = 0xFFFFFFFF
+
+
+class _SpawnFailure(RuntimeError):
+    """worker 创建/归属/恢复失败：本场没有启动。
+
+    失败不降级成「父进程活着才 taskkill」——那种运行方式在父进程被杀后
+    会留下脱管的后代，正是「停止不了」的来源。宁可这一场明确失败。
+    """
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", _IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class _THREADENTRY32(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.c_uint32),
+        ("cntUsage", ctypes.c_uint32),
+        ("th32ThreadID", ctypes.c_uint32),
+        ("th32OwnerProcessID", ctypes.c_uint32),
+        ("tpBasePri", ctypes.c_long),
+        ("tpDeltaPri", ctypes.c_long),
+        ("dwFlags", ctypes.c_uint32),
+    ]
+
+
+_KERNEL32 = None
+
+
+def _win_kernel32():
+    """Windows kernel32 句柄与函数原型（只初始化一次）。
+
+    必须在同一个句柄上设置 argtypes：否则 64 位下 ctypes 会把 Python int
+    当 32 位 c_int 传，job/进程/线程句柄被截断，调用静默失败。
+    """
+    global _KERNEL32
+    if _KERNEL32 is not None:
+        return _KERNEL32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    kernel32.SetInformationJobObject.restype = ctypes.c_int
+    kernel32.SetInformationJobObject.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+    kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.TerminateJobObject.restype = ctypes.c_int
+    kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenThread.restype = ctypes.c_void_p
+    kernel32.OpenThread.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.ResumeThread.restype = ctypes.c_uint32
+    kernel32.ResumeThread.argtypes = [ctypes.c_void_p]
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    kernel32.Thread32First.restype = ctypes.c_int
+    kernel32.Thread32First.argtypes = [ctypes.c_void_p, ctypes.POINTER(_THREADENTRY32)]
+    kernel32.Thread32Next.restype = ctypes.c_int
+    kernel32.Thread32Next.argtypes = [ctypes.c_void_p, ctypes.POINTER(_THREADENTRY32)]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    _KERNEL32 = kernel32
+    return kernel32
+
+
+def _close_handle(handle) -> None:
+    """关闭自有句柄；0/None 直接跳过，失败不抛（清理路径不制造新异常）。"""
+    if not handle:
+        return
+    try:
+        _win_kernel32().CloseHandle(handle)
+    except Exception:
+        pass
+
+
+def _open_primary_thread(pid: int):
+    """打开刚创建的挂起进程的主线程。
+
+    挂起进程此刻只有一个线程，所以「按拥有者 PID 找到的第一个线程」
+    就是主线程。找不到或打不开返回 None，由调用方按启动失败处理。
+    """
+    kernel32 = _win_kernel32()
+    snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
+    if not snapshot or snapshot == _INVALID_HANDLE_VALUE:
+        return None
+    try:
+        entry = _THREADENTRY32()
+        entry.dwSize = ctypes.sizeof(_THREADENTRY32)
+        found = None
+        ok = kernel32.Thread32First(snapshot, ctypes.byref(entry))
+        while ok:
+            if entry.th32OwnerProcessID == int(pid):
+                found = int(entry.th32ThreadID)
+                break
+            ok = kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+        if not found:
+            return None
+        return kernel32.OpenThread(_THREAD_SUSPEND_RESUME, False, found) or None
+    finally:
+        _close_handle(snapshot)
+
+
+def _create_job_for(proc: subprocess.Popen):
+    """建一个 KILL_ON_JOB_CLOSE 的 Job 并把进程挂进去；失败返回 None。
+
+    返回 None 由调用方升级成 _SpawnFailure：不再有「没拿到所有权也继续跑」
+    的降级路径。失败时自己关掉已建的 job 与进程句柄，不留泄漏。
+    """
+    if os.name != "nt":
+        return None
+    kernel32 = _win_kernel32()
+    job = None
+    handle = None
+    try:
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+                job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(info), ctypes.sizeof(info)):
+            _close_handle(job)
+            return None
+        handle = kernel32.OpenProcess(
+            _PROCESS_SET_QUOTA | _PROCESS_TERMINATE | _PROCESS_QUERY_INFORMATION,
+            False, proc.pid)
+        if not handle:
+            _close_handle(job)
+            return None
+        if not kernel32.AssignProcessToJobObject(job, handle):
+            _close_handle(job)
+            return None
+        return job
+    except Exception:
+        _close_handle(job)
+        return None
+    finally:
+        _close_handle(handle)
+
+
+class _ProcessTree:
+    """本场 worker 的进程树所有权：收走时不依赖一个还活着的父 PID。"""
+
+    def __init__(self, proc: subprocess.Popen, job):
+        self.proc = proc
+        self._job = job
+        self._lock = threading.RLock()
+        self._ended = False
+        self._closed = False
+
+    @property
+    def owned(self) -> bool:
+        """是否拿到了跨父进程生命周期的所有权（Job Object）。"""
+        return self._job is not None
+
+    def terminate(self) -> bool:
+        """终止整棵树，返回是否确认已终止。
+
+        失败不置「已成功」标志：watchdog 失败后 finally 还能再试一次。
+        加锁串行化 watchdog 与 finally 的并发调用，避免一个正在
+        TerminateJobObject 时另一个已经走进了 close()。
+        """
+        with self._lock:
+            if self._ended:
+                return True
+            ok = True
+            if self._job is not None:
+                try:
+                    if not _win_kernel32().TerminateJobObject(self._job, 1):
+                        ok = False
+                except Exception:
+                    ok = False
+            if self.proc.poll() is None:
+                if not _kill_tree(self.proc):
+                    ok = False
+            if ok:
+                self._ended = True
+            return ok
+
+    def close(self) -> None:
+        """释放 job 句柄；KILL_ON_JOB_CLOSE 保证残留后代随句柄一起结束。
+
+        与 terminate 互斥：绝不在另一次终止还在用句柄时关掉它。
+        """
+        with self._lock:
+            if self._job is None or self._closed:
+                return
+            self._closed = True
+            _close_handle(self._job)
+            self._job = None
+
+
+def spawn_owned_worker(args: list[str], *, cwd: str, env: dict) -> _ProcessTree:
+    """创建报名 worker：先挂起，取得进程树所有权后再让它跑。
+
+    任何一步（挂起创建 / 建 Job / 归属 / 恢复线程）失败，都先把仍挂起的
+    自有进程结束掉、关掉所有自有句柄，再抛 :class:`_SpawnFailure`；
+    调用方据此把这一场记成「本机没能启动」，不产生任何网络或浏览器动作。
+    """
+    if os.name != "nt":
+        raise _SpawnFailure("非 Windows 环境无法取得进程树所有权")
+    proc = subprocess.Popen(
+        args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
+        env=env, creationflags=CREATE_NO_WINDOW | _CREATE_SUSPENDED)
+    job = None
+    try:
+        thread = _open_primary_thread(proc.pid)
+        if not thread:
+            raise _SpawnFailure("找不到刚创建进程的主线程")
+        try:
+            job = _create_job_for(proc)
+            if not job:
+                raise _SpawnFailure("worker 没能加入进程树（Job 创建或归属失败）")
+            if _win_kernel32().ResumeThread(thread) == _RESUME_FAILED:
+                raise _SpawnFailure("worker 主线程没能恢复执行")
+        finally:
+            _close_handle(thread)
+    except BaseException:
+        # 失败路径：结束仍挂起的自有进程（此刻它还没有任何后代），
+        # 管道与句柄一并关闭，绝不留下半个 worker。
+        _close_handle(job)
+        job = None
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        if proc.stdout:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+        raise
+    return _ProcessTree(proc, job)
+
+
+SUPERVISE_GRACE_S = 5.0
+
+
+def _task_deadline(spec) -> float | None:
+    """父层视角的本场绝对截止（与 worker 的预算同一公式）。
+
+    worker 自己也会算，但管道卡死、进程不退出时只有父进程能收走它；
+    这里只用于监督兜底，不改变 worker 的调度。
+    """
+    start = float(getattr(spec, "retry_started_at", 0) or 0)
+    if start <= 0:
+        return None
+    end = school_epoch(spec.sign_end) if getattr(spec, "sign_end", "") else None
+    retry_for = int(getattr(spec, "retry_for_s", 120) or 0)
+    if retry_for > 0:
+        deadline = start + retry_for
+        return min(deadline, end) if end else deadline
+    if end:
+        return end
+    return start + 120.0
+
+
+def _parse_checkpoint_line(line: str) -> tuple[str, float] | None:
+    """解析 worker 的 [checkpoint] JSON 行，返回 (kind, 源事件 epoch 秒)。
+
+    kind 只认三个真实发生过的事件；坏 JSON、未知 kind 都返回 None，
+    调用方保持已有 checkpoint 不变，绝不用接收时刻补一个假节点。
+    """
+    text = str(line or "")
+    marker = "[checkpoint] "
+    index = text.find(marker)
+    if index < 0:
+        return None
+    try:
+        data = json.loads(text[index + len(marker):].strip())
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    kind = str(data.get("kind") or "")
+    if kind not in {"worker_started", "page_opened", "watch_started"}:
+        return None
+    try:
+        at = float(data.get("at"))
+    except (TypeError, ValueError):
+        return None
+    return (kind, at) if at > 0 else None
+
+
+def _parse_clock_line(out: str) -> dict | None:
+    """取输出里最后一条 [clock] 结构化粗校时结论；没有则 None。
+
+    每轮 check 都要带结论（ok/warn/unknown），界面才能用新状态替换旧告警；
+    只取最后一行会让「本轮没有采样」被误当成「上一轮仍然有效」。
+    """
+    found = None
+    for line in str(out or "").splitlines():
+        marker = "[clock] "
+        index = line.find(marker)
+        if index < 0:
+            continue
+        try:
+            data = json.loads(line[index + len(marker):].strip())
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict) and data.get("source") == "http_date":
+            found = data
+    return found
 
 
 def _parse_retry_line(line: str) -> dict | None:
@@ -1298,6 +2698,21 @@ def _parse_retry_line(line: str) -> dict | None:
     if reason:
         fields["last_reason"] = reason
     return fields or None
+
+
+def _attempts_of(stop: dict) -> int:
+    """从结构化终态行里读「已承认的提交次数」；非法值按 0。"""
+    try:
+        return max(0, int((stop or {}).get("attempts", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _with_attempts(stop: dict, attempts: int) -> dict:
+    """终态载荷统一写「两路归并后的次数」，不让某一路缺失把次数清零。"""
+    merged = dict(stop or {})
+    merged["attempts"] = max(attempts, _attempts_of(stop))
+    return merged
 
 
 def _retry_payload(stop: dict, spec: "TaskSpec", stop_reason: str) -> dict:
@@ -1336,9 +2751,11 @@ def _check_reason_line(out: str) -> tuple[str, str]:
 
     归因只信第一条 [X] 来源行——失败输出的末尾固定是「请重新登录」指引，
     拿末行分类会把网络错误误判成登录失效；末行仍返回给界面做时钟偏差展示。
+    结构化 [clock]/[checkpoint] 行不是人话，既不当来源也不当末行。
     空输出返回 ("", "")，调用方按「认不出的失败」落 unknown。
     """
     lines = [ln.strip() for ln in str(out or "").strip().splitlines() if ln.strip()]
+    lines = [ln for ln in lines if "[clock] " not in ln and "[checkpoint] " not in ln]
     reason = next((ln for ln in lines if ln.startswith("[X] ")), "")
     return reason, (lines[-1] if lines else "")
 
@@ -1464,8 +2881,20 @@ def main() -> int:
         return 1
     # 进程级生命周期：冻结上一运行周期并开始心跳（F5 重载不重置；
     # 懒创建兜底——bootstrap 先被调用时也能拿到同一实例）
-    lifecycle = get_lifecycle()
-    api = Api()
+    # 独立北京时间（决策 012）：主程序唯一 BusinessClock 生命周期；
+    # 后台同步不阻塞 UI，Api import 时不联网；demo 完全离线（标「演示时间」）
+    clock = BusinessClock(background=not DEMO)
+    configure_time_source(clock.now)
+    try:
+        snap = clock.snapshot()
+        if snap.get("owner_id"):
+            _CLOCK_ENV["path"] = clock._snapshot_path()
+            _CLOCK_ENV["owner"] = str(snap.get("owner_id"))
+    except Exception:
+        pass
+    lifecycle = get_lifecycle(now_fn=clock.now)
+    api = Api(clock=clock)
+    api._start_clock_monitor()
     window = webview.create_window(
         "天软活动预报名工具", str(UI),
         js_api=api, width=1120, height=800, min_size=(980, 700),
@@ -1478,6 +2907,7 @@ def main() -> int:
     # 再停心跳并落关闭时刻，clean/abnormal 的分界不变
     api.shutdown()
     lifecycle.finalize()
+    clock.close()
     return 0
 
 

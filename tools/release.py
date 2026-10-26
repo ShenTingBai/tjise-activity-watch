@@ -98,11 +98,17 @@ def tag_of(version: str) -> str:
 
 
 def exe_asset_name(version: str) -> str:
-    return "%s-v%s-win-x64.exe" % (PRODUCT_NAME, version)
+    """下载资产的唯一英文基名。
+
+    GitHub 会把中文前缀规范化成别的形式（已发布 v1.1.0 就靠人工补救过一次），
+    所以下载名只用 ASCII，中文产品名只出现在 Release 标题/说明里。
+    manifest、prepare、verify、publish 共用这一个函数，不产生手工映射。
+    """
+    return "tjise-activity-watch-v%s-win-x64.exe" % version
 
 
 def zip_asset_name(version: str) -> str:
-    return "%s-v%s-win-x64.zip" % (PRODUCT_NAME, version)
+    return "tjise-activity-watch-v%s-win-x64.zip" % version
 
 
 def run(cmd: list[str], cwd: Path = ROOT, env: dict | None = None) -> str:
@@ -435,7 +441,10 @@ def ensure_tag(tag: str, expect_commit: str) -> None:
 
 
 def release_notes(tag: str) -> str:
-    """取 CHANGELOG 里最新一节，省得每次手写。"""
+    """取 CHANGELOG 里最新一节，并附上与资产名同源的下载行。
+
+    下载名不再手写：GitHub 曾把中文前缀规范化，人工补救过一次（R16）。
+    """
     text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     lines = text.splitlines()
     buf: list[str] = []
@@ -448,7 +457,10 @@ def release_notes(tag: str) -> str:
         if buf:
             buf.append(line)
     body = "\n".join(buf).strip()
-    return (body or tag) + "\n\n---\n\n"
+    version = tag[1:] if tag.startswith("v") else tag
+    download = ("**下载**：`%s`（单 EXE） · `%s`（完整 ZIP）\n\n---\n\n"
+                % (exe_asset_name(version), zip_asset_name(version)))
+    return (body or tag) + "\n\n" + download
 
 
 def publish(tag: str, assets: list[Path], clobber: bool = False) -> None:

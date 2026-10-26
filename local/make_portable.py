@@ -40,7 +40,10 @@ PIP_PACKAGES = ["playwright>=1.40", "pillow>=9.0", "pywebview>=5.0"]
 
 # 应用本体：脚本 + 双击入口 + 说明（runtime_paths.py 是 app/grab 的数据根依赖，漏掉直接 ImportError）
 APP_FILES = [
-    "grab.py", "app.py", "signup_plan.py", "runtime_paths.py", "install.bat", "_py.bat",
+    "grab.py", "app.py", "signup_plan.py", "runtime_paths.py",
+    # 独立北京时间（决策 012）：业务时钟与其契约必须随绿色版一起分发
+    "business_clock.py", "time_contract.py", "update_check.py",
+    "install.bat", "_py.bat",
     "1-登录.bat", "2-抢活动.bat", "3-检查登录和活动.bat", "4-图形界面.bat",
     "requirements.txt", "config.example.json", "README.md", "gui-preview.png",
     "启动不了点我.txt",

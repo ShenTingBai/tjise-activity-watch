@@ -11,10 +11,14 @@ from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
 
 LOCAL = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
 if str(LOCAL) not in sys.path:
     sys.path.insert(0, str(LOCAL))
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
 import update_check as updates
 import app as local_app
+from fixtures.business_clock import TestWallClock  # noqa: E402
 
 
 def release(tag="v1.1.0", **extra):
@@ -99,7 +103,7 @@ class UpdateNetworkTests(unittest.TestCase):
 
 class UpdateBridgeTests(unittest.TestCase):
     def setUp(self):
-        self.api = local_app.Api()
+        self.api = local_app.Api(clock=TestWallClock())
         self.api._emit = Mock()
 
     def test_constructor_and_bootstrap_do_not_query(self):

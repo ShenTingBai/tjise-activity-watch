@@ -43,3 +43,7 @@
 策略语义改动需同步四处：`local/grab.py` 的 `compute_retry_window` / 轮询循环、
 `docs/UI_SPEC.md` §5.8、`docs/RETRY_POLICY_GUIDE.md`、`local/tests/test_retry_policy.py`；
 `retry_for_s` / `max_attempts` 字段名不得重命名（快照与事件载荷契约）。
+
+## 2026-10-26 返修补记（1.1.1 候选）
+
+次数改为按真实 `signUp` 请求发起计数；策略起点在计划接纳时冻结（未来场=sign_start，已开放场=accepted_at），全部阻塞共用单调预算；最后一次请求无响应时单列「结果未确认」。回归证据：`local/tests/test_worker_boundaries.py`（直接驱动生产 cmd_grab）。

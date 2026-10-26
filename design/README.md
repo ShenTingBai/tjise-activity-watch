@@ -47,7 +47,7 @@
 | 签到 / 签退三态筛选 | implemented | [005](decisions/005-attendance-filters.md) |
 | 登录态持久化与启动校验（四态 / 4001 / 迁移） | implemented | [006](decisions/006-session-persistence.md) |
 | 运行时间线（真实事件 + 原定参考 + 统一截止） | implemented（真机验收待用户） | [007](decisions/007-runtime-timeline.md) |
-| 应用生命周期、版本单一来源与发布资产 | implemented（构建/上传待授权，真机验收待用户） | [008](decisions/008-lifecycle-version-release.md) |
+| 应用生命周期、版本单一来源与发布资产 | v1.1.0 已发布（2026-10-26）；1.1.1 为未上传补丁候选，学校真机验收仍待用户 | [008](decisions/008-lifecycle-version-release.md) |
 | 六步可重播功能引导 | implemented（mock 截图见 [current-ui/](current-ui/)，真机验收待用户） | [009](decisions/009-replayable-product-tour.md) |
 | 独立可用单EXE | implemented（离线实包通过，用户真机待验收） | [010](decisions/010-standalone-exe-and-settings.md) |
 | 统一帮助、主题对齐与手动检查更新 | confirmed（代码已落地，技术与用户验收分列） | [011](decisions/011-unified-help-and-manual-update.md) · [规范](specs/assistance-panels.md) |
@@ -122,3 +122,12 @@ python design/check_refs.py
 
 逐条核对本章 `路径:行号`「原文片段」是否原样出现在基线 `a66016a` 的那一行。
 新增内容不要再写行号引用——现行代码以 `docs/` 与 `local/` 为准，行号易漂移。
+
+### 独立北京时间（决策 012，2026-10-26 返修轮更新）
+
+工具按**独立北京时间**运行：业务时刻来自公共 NTP 锚点 + 应用内经过时长，不读取也不修改系统时间；
+校时失败不禁登录、不清凭证，只禁自动报名并在时间详情提供重新校准。顶栏只有一个时间入口
+（正常安静显示「北京时间 + 时分秒 + 状态图形」，未校准「待校准」，详情给误差/来源与恢复动作）。
+快照合同（epoch_s↔tick_s、sampled_tick_s、age_s）与五态文案见
+[决策 012](decisions/012-independent-beijing-clock.md) 与
+[copywriting.md](specs/copywriting.md)。真实网络授时精度与学校真实开放瞬间属待验收边界，不在此宣称。

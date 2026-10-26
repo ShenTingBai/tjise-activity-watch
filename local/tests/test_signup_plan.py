@@ -10,12 +10,25 @@
 
 from __future__ import annotations
 
+import io
 import sys
 import threading
 import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+
+LOCAL = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+# 裸导入（time_contract / grab）依赖 local/ 在 sys.path 上：必须早于这些 import
+if str(LOCAL) not in sys.path:
+    sys.path.insert(0, str(LOCAL))
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+
+from time_contract import configure_time_source, school_time_text  # noqa: E402
+configure_time_source(time.time)   # 旧用例显式注入本机时钟；新用例改注 FakeBusinessClock
+from unittest import mock
 
 from local.signup_plan import (
     PlanCoordinator,
@@ -26,8 +39,8 @@ from local.signup_plan import (
     parse_timestamp,
     validate_plan,
 )
-
-LOCAL = Path(__file__).resolve().parents[1]
+from fixtures.business_clock import TestWallClock  # noqa: E402
+from business_clock import ClockUnavailable  # noqa: E402
 
 
 def activity(aid, sign, start, end, name=None, signed=False):
@@ -283,7 +296,7 @@ class ApiBusyLockTests(unittest.TestCase):
         finally:
             sys.path.pop(0)
         self._app_module = local_app
-        return local_app.Api()
+        return local_app.Api(clock=TestWallClock())
 
     def test_busy_lock_blocks_login_and_start_plan_until_stopped(self):
         api = self._api()
@@ -340,7 +353,107 @@ class ApiBusyLockTests(unittest.TestCase):
         self.assertNotEqual(at_value, "2026-10-20 00:00:00", "过期的开放时间不得原样传给脚本")
         rewritten = parse_timestamp(at_value)  # 必须仍是 grab.py 认的完整格式
         self.assertIsNotNone(rewritten)
-        self.assertLessEqual(rewritten, datetime.now().replace(microsecond=0))
+        # 学校时间统一为带东八区时区的 datetime：比较也必须用同一口径，
+        # 否则 naive/aware 混比会抛 TypeError（不是放宽断言）
+        self.assertLessEqual(rewritten, datetime.now(rewritten.tzinfo).replace(microsecond=0))
+
+    def test_run_plan_task_keeps_future_start_when_os_date_is_30_days_off(self):
+        """未来场次必须原样传真实 sign_start：错误 OS 日期不得改写成「现在」。"""
+        from unittest import mock
+        from fixtures.business_clock import FakeBusinessClock
+        from time_contract import school_time_text
+
+        self._api()                 # 完成导入与跳过判定，并留下 _app_module
+        local_app = self._app_module
+        start = 1793100000.0
+        clock = FakeBusinessClock(epoch=start, tick=0.0)
+        api = local_app.Api(clock=clock)
+        captured, statuses = {}, []
+
+        def fake_worker(*args):
+            captured["args"] = list(args)
+            return ["python", "grab.py"]
+
+        class FakeProc:
+            pid = 4242
+            returncode = 2
+
+            def __init__(self):
+                self.stdout = io.StringIO("")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        class FakeTree:
+            proc = FakeProc()
+
+            def terminate(self):
+                return True
+
+            def close(self):
+                pass
+
+        def fake_spawn(*a, **k):
+            captured["spawned"] = True
+            return FakeTree()
+
+        real_start = school_time_text(start + 600.0)
+        spec = TaskSpec("task-f", "f", "未来开放的活动",
+                        real_start, "2026-10-23 12:00:00", "2026-10-23 13:00:00")
+        # OS 墙钟快 30 天：业务时刻才是判断依据
+        with mock.patch.object(local_app, "worker_command", fake_worker), \
+                mock.patch.object(local_app, "spawn_owned_worker", fake_spawn), \
+                mock.patch("time.time", return_value=start + 30 * 86400):
+            api._run_plan_task(spec, threading.Event(),
+                               lambda s, d=None: statuses.append(dict(d or {})))
+        args = captured["args"]
+        self.assertEqual(args[args.index("--at") + 1], real_start,
+                         "未来场次不得被系统日期改写成现在")
+        spawned = [item.get("worker_spawned_at") for item in statuses
+                   if item.get("worker_spawned_at") is not None]
+        self.assertEqual(spawned, [start], "worker 节点时间必须是业务北京时间")
+
+
+class CoordinatorClockLossTests(unittest.TestCase):
+    """C04：等待期间校时失效必须收成唯一 plan_done，不把线程永久挂在等待里。"""
+
+    def test_clock_loss_while_waiting_emits_single_plan_done(self):
+        start = 1793100000.0
+        row = {"id": "a", "name": "未来场",
+               "sign_start": school_time_text(start + 3600),
+               "sign_end": school_time_text(start + 7200),
+               "act_start": "2099-01-03 09:00:00", "act_end": "2099-01-03 11:00:00",
+               "signed": False}
+        spec = TaskSpec.from_activity(row, "t-a", now=start)
+        events, runner_calls = [], []
+        calls = {"n": 0}
+
+        def flaky_now():
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise ClockUnavailable("锚点超过持有上限未重校")
+            return start
+
+        def runner(spec, cancel_event, status):
+            runner_calls.append(spec.task_id)
+            return {"status": "success"}
+
+        coord = PlanCoordinator("p-clock", [spec], runner,
+                                lambda kind, payload: events.append((kind, payload)),
+                                now=flaky_now, sleep=lambda seconds: None)
+        coord.start()
+        coord._thread.join(5)
+        self.assertFalse(coord._thread.is_alive(), "调度线程不得因校时失效永久挂起")
+        dones = [payload for kind, payload in events if kind == "plan_done"]
+        self.assertEqual(len(dones), 1, "plan_done 必须恰一次")
+        self.assertEqual(runner_calls, [], "校时失效后不得启动新 worker")
+        tasks = [payload for kind, payload in events if kind == "task"]
+        self.assertEqual(tasks[-1]["status"], "canceled")
+        self.assertIn("北京时间", tasks[-1].get("reason", ""))
+        self.assertEqual(dones[0]["summary"]["counts"].get("canceled"), 1)
 
 
 class WorkerStopLifecycleTests(unittest.TestCase):
@@ -373,7 +486,7 @@ class WorkerStopLifecycleTests(unittest.TestCase):
         finally:
             sys.path.pop(0)
         self._app_module = local_app
-        return local_app.Api()
+        return local_app.Api(clock=TestWallClock())
 
     def _start_and_wait_worker(self, api, source, needs_grandchild=True):
         """启动单任务计划并等到 worker 进程（含孙进程）真的跑起来。"""
@@ -392,6 +505,9 @@ class WorkerStopLifecycleTests(unittest.TestCase):
 
         at = (datetime.now() - timedelta(seconds=5)).strftime("%Y-%m-%d %H:%M:%S")
         row = activity("a", at, "2026-10-23 12:00:00", "2026-10-23 13:00:00")
+        # 计划接纳以本进程缓存为权威（R05）：本类验证停止生命周期，
+        # 先把同源快照登记进缓存；接纳门禁由专门用例覆盖
+        api._activities = {str(row["id"]): dict(row)}
         patcher = mock.patch.object(local_app, "worker_command",
                                     lambda *args: [sys.executable, str(fake)])
         with patcher:
@@ -914,6 +1030,285 @@ class RetryPolicyContractTests(unittest.TestCase):
         self.assertEqual(final["attempts"], 2)
         self.assertEqual(final["retry_deadline"], "1792900000")
         self.assertEqual(final["sign_end"], "2026-10-24 10:00:00")
+
+
+class PlanAdmissionTests(unittest.TestCase):
+    """R05/R11：计划接纳只信本进程缓存，并且同一 request_id 只接纳一次。"""
+
+    def _api(self):
+        sys.path.insert(0, str(LOCAL))
+        try:
+            import app as local_app
+        except Exception as exc:
+            self.skipTest("无法导入 local/app.py：%s" % exc)
+        finally:
+            sys.path.pop(0)
+        self._app = local_app
+        return local_app.Api(clock=TestWallClock())
+
+    def _seed(self, api, **override):
+        item = {"id": "a1", "name": "活动", "sign_start": "2026-01-01 09:00:00",
+                "sign_end": "2099-01-02 09:00:00",
+                "act_start": "2099-01-03 09:00:00", "act_end": "2099-01-03 11:00:00",
+                "signed": False}
+        item.update(override)
+        api._activities = {item["id"]: dict(item)}
+        api._last_check = {"result": "valid", "checked_at": 0.0}
+        return item
+
+    def _fake_coordinator(self, app):
+        from unittest import mock
+        inst = mock.Mock()
+        inst.plan_id = "plan-1"
+        inst.snapshot = mock.Mock(return_value={"status": "running"})
+        return inst
+
+    def test_cached_signed_beats_stale_frontend(self):
+        """缓存已报名、前端说未报名：拒绝，且不创建协调器。"""
+        api = self._api()
+        app = self._app
+        self._seed(api, signed=True)
+        with mock.patch.object(app, "PlanCoordinator") as coordinator:
+            res = api.start_plan([{"id": "a1", "signed": False}])
+        self.assertFalse(res["ok"])
+        self.assertIn("已变化", res["text"])
+        self.assertEqual(res["errors"][0]["kind"], "activity_changed")
+        coordinator.assert_not_called()
+        self.assertIsNone(api._plan)
+
+    def test_cached_closed_beats_stale_frontend_end(self):
+        """缓存已截止、前端给未来截止：拒绝，不能拿旧快照开始。"""
+        api = self._api()
+        app = self._app
+        self._seed(api, sign_end="2020-01-02 09:00:00")
+        with mock.patch.object(app, "PlanCoordinator") as coordinator:
+            res = api.start_plan([{"id": "a1", "sign_end": "2099-01-02 09:00:00"}])
+        self.assertFalse(res["ok"])
+        self.assertIn("已变化", res["text"])
+        coordinator.assert_not_called()
+
+    def test_unknown_and_malformed_items_are_recoverable(self):
+        api = self._api()
+        app = self._app
+        self._seed(api)
+        cases = [
+            ("unknown_activity", [{"id": "nope"}]),
+            ("bad_item", ["not-a-dict"]),
+            ("missing_id", [{"name": "没有 id"}]),
+            ("duplicate_id", [{"id": "a1"}, {"id": "a1"}]),
+        ]
+        for kind, items in cases:
+            with self.subTest(kind=kind):
+                with mock.patch.object(app, "PlanCoordinator") as coordinator:
+                    res = api.start_plan(items)
+                self.assertFalse(res["ok"], "坏输入必须拒绝")
+                self.assertIn(kind, [error.get("kind") for error in res["errors"]])
+                coordinator.assert_not_called()
+                self.assertIsNone(api._plan, "拒绝路径不得创建计划")
+
+    def test_valid_snapshot_is_accepted_once(self):
+        api = self._api()
+        app = self._app
+        item = self._seed(api)
+        inst = self._fake_coordinator(app)
+        with mock.patch.object(app, "PlanCoordinator", return_value=inst):
+            res = api.start_plan([{"id": item["id"]}])
+        self.assertTrue(res["ok"], res)
+        inst.start.assert_called_once_with()
+        self.assertEqual(api._plan, inst)
+
+    def test_same_request_id_starts_only_once(self):
+        """R11：同 request_id 并发只启动一次；重放返回原 plan_id。"""
+        api = self._api()
+        app = self._app
+        item = self._seed(api)
+        inst = self._fake_coordinator(app)
+
+        def factory(plan_id, *args, **kwargs):
+            # 真实协调器持有传进来的 plan_id：对账时按它判断「这个计划还在跑」
+            inst.plan_id = plan_id
+            return inst
+
+        with mock.patch.object(app, "PlanCoordinator", side_effect=factory):
+            first = api.start_plan([{"id": item["id"]}], request_id="rid-1")
+            second = api.start_plan([{"id": item["id"]}], request_id="rid-1")
+        self.assertTrue(first["ok"])
+        self.assertEqual(second.get("plan_id"), first["plan_id"])
+        self.assertTrue(second.get("duplicate"))
+        inst.start.assert_called_once_with()
+        state = api.start_request_state("rid-1")
+        self.assertEqual(state["state"], "accepted")
+        self.assertEqual(state["plan_id"], first["plan_id"])
+        self.assertTrue(state["running"])
+
+    def test_cancel_pending_prevents_acceptance(self):
+        """取消先到：最终预留必须拒绝，零 worker、零计划。"""
+        api = self._api()
+        app = self._app
+        item = self._seed(api)
+        api._remember_start("rid-2", "pending")
+        self.assertTrue(api.cancel_start_request("rid-2")["ok"])
+        with mock.patch.object(app, "PlanCoordinator") as coordinator:
+            res = api.start_plan([{"id": item["id"]}], request_id="rid-2")
+        self.assertFalse(res["ok"])
+        self.assertTrue(res.get("canceled"))
+        coordinator.assert_not_called()
+        self.assertIsNone(api._plan)
+
+    def test_cancel_after_acceptance_is_refused(self):
+        api = self._api()
+        app = self._app
+        item = self._seed(api)
+        inst = self._fake_coordinator(app)
+        with mock.patch.object(app, "PlanCoordinator", return_value=inst):
+            api.start_plan([{"id": item["id"]}], request_id="rid-3")
+        res = api.cancel_start_request("rid-3")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["state"], "accepted")
+
+
+
+class StartAdmissionConcurrencyTests(unittest.TestCase):
+    """C04：同 ID 查重与占位原子，取消与接纳有唯一线性化点。"""
+
+    def _api(self):
+        sys.path.insert(0, str(LOCAL))
+        try:
+            import app as local_app
+        except Exception as exc:
+            self.skipTest("无法导入 local/app.py：%s" % exc)
+        finally:
+            sys.path.pop(0)
+        self._app = local_app
+        return local_app.Api(clock=TestWallClock())
+
+    def _seed(self, api):
+        item = {"id": "a1", "name": "活动", "sign_start": "2026-01-01 09:00:00",
+                "sign_end": "2099-01-02 09:00:00",
+                "act_start": "2099-01-03 09:00:00", "act_end": "2099-01-03 11:00:00",
+                "signed": False}
+        api._activities = {"a1": dict(item)}
+        api._last_check = {"result": "valid", "checked_at": 0.0}
+        return item
+
+    def _inst(self, plan_id):
+        inst = mock.Mock()
+        inst.plan_id = plan_id
+        inst.snapshot = mock.Mock(return_value={"status": "running", "tasks": []})
+        return inst
+
+    def test_concurrent_same_id_runs_inner_once(self):
+        """两个真正并发的同 ID 请求：只有一个执行 inner。"""
+        api = self._api()
+        app = self._app
+        item = self._seed(api)
+        real_inner = api._start_plan_inner
+        entered = threading.Barrier(2, timeout=0.5)
+        calls = []
+
+        def slow_inner(items, headed, policy, rid):
+            calls.append(rid)
+            try:
+                entered.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return real_inner(items, headed, policy, rid)
+
+        inst = self._inst("p1")
+        results = [None, None]
+
+        def starter(index):
+            results[index] = api.start_plan([{"id": item["id"]}], request_id="rid-c")
+
+        with mock.patch.object(api, "_start_plan_inner", side_effect=slow_inner), \
+                mock.patch.object(app, "PlanCoordinator", return_value=inst):
+            threads = [threading.Thread(target=starter, args=(i,), daemon=True) for i in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(5)
+            self.assertFalse(any(thread.is_alive() for thread in threads), "并发接纳不得死锁")
+        self.assertEqual(calls, ["rid-c"], "只有占位者能执行 inner")
+        self.assertEqual(inst.start.call_count, 1, "协调器只能启动一次")
+        states = [r and (r.get("pending") and "pending" or ("accepted" if r.get("ok") else "rejected"))
+                  for r in results]
+        self.assertIn("accepted", states)
+        self.assertIn("pending", states, "后到请求应拿到在途答复")
+        record = api.start_request_state("rid-c")
+        self.assertEqual(record["state"], "accepted")
+        accepted = next(r for r in results if r and r.get("ok") and not r.get("pending"))
+        self.assertEqual(record["plan_id"], accepted["plan_id"],
+                         "登记的计划号必须与实际返回的一致")
+
+    def test_cancel_before_reservation_wins(self):
+        """取消停在预留前：放行后必须拒绝，零启动。"""
+        api = self._api()
+        app = self._app
+        item = self._seed(api)
+        entered, release = threading.Event(), threading.Event()
+        made = []
+
+        def gate(plan_id, specs, runner, emit, now=None):
+            entered.set()
+            release.wait(5)
+            inst = self._inst(plan_id)
+            made.append(inst)
+            return inst
+
+        holder = {}
+
+        def starter():
+            holder["res"] = api.start_plan([{"id": item["id"]}], request_id="rid-d")
+
+        with mock.patch.object(app, "PlanCoordinator", side_effect=gate):
+            worker = threading.Thread(target=starter, daemon=True)
+            worker.start()
+            self.assertTrue(entered.wait(5))
+            cancel = api.cancel_start_request("rid-d")
+            self.assertTrue(cancel["ok"], "pending 阶段可以取消")
+            release.set()
+            worker.join(5)
+        self.assertFalse(holder["res"].get("ok"))
+        self.assertTrue(holder["res"].get("canceled"))
+        self.assertFalse(made and made[0].start.called, "取消先到则零启动")
+        self.assertIsNone(api._plan)
+
+    def test_cancel_after_acceptance_reports_real_plan(self):
+        """接纳先赢：取消不得谎称成功，必须给真实 plan_id。"""
+        api = self._api()
+        app = self._app
+        item = self._seed(api)
+        inst = self._inst("p2")
+        with mock.patch.object(app, "PlanCoordinator", return_value=inst):
+            res = api.start_plan([{"id": item["id"]}], request_id="rid-e")
+        self.assertTrue(res["ok"])
+        cancel = api.cancel_start_request("rid-e")
+        self.assertFalse(cancel["ok"])
+        self.assertEqual(cancel["state"], "accepted")
+        self.assertEqual(cancel["plan_id"], res["plan_id"])
+
+    def test_inner_exception_leaves_real_conclusion(self):
+        api = self._api()
+        item = self._seed(api)
+        with mock.patch.object(api, "_start_plan_inner", side_effect=RuntimeError("boom")):
+            res = api.start_plan([{"id": item["id"]}], request_id="rid-f")
+        self.assertFalse(res["ok"])
+        self.assertIn("本机异常", res["text"])
+        record = api.start_request_state("rid-f")
+        self.assertEqual(record["state"], "rejected", "异常也必须留真实结论，不能永久 pending")
+
+    def test_coordinator_start_failure_records_rejected(self):
+        api = self._api()
+        app = self._app
+        item = self._seed(api)
+        inst = self._inst("p3")
+        inst.start.side_effect = RuntimeError("启动失败")
+        with mock.patch.object(app, "PlanCoordinator", return_value=inst):
+            res = api.start_plan([{"id": item["id"]}], request_id="rid-g")
+        self.assertFalse(res["ok"])
+        self.assertIsNone(api._plan)
+        record = api.start_request_state("rid-g")
+        self.assertEqual(record["state"], "rejected")
 
 
 if __name__ == "__main__":

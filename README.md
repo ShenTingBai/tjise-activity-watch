@@ -52,12 +52,14 @@
 
 **不想装 Python**：到 [Releases](https://github.com/ShenTingBai/tjise-activity-watch/releases) 下载本机版资产，任选其一：
 
-- `天软活动预报名工具-vX.Y.Z-win-x64.zip`（**完整便携包，推荐**）：独立 EXE、README 和启动说明都在里面，解压双击主 EXE 即用；
-- `天软活动预报名工具-vX.Y.Z-win-x64.exe`：**独立可用单文件**——程序组件（grab-worker）已内置，拷到任何空目录双击即可，不再需要同目录的 worker；
+- `tjise-activity-watch-vX.Y.Z-win-x64.zip`（**完整便携包，推荐**）：独立 EXE、README 和启动说明都在里面，解压双击主 EXE 即用；
+- `tjise-activity-watch-vX.Y.Z-win-x64.exe`：**独立可用单文件**——程序组件（grab-worker）已内置，拷到任何空目录双击即可，不再需要同目录的 worker；
 - `tjise-grab-portable-*.zip` 绿色版：解压双击 `启动.bat`。
 
-> 独立 EXE 与四成员 ZIP 形态自 v1.1.0 起生效；该版本正式发布前，Release 页现有资产的
-> 形态以资产内启动说明为准，请以实际下载到的资产为准阅读。
+> 下载名固定用 ASCII 基名：GitHub 会把中文前缀规范化，v1.1.0 上传时就靠人工改过一次名
+> （见 `tools/release.py` 的 `exe_asset_name`）。中文产品名只出现在 Release 标题和包里说明。
+> 独立 EXE 与四成员 ZIP 形态自 v1.1.0 起生效；**v1.1.0 已于 2026-10-26 发布**，
+> 1.1.1 是尚未上传的补丁候选（真实学校窗口仍待用户真机验收）。
 
 右上角 **「帮助」** 集中三步使用说明、重看六步引导、当前版本和本机数据目录。点「检查更新」才会查询 GitHub 最新正式版并比较版本；失败会显示原因与重试入口，当前候选比正式版新时明确提示「当前为预览版本」。检查结果附检查时间，不自动下载或安装；「查看发布页」用系统浏览器打开 [最新发布](https://github.com/ShenTingBai/tjise-activity-watch/releases/latest)。当前版本以 [VERSION](VERSION) 为准。
 
@@ -228,3 +230,8 @@ tjise-activity-watch/
 ## License
 
 [MIT](LICENSE)
+
+
+## 本机时间不对能用吗？（决策 012）
+
+能。工具按**独立北京时间**运行（公共网络授时 + 应用内经过时长），不读取也不修改你电脑的时间设置。顶栏只有一个时间入口：正常显示「北京时间 + 时分秒」，未校准显示「待校准」，点开「时间详情」可看校准来源、估计误差并「重新校准时间」。网络授时不可用时登录与列表照常可用，只是自动报名会暂停，并不会因此清除登录或误报失效。版本仍为未发布 1.1.1 候选。

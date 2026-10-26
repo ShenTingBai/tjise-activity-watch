@@ -213,7 +213,9 @@ class LoginStateContractTests(unittest.TestCase):
         # login_state/token_hours_left 读的是模块级 SESSION_FILE（runtime_paths
         # 统一数据根），不是 HERE：patch 错目标会让隔离失效、摸到真实登录态
         session = tmp / "session.json"
-        with mock.patch.object(local_app, "SESSION_FILE", session):
+        prefs = tmp / "ui.json"
+        with mock.patch.object(local_app, "SESSION_FILE", session), \
+             mock.patch.object(local_app, "PREFS", prefs):
             absent = local_app.login_state()
             self.assertFalse(absent["session_present"], "文件不存在=未登录")
             self.assertIsNone(absent["hours_left"])
@@ -234,14 +236,16 @@ class LoginStateContractTests(unittest.TestCase):
             valid = local_app.login_state()
             self.assertTrue(valid["session_present"])
             self.assertFalse(valid["session_expired"])
-            self.assertGreater(valid["hours_left"], 0)
+            # 决策 012：无 v2 锚点不报数——旧 saved_at 不能冒充准确小时数
+            self.assertIsNone(valid["hours_left"])
 
             stale = (datetime.now() - timedelta(hours=25)).strftime("%Y-%m-%d %H:%M:%S")
             session.write_text(json.dumps({"token": "t", "saved_at": stale}), encoding="utf-8")
             expired = local_app.login_state()
             self.assertTrue(expired["session_present"], "过期=登录过")
-            self.assertTrue(expired["session_expired"])
-            self.assertEqual(expired["hours_left"], 0.0)
+            # 旧墙钟文本不改判失效：有效性只由学校真实校验决定
+            self.assertFalse(expired["session_expired"])
+            self.assertIsNone(expired["hours_left"])
 
     def test_check_hint_success_beats_login_keyword(self):
         """code==0 的成功行常含「登录」字样（如「登录态还有 17 小时」），不得归类 login。"""
@@ -371,9 +375,9 @@ class LedAndStopContractTests(unittest.TestCase):
         self.assertIn('<script src="led.js"></script>', html, "必须在 app.js 之前引入 led.js")
         self.assertIn('id="led"', html, "缺少 LED 点阵容器 #led")
         self.assertIn('id="dlg-stop"', html, "缺少停止确认 dialog #dlg-stop")
-        self.assertIn("继续等待", html, "确认弹窗必须有「继续等待」按钮")
+        self.assertIn("继续计划", html, "确认弹窗必须有「继续计划」按钮")
         self.assertIn("停止计划", html, "确认弹窗必须有「停止计划」按钮")
-        self.assertIn('value="no"', html, "「继续等待」提交 no，Esc 也走 no 通道")
+        self.assertIn('value="no"', html, "「继续计划」提交 no，Esc 也走 no 通道")
 
     def test_led_js_is_pure_renderer(self):
         js = read("ui/led.js")
@@ -408,10 +412,30 @@ class StopLifecycleContractTests(unittest.TestCase):
         self.assertIn("_terminate_plan_procs", py, "stop_plan 必须主动终止活着的 worker")
 
     def test_grab_retry_window_is_hard_deadline(self):
-        py = read("grab.py")
-        self.assertIn("def clamp_wait_ms", py, "重试循环必须有窗口钳制函数")
-        self.assertGreaterEqual(py.count("clamp_wait_ms(deadline"), 7,
-                                "循环内 reload/expect_response/click/wait 都要钳到剩余窗口")
+        """所有阻塞必须压在同一个单调预算上（R03/R06）。
+
+        旧实现按墙钟 deadline 逐个钳制，墙钟回拨就会把窗口拉长；现在
+        reload/click/expect_response/goto 的超时都必须来自 RetryBudget，
+        由单调截止与绝对截止取更紧者。行为证据在 test_worker_boundaries。
+        """
+        import ast
+        source = read("grab.py")
+        self.assertNotIn("def clamp_wait_ms", source, "旧的墙钟钳制 helper 必须移除")
+        self.assertIn("RetryBudget(", source, "重试窗口必须用单调预算")
+        tree = ast.parse(source)
+        cmd = next(node for node in tree.body
+                   if isinstance(node, ast.FunctionDef) and node.name == "cmd_grab")
+        offenders = []
+        for node in ast.walk(cmd):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr not in {"reload", "click", "expect_response", "goto"}:
+                continue
+            timeout = next((kw.value for kw in node.keywords if kw.arg == "timeout"), None)
+            text = ast.unparse(timeout) if timeout is not None else "<none>"
+            if "budget.timeout_ms" not in text:
+                offenders.append((node.func.attr, text))
+        self.assertFalse(offenders, "阻塞调用必须用预算超时：%r" % offenders)
 
     def test_grab_finally_never_returns(self):
         """cmd_grab 的 finally 只收尾浏览器：return 会掩盖真实退出码（成功0/登录失败3/报名失败2）。"""
@@ -432,7 +456,8 @@ class StopLifecycleContractTests(unittest.TestCase):
         self.assertIn("S.stopping", js, "停止后必须有「正在停止」的即时反馈状态")
         self.assertIn('"正在停止…"', js, "停止按钮要切换为「正在停止…」")
         self.assertIn("S.stopping = false", js, "plan_done 后必须解除正在停止状态")
-        self.assertIn('"正在停止" : "正在处理"', js, "忙碌胶囊要区分停止中/处理中")
+        self.assertIn("S.login.present === false ? \"未登录\" : \"已登录\"", js,
+                      "忙碌胶囊只表达登录状态，不替换成处理中")
 
 
 class RetryPolicyUiContractTests(unittest.TestCase):
@@ -459,8 +484,10 @@ class RetryPolicyUiContractTests(unittest.TestCase):
 
     def test_app_js_renders_attempts_and_stop_reason(self):
         js = read("ui/app.js")
-        self.assertIn("第 \" + task.attempts + \" 次提交", js,
-                      "任务卡必须显示第 N 次提交（telemetry）")
+        # R13：有限次数必须显示 N/M；0=不限要明说，不能只写「第 N 次」
+        self.assertIn('"已提交 " + attempts + "/" + cap + " 次"', js,
+                      "任务卡必须显示已提交 N/M 次（telemetry）")
+        self.assertIn("（不限次数）", js, "不限次数必须明说，不能只给一个孤立数字")
         self.assertIn("last_reason", js, "任务卡必须显示最近原因")
         self.assertIn("stopReasonText", js, "缺少停止条件人话函数")
         for word in ("达到最大提交次数", "重试时长到了", "报名已截止", "登录失效"):
@@ -489,14 +516,22 @@ class StateGapsContractTests(unittest.TestCase):
         self.assertIn("RETRY_WINDOW_S", js, "登录到期必须按「报名窗口 + 重试时长」口径比较")
         self.assertIn("earliestSelectedExecutionEnd", js,
                       "已开放场次必须用本次执行窗口判断登录到期，不得拿历史 sign_start")
-        self.assertIn("登录撑得到这次报名窗口", js,
-                      "检查条必须能给出登录撑得到/撑不到的结论")
+        # R15：登录剩余只是估算，不能给「一定撑得到」的保证句
+        self.assertIn("预计可覆盖本次窗口", js, "检查条必须用「预计」而不是保证语气")
+        self.assertNotIn("登录撑得到这次报名窗口", js,
+                         "不得再用保证式结论：登录有效性只由学校校验决定")
 
-    def test_clock_skew_parsed_from_check_and_log(self):
+    def test_clock_skew_structured_and_not_text_scraped(self):
+        """R08：学校 HTTP 粗测只认结构化载荷，逐轮替换，不再从文本猜。"""
         js = read("ui/app.js")
-        self.assertIn("本机时钟与服务器相差", js, "必须能从日志/check 原话解析时钟偏差")
-        self.assertIn("#clock-skew", js, "偏差必须上顶栏徽章（#clock-skew）")
+        self.assertIn("function applyClock", js, "必须有一个结构化学校时间入口")
+        self.assertIn("S.clock = {", js, "学校粗测必须按状态（ok/warn/unknown）整份替换")
         self.assertIn("clock-pop", js, "必须有时钟详情浮层 #clock-pop")
+        self.assertIn("粗测", js, "必须明确这是粗测、仅作诊断")
+        self.assertNotIn("#clock-skew", js, "顶栏不再放长状态徽章")
+        self.assertNotIn("本机时钟与服务器相差", js,
+                         "不得再从人读文本解析偏差：失败文本不能变成确定结论")
+        self.assertNotIn("S.clock.checked =", js, "旧的 checked 布尔已被状态机取代")
 
     def test_online_offline_banners(self):
         js = read("ui/app.js")
@@ -535,11 +570,11 @@ class DualModeUiContractTests(unittest.TestCase):
     checkpoint、统一 deadline、startPlan 载荷与恢复合并不丢运行时字段。"""
 
     def test_mode_of_and_mode_texts(self):
-        """modeOf 三分类与三种正式模式文案必须存在（预报名/立即报名/抢名额/已截止）。"""
+        """modeOf 三分类与三种正式模式文案必须存在（预报名/立即报名/已截止）。"""
         js = read("ui/app.js")
         self.assertIn("function modeOf(", js, "缺少模式分类函数 modeOf")
         self.assertIn('pre_register: "预报名"', js, "缺少预报名文案")
-        self.assertIn('instant_signup: "立即报名/抢名额"', js, "缺少立即报名/抢名额文案")
+        self.assertIn('instant_signup: "立即报名"', js, "缺少立即报名文案")
         self.assertIn('closed: "已截止"', js, "缺少已截止文案")
         # 模式只做展示与即时门禁：后端仍是最终权威
         self.assertIn("def classify_signup_mode", read("signup_plan.py"),
@@ -601,7 +636,7 @@ class DualModeUiContractTests(unittest.TestCase):
             self.assertIn(field, body, "路线站点必须用真实 checkpoint：%s" % field)
         self.assertIn("done: runStarted !== null", body,
                       "「本次启动」只有真实 checkpoint 才算 done")
-        self.assertIn('done: now >= open', body,
+        self.assertIn("done: openDone", body,
                       "原定开放是时间参考节点（历史开放标 done 但不抢占当前节点）")
 
     def test_unified_effective_retry_deadline(self):
@@ -645,7 +680,7 @@ out.push(taskHtml({ ...task, signup_mode: "pre_register" }));
 out.push(taskHtml({ ...task, signup_mode: "instant_signup" }));
 """)
         self.assertIn("预报名 · ", cards[0])
-        self.assertIn("立即报名/抢名额 · ", cards[1])
+        self.assertIn("立即报名 · ", cards[1])
 
 
 class PreopenRouteContractTests(unittest.TestCase):
@@ -659,7 +694,7 @@ class PreopenRouteContractTests(unittest.TestCase):
         for banned in ("armedAt", "open - 100", "open - 5"):
             self.assertNotIn(banned, body,
                              "路线图站点不得用 %s 生成估算时间冒充事件时间" % banned)
-        for needed in ("待启动", "待打开", "待发生"):
+        for needed in ("待启动", "待打开", "待开始"):
             self.assertIn(needed, body, "缺 checkpoint 的站点必须显示「%s」" % needed)
         # 真实 checkpoint 仍是三个执行站点唯一的时间来源
         for field in ("run_started_at", "page_opened_at", "watch_started_at"):
@@ -723,21 +758,23 @@ class TourAndLifecycleContractTests(unittest.TestCase):
             self.assertIn(key, js, "引导状态键 %s 必须写入偏好" % key)
         self.assertIn("savePrefsNow", js, "完成/跳过必须立即落盘，不等防抖")
         # 六步标题齐全（顺序在数组里固定）
-        for title in ("登录状态", "活动与模式", "筛选", "选择与冲突", "重试与开始", "运行与结果"):
+        for title in ("登录账号", "查看活动", "筛选活动", "选择活动", "设置并开始", "查看结果"):
             self.assertIn('title: "%s"' % title, js, "TOUR_STEPS 缺「%s」步骤" % title)
 
     def test_tour_steps_do_not_promise_selection_starts(self):
-        """第 2 步不得再写「选中后马上执行」：选择不等于开始（UX-02 同源误导读法）。"""
+        """选择不等于开始：引导必须写清「选择活动不会自动开始报名」。"""
         js = read("ui/app.js")
         steps = js[js.index("TOUR_STEPS = ["):js.index("const S = {")]
         self.assertNotIn("选中后马上执行", steps,
-                         "引导不得暗示选中即执行；开始必须点「开始报名计划」")
-        self.assertIn("再点「开始报名计划」", steps, "第 2 步要写清真正的开始动作")
-        # 第 5 步讲次数口径，第 6 步讲任务/计划结果分层与停止语义
-        self.assertIn("次数只算真正发出去的提交", steps, "第 5 步要讲清次数只算真实提交")
+                         "引导不得暗示选中即执行")
+        self.assertIn("选择活动不会自动开始报名", steps, "第 2 步要写清选择不等于开始")
+        self.assertIn("再选择「开始报名计划」", steps, "第 5 步要写清真正的开始动作")
+        # 第 5 步讲停止条件，第 6 步讲任务/计划结果分层与停止语义
+        self.assertIn("工具停止尝试", steps, "第 5 步要讲清三种停止条件")
         self.assertIn("整块大屏的结论要等整个计划结束", steps,
                       "第 6 步要区分任务结果与计划结果")
-        self.assertIn("不会撤销学校那边已经报上的", steps, "第 6 步要说明停止不等于撤销报名")
+        self.assertIn("停止计划不会取消已成功的报名", read("ui/index.html"),
+                      "停止确认要说明不撤销学校报名")
 
     def test_tour_never_triggers_backend_actions(self):
         """引导只做说明：开始/推进/跳过引导的代码不得调用任何桥接动作。"""
@@ -766,17 +803,18 @@ class TourAndLifecycleContractTests(unittest.TestCase):
         self.assertIn("tourSkip()", esc_body, "Esc 在引导打开时必须先走跳过")
 
     def test_chrome_login_window_text_only(self):
-        """第 1 步必须说明 Chrome 登录窗口高亮不了（系统窗口）。"""
+        """第 1 步必须说明浏览器登录窗口是系统窗口、引导无法高亮。"""
         js = read("ui/app.js")
         first_step = js[js.index("TOUR_STEPS = ["):js.index('{ target: "list"')]
-        self.assertIn("高亮不了", first_step, "登录步骤必须说明系统窗口不能高亮")
+        self.assertIn("浏览器", first_step, "登录步骤不得硬编码 Chrome")
+        self.assertNotIn("Chrome", first_step, "登录步骤不得硬编码 Chrome")
 
     def test_lifecycle_display_and_estimate_reminder(self):
         """生命周期提示：离线时长 abnormal 带「约」；登录估算同源且只是提醒；valid 不被估算压成失效。"""
         js = read("ui/app.js")
         self.assertIn("S.lifecycle = info.lifecycle || null", js,
                       "bootstrap 的 lifecycle 快照必须消费")
-        self.assertIn("上次关闭后离线", js, "时钟浮层必须显示上一周期的固定离线间隔")
+        self.assertIn("上次退出至本次启动", js, "时间详情必须显示上一周期的固定离线间隔")
         self.assertIn("约 ", js, "abnormal/估算值必须带「约」")
         self.assertIn("以学校校验为准", js, "登录估算必须注明以学校校验为准")
         # R4：浮层剩余与胶囊同源（S.login 锚点），不得读冻结的生命周期快照
@@ -904,11 +942,25 @@ function makeEl(sel) {
   /* <dialog> 原生方法桩：设置/说明/停止确认的 open 状态靠它们翻转 */
   el.showModal = () => { el.open = true; };
   el.close = () => { el.open = false; };
-  el.appendChild = () => {};
-  el.removeChild = () => {};
-  el.insertBefore = () => {};
+  /* 子节点按真实语义记账：addLog 的「副作用有没有重复」需要数得出来 */
+  el._children = [];
+  el.appendChild = (child) => {
+    el._children.push(child);
+    el.childElementCount = el._children.length;
+    return child;
+  };
+  el.removeChild = (child) => {
+    const at = el._children.indexOf(child);
+    if (at >= 0) el._children.splice(at, 1);
+    el.childElementCount = el._children.length;
+    return child;
+  };
+  el.insertBefore = (child) => { el._children.unshift(child); el.childElementCount = el._children.length; return child; };
   el.childElementCount = 0;
   el.childNodes = [];
+  Object.defineProperty(el, "firstChild", {
+    get() { return el._children[0] || null; },
+  });
   el.getBoundingClientRect = () => ({ top: 100, left: 100, bottom: 140, right: 460, width: 360, height: 40 });
   el.getClientRects = () => [1];
   el.offsetWidth = 360;
@@ -923,9 +975,16 @@ function el2(sel) {
   return els.get(sel);
 }
 
+/* 单调钟独立于 Date：初值与 Date.now 同源（既有用例仍可用 Date.now 伪造
+ * 「很久以前」的缓存时间），用例可再用 __advanceMono 单独推进经过时长，
+ * 不会用 Date 假跳变同时推进 performance 导致红例失真。 */
+const monoState = { base: Date.now(), offset: 0 };
 const sandbox = {
   console, Date, Math, JSON, Promise, Object, Array, Number, String, Boolean, RegExp, Error,
   isNaN, parseInt, parseFloat,
+  performance: { now: () => monoState.base + monoState.offset },
+  __advanceMono: (ms) => { monoState.offset += Number(ms) || 0; },
+  __monoValue: () => monoState.base + monoState.offset,
   innerWidth: 1120, innerHeight: 800,
   setTimeout: () => 0, clearTimeout: () => {}, setInterval: () => 0, clearInterval: () => {},
   navigator: { onLine: true },
@@ -955,6 +1014,18 @@ sandbox.window = sandbox;
 sandbox.document.body = el2("body");
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(appJs, "utf8"), sandbox, { filename: "app.js" });
+/* 决策 012：node 桩显式注入可信假时钟（锚定 Date.now），不以 Date.now 作默认成功桩 */
+vm.runInContext(
+  "ingestBusinessClock({ schema: 1, owner_id: 'harness-clock', generation: 1," +
+  " state: 'ready', epoch_s: Date.now() / 1000, tick_s: 0, sampled_tick_s: 0," +
+  " uncertainty_s: 0, source: 'harness', age_s: 0, reason: '测试注入' });" +
+  /* 用例把「业务现在」定到任意时刻：注入新一代快照，不再改 Date.now（墙钟不是权威） */
+  "globalThis.setBusinessNow = (ms) => ingestBusinessClock({" +
+  " schema: 1, owner_id: 'harness-clock'," +
+  " generation: (S.businessClock.gen || 0) + 1, state: 'ready'," +
+  " epoch_s: ms / 1000, tick_s: 0, sampled_tick_s: 0, uncertainty_s: 0," +
+  " source: 'harness', age_s: 0, reason: '测试注入' });",
+  sandbox, { filename: "clock-inject.js" });
 /* 片段统一包成 async IIFE：顶层 await 可用（受控 Promise 次序），同步片段
  * 返回的 promise 立即完成，输出时序不变 */
 const snippetSource = fs.readFileSync(snippetFile, "utf8");
@@ -966,9 +1037,14 @@ snippetResult.then(finishHarness, (err) => { process.stderr.write(String(err)); 
 """
 
 
-def run_js(snippet: str):
-    """在受控 JS 上下文里执行片段，返回 out 数组（list）。node 缺失时 skip。"""
+def run_js(snippet: str, env: dict | None = None):
+    """在受控 JS 上下文里执行片段，返回 out 数组（list）。node 缺失时 skip。
+
+    env 用于按用例注入 TZ（例如证明学校时间解析不随本机时区漂移）；
+    默认不改进程环境。
+    """
     import json
+    import os
     import shutil
     import subprocess
     import tempfile
@@ -980,15 +1056,259 @@ def run_js(snippet: str):
         part = Path(name) / "snippet.js"
         harness.write_text(JS_HARNESS, encoding="utf-8")
         part.write_text(snippet, encoding="utf-8")
+        child_env = dict(os.environ)
+        child_env.update(env or {})
         res = subprocess.run([node, str(harness), str(LOCAL / "ui" / "app.js"), str(part)],
                              capture_output=True, text=True, encoding="utf-8",
-                             errors="replace", timeout=30)
+                             errors="replace", timeout=30, env=child_env)
         if res.returncode != 0:
             raise AssertionError("JS 行为测试崩溃：%s" % res.stderr[-800:])
         marker = res.stdout.rfind("__RESULT__")
         if marker < 0:
             raise AssertionError("JS 行为测试没有输出结果：%s" % res.stdout[-500:])
         return json.loads(res.stdout[marker + len("__RESULT__"):].strip() or "[]")
+
+
+class ClockModelReliabilityTests(unittest.TestCase):
+    """CB04/CB06：采样后漂移只计一次、真实校准年龄、单调 TTL。"""
+
+    def test_sampled_uncertainty_does_not_double_count_age(self):
+        res = run_js(r"""
+const t0 = 1700000000000;
+ingestBusinessClock({ schema: 1, owner_id: "harness-clock", generation: 10, state: "ready",
+  epoch_s: t0 / 1000, tick_s: 0, sampled_tick_s: 0,
+  uncertainty_s: 0.47, source: "ntp", age_s: 400, reason: "测试注入" }, { rttMs: 0 });
+const first = clockReading();
+const ui1 = clockUiState();
+const now1 = businessNowMs();
+__advanceMono(10000);
+const second = clockReading();
+const ui2 = clockUiState();
+const now2 = businessNowMs();
+__advanceMono(490001);        /* age = 900.001s：真正过期仍禁用 */
+const ui3 = clockUiState();
+const now3 = businessNowMs();
+ingestBusinessClock({ schema: 1, owner_id: "harness-clock", generation: 11, state: "ready",
+  epoch_s: t0 / 1000 + 1000, tick_s: 0, sampled_tick_s: 0,
+  uncertainty_s: 0.5001, source: "ntp", age_s: 0, reason: "测试注入" }, { rttMs: 0 });
+const ui4 = clockUiState();
+const now4 = businessNowMs();
+out.push({ unc1: first.uncertaintyMs, unc2: second.uncertaintyMs,
+  age1: first.ageMs, age2: second.ageMs, deltaNow: now2 - now1,
+  ui1, ui2, ui3, now3, ui4, now4, now1 });
+""")
+        row = res[0]
+        self.assertIn(row["ui1"], ("ready", "holdover"),
+                      "采样 age=400s、unc=0.47s 时后端仍可用，UI 不得提前禁用")
+        self.assertIsNotNone(row["now1"])
+        self.assertAlmostEqual(row["unc1"], 470.0, delta=0.5)
+        self.assertAlmostEqual(row["unc2"] - row["unc1"], 1.0, delta=0.2,
+                               msg="10 秒只增加约 1ms 漂移，不得再加采样前 40ms")
+        self.assertAlmostEqual(row["age1"], 400000.0, delta=1.0)
+        self.assertAlmostEqual(row["age2"], 410000.0, delta=1.0)
+        self.assertAlmostEqual(row["deltaNow"], 10000.0, delta=1.0)
+        self.assertIn(row["ui2"], ("ready", "holdover"))
+        self.assertEqual(row["ui3"], "unavailable", "超过 900 秒仍必须禁用")
+        self.assertIsNone(row["now3"])
+        self.assertEqual(row["ui4"], "unavailable", "总误差超过 0.5 秒仍必须禁用")
+        self.assertIsNone(row["now4"])
+
+    def test_f5_old_anchor_reports_real_calibration_age(self):
+        res = run_js(r"""
+ingestBusinessClock({ schema: 1, owner_id: "harness-clock", generation: 10, state: "ready",
+  epoch_s: Date.now() / 1000, tick_s: 0, sampled_tick_s: 600,
+  uncertainty_s: 0.05, source: "ntp", age_s: 600, reason: "测试注入" });
+out.push({ last: clockLastSyncText(), ui: clockUiState(),
+  usable: businessNowMs() !== null });
+""")
+        row = res[0]
+        self.assertEqual(row["last"], "10 分钟前",
+                         "F5 接入 600 秒旧锚点必须显示真实年龄，不能刷新成「刚刚」")
+        self.assertEqual(row["ui"], "holdover")
+        self.assertTrue(row["usable"])
+
+    def test_round_cache_ttl_uses_monotonic_elapsed(self):
+        res = run_js(r"""
+const realNow = Date.now;
+let wall = 1700000000000;
+Date.now = () => wall;
+try {
+  cacheRoundPayload("check", "r1", { ok: true });
+  wall += 8 * 3600e3;                 /* OS 前移 8 小时 */
+  const kept = takeRoundPayload("check", "r1");
+  cacheRoundPayload("check", "r2", { ok: true });
+  __advanceMono(130001);              /* 真正经过 130 秒才过期 */
+  const expired = takeRoundPayload("check", "r2");
+  cacheRoundPayload("check", "r3", { ok: true });
+  wall -= 30 * 86400e3;               /* OS 回拨 30 天 */
+  const keptBack = takeRoundPayload("check", "r3");
+  out.push({ kept, expired, keptBack });
+} finally {
+  Date.now = realNow;
+}
+""")
+        row = res[0]
+        self.assertIsNotNone(row["kept"], "OS 前移不得让刚暂存的终态立刻过期")
+        self.assertIsNone(row["expired"], "真正单调超过 130 秒必须过期")
+        self.assertIsNotNone(row["keptBack"], "OS 回拨不得延长缓存期限")
+
+    def test_skipped_ack_replays_cached_terminal_across_wall_jumps(self):
+        for offset in (8 * 3600e3, -30 * 86400e3):
+            res = run_js(r"""
+const realNow = Date.now;
+let wall = 1700000000000;
+Date.now = () => wall;
+try {
+  S.round.check = "owner-new";
+  S.round.gen.check = 1;
+  S.login.checking = true;
+  S.login.result = null;
+  window.onBackend.check({ request_id: "owner-old", ok: true, result: "valid",
+    session_present: true, hours_left: 3 });
+  wall += %d;
+  settleSynchronous({ skipped: true, request_id: "owner-old" }, "check");
+  out.push({ result: S.login.result, checkId: S.round.check,
+    cacheLeft: S.round.cache.length });
+} finally {
+  Date.now = realNow;
+}
+""" % offset)
+            row = res[0]
+            self.assertEqual(row["result"], "valid",
+                             "OS 跳变 %s 后 skipped ack 仍须立即重放暂存终态" % offset)
+            self.assertEqual(row["checkId"], "owner-old")
+            self.assertEqual(row["cacheLeft"], 0)
+
+    def test_true_monotonic_expiry_drops_cached_terminal(self):
+        res = run_js(r"""
+S.round.check = "owner-new";
+S.login.checking = true;
+window.onBackend.check({ request_id: "owner-old", ok: true, result: "valid",
+  session_present: true, hours_left: 3 });
+__advanceMono(130001);
+settleSynchronous({ skipped: true, request_id: "owner-old" }, "check");
+out.push({ result: S.login.result, cacheLeft: S.round.cache.length });
+""")
+        row = res[0]
+        self.assertIsNone(row["result"], "真正超过 130 秒后不得重放暂存终态")
+        self.assertLessEqual(row["cacheLeft"], 1, "过期项不得被取用重放")
+
+    def test_wait_for_bridge_uses_monotonic_bound(self):
+        res = run_js(r"""
+const realNow = Date.now;
+const realTimeout = setTimeout;
+let wall = 1700000000000;
+Date.now = () => wall;
+setTimeout = (fn) => { __advanceMono(50); wall += 3600e3; fn(); return 1; };
+const start = __monoValue();
+try {
+  const ok = await waitForBridge(15000);
+  out.push({ ok: ok, elapsed: __monoValue() - start });
+} finally {
+  Date.now = realNow;
+  setTimeout = realTimeout;
+}
+""")
+        row = res[0]
+        self.assertFalse(row["ok"])
+        self.assertGreaterEqual(row["elapsed"], 14950,
+                                "15 秒承诺必须按单调经过时长，不能被 OS 前移提前结束")
+
+
+class UnknownClockDisplayTests(unittest.TestCase):
+    """CB05：校时失败不得冒充「学校还没公布报名时间」。"""
+
+    ITEMS = r"""
+const items = [
+  { id: "a", name: "已知开放时间", sign_start: "2026-10-27 09:00:00",
+    sign_end: "2026-10-27 18:00:00", act_start: "2026-10-28 09:00:00",
+    act_end: "2026-10-28 11:00:00", place: "A", signed: false },
+  { id: "b", name: "已报名活动", sign_start: "2026-10-27 10:00:00",
+    sign_end: "2026-10-27 18:00:00", act_start: "2026-10-28 09:00:00",
+    act_end: "2026-10-28 11:00:00", place: "B", signed: true, state: "已报名" },
+  { id: "c", name: "时间未公布", sign_start: "",
+    sign_end: "", act_start: "2026-10-29 09:00:00",
+    act_end: "2026-10-29 11:00:00", place: "C", signed: false }
+];
+applyActivities({ ok: true, items: items }, true);
+"""
+
+    def test_known_start_without_trusted_now_is_pending_calibration(self):
+        res = run_js(self.ITEMS + r"""
+S.selected.clear();
+markClockUnavailable("校时失败");
+render();
+const rows = $("#rows").innerHTML;
+out.push({ rows, board: $("#selected").textContent,
+  boardText: $("#board-text").innerHTML,
+  metric: $("#metric-free").textContent });
+""")
+        row = res[0]
+        rows = row["rows"]
+        # A 有已知开放时间：保留绝对时间并标「待校准」，不得进「报名时间待公布」
+        row_a = rows.split('data-id="a"', 1)[1].split('data-id="b"', 1)[0]
+        self.assertIn("待校准", row_a)
+        self.assertIn("09:00", row_a, "已知绝对时间必须保留")
+        # C 真正缺 sign_start：仍然是「待公布」
+        row_c = rows.split('data-id="c"', 1)[1]
+        self.assertIn("待公布", row_c)
+        self.assertRegex(rows, r"报名时间待公布.*?count\">1 场",
+                         "待公布组只能包含真正缺开放时间的活动")
+        # B 已报名事实保留
+        row_b = rows.split('data-id="b"', 1)[1].split('data-id="c"', 1)[0]
+        self.assertIn("已报名", row_b)
+        # 大屏：不得断言没有可报名场次，只给时间待校准与单一恢复入口
+        self.assertEqual(row["board"], "时间待校准")
+        self.assertNotIn("没有可报名的场次", row["board"] + row["boardText"])
+        self.assertIn("校准北京时间", row["boardText"])
+        self.assertEqual(row["boardText"].count("data-open-clock"), 1,
+                         "恢复入口必须唯一")
+        self.assertEqual(row["metric"], "待确认", "未知计数不得伪造 0 或 6")
+
+    def test_recovery_recomputes_groups_counts_and_keeps_selection(self):
+        res = run_js(self.ITEMS + r"""
+S.selected.clear();
+S.selected.add("a");
+S.retryPolicy = { retry_for_s: 600, max_attempts: 2 };
+markClockUnavailable("校时失败");
+render();
+const beforeMetric = $("#metric-free").textContent;
+const beforeCountdown = $("#countdown").textContent;
+ingestBusinessClock({ schema: 1, owner_id: "harness-clock", generation: 30,
+  state: "ready", epoch_s: Date.now() / 1000, tick_s: 0, sampled_tick_s: 0,
+  uncertainty_s: 0.05, source: "harness", age_s: 0, reason: "恢复" });
+S.businessClock.attempted = true;
+render();
+const rows = $("#rows").innerHTML;
+out.push({ beforeMetric, beforeCountdown,
+  metric: $("#metric-free").textContent,
+  countdown: $("#countdown").textContent,
+  selected: Array.from(S.selected), policy: S.retryPolicy,
+  rowA: rows.split('data-id="a"')[1].split('data-id="b"')[0] });
+""")
+        row = res[0]
+        self.assertEqual(row["beforeMetric"], "待确认")
+        self.assertIn("待校准", row["beforeCountdown"])
+        self.assertRegex(row["metric"], r"^\d+$",
+                         "恢复后计数必须回到真实数字")
+        self.assertNotIn("待校准", row["countdown"],
+                         "恢复后倒计时必须原地重算")
+        self.assertEqual(row["selected"], ["a"], "恢复不得丢掉选择")
+        self.assertEqual(row["policy"], {"retry_for_s": 600, "max_attempts": 2},
+                         "恢复不得重置重试策略")
+        self.assertNotIn("待校准", row["rowA"])
+        self.assertNotIn("待公布", row["rowA"])
+
+    def test_runtime_component_copy_points_to_redownload_and_recheck(self):
+        res = run_js(r"""
+out.push({ hint: RUNTIME_ERRORS.worker_missing.hint,
+  title: RUNTIME_ERRORS.worker_missing.title });
+""")
+        row = res[0]
+        self.assertIn("无法找到所需程序组件", row["hint"])
+        self.assertIn("重新下载完整版本", row["hint"])
+        self.assertIn("重新检查", row["hint"])
+        self.assertNotIn("没跟着程序", row["hint"])
 
 
 class LoginEstimateBehaviorTests(unittest.TestCase):
@@ -1017,25 +1337,23 @@ out.push({ before, cleared, after: S.login.expireAt,
         self.assertEqual(res[0]["cleared"], None, "重登成功后旧锚点必须作废")
         self.assertGreater(res[0]["after"], res[0]["before"] + 8 * 3600e3,
                            "check 事件必须换上重登后的新锚点")
-        self.assertEqual(res[0]["pillText"], "登录有效")
+        self.assertEqual(res[0]["pillText"], "已登录")
 
     def test_anchor_counts_down_with_clock(self):
         """时钟推进两小时：锚点不动，各处剩余同步减两小时（不重开窗口、不刷新）。"""
         res = run_js(r"""
 const H = 3600e3;
-const realNow = Date.now;
 const t0 = 1700000000000;
-Date.now = () => t0;
+setBusinessNow(t0);
 setLogin(5, null, true, { estimated_expires_at: t0 / 1000 + 5 * 3600 });
 /* 校验回来：ok=true 才会离开「正在检查」分支（与真实启动时序一致） */
 window.onBackend.check({ ok: true, result: "valid", hours_left: 5,
   session_present: true, estimated_expires_at: t0 / 1000 + 5 * 3600 });
 const h1 = loginHoursLeft();
-Date.now = () => t0 + 2 * H;
+setBusinessNow(t0 + 2 * H);
 paintLogin();
 const h2 = loginHoursLeft();
 const sub = document.querySelector("#pill-sub").textContent;
-Date.now = realNow;
 out.push({ h1, h2, sub });
 """)
         self.assertAlmostEqual(res[0]["h1"], 5.0, delta=0.01)
@@ -1047,18 +1365,16 @@ out.push({ h1, h2, sub });
         res = run_js(r"""
 const H = 3600e3;
 const t0 = 1700000000000;
-const realNow = Date.now;
-Date.now = () => t0;
+setBusinessNow(t0);
 const anchor = t0 / 1000 + 4 * 3600;
 setLogin(4, null, true, { estimated_expires_at: anchor });
 window.onBackend.check({ ok: true, result: "valid", hours_left: 4,
   session_present: true, estimated_expires_at: anchor });
 const a1 = S.login.expireAt;
-/* 两小时后再次 check：后端 hours 按绝对墙钟递减（4→2），锚点必须仍是同一绝对时刻 */
-Date.now = () => t0 + 2 * H;
+/* 两小时后再次 check：后端 hours 按绝对时刻递减（4→2），锚点必须仍是同一绝对时刻 */
+setBusinessNow(t0 + 2 * H);
 window.onBackend.check({ ok: true, result: "valid", hours_left: 2,
   session_present: true, estimated_expires_at: anchor });
-Date.now = realNow;
 out.push({ a1, a2: S.login.expireAt });
 """)
         self.assertEqual(res[0]["a1"], res[0]["a2"], "同一凭证的锚点不得随刷新漂移")
@@ -1073,7 +1389,7 @@ out.push({ state: document.querySelector("#pill").dataset.state,
   sub: document.querySelector("#pill-sub").textContent });
 """)
         self.assertEqual(res[0]["state"], "ok")
-        self.assertEqual(res[0]["text"], "登录有效")
+        self.assertEqual(res[0]["text"], "已登录")
         self.assertIn("以学校校验为准", res[0]["sub"])
 
     def test_no_anchor_shows_unknown_not_fabricated(self):
@@ -1085,7 +1401,7 @@ paintLogin();
 out.push({ text: document.querySelector("#pill-text").textContent,
   expiry: expiryText() });
 """)
-        self.assertEqual(res[0]["text"], "暂时无法确认登录态")
+        self.assertEqual(res[0]["text"], "登录待确认")
         self.assertNotIn("17", res[0]["expiry"], "没有锚点不得编造 17 小时")
         self.assertIn("未知", res[0]["expiry"])
 
@@ -1223,7 +1539,7 @@ class SettingsEntryContractTests(unittest.TestCase):
         dialog = help_dialog(html)
         self.assertNotIn('id="btn-settings"', html)
         self.assertNotIn('id="settings"', html)
-        for text in ("三步使用说明", "本机数据", "重看引导", "查看发布页",
+        for text in ("三步使用说明", "本机数据", "重看引导", "前往下载页",
                      "打开数据目录", "Esc 关闭"):
             self.assertIn(text, dialog, "更多弹窗缺「%s」" % text)
         # 不再用三张同形分组卡叠套；现行入口统一叫「更多」
@@ -1244,9 +1560,9 @@ class SettingsEntryContractTests(unittest.TestCase):
                       "说明底部保留重播快捷入口（学习入口就近可重播）")
         self.assertIn('id="help-steps"', help_body, "说明弹窗保留三步快速帮助容器")
         js = read("ui/app.js")
-        for step_title in ("确认登录", "选活动并开始", "看进度与结果"):
+        for step_title in ("登录账号", "设置报名计划", "查看报名结果"):
             self.assertIn(step_title, js, "三步快速帮助必须保留（%s）" % step_title)
-        self.assertIn("再点「开始报名计划」", js, "三步说明必须写出真正的开始动作")
+        self.assertIn("再选择「开始报名计划」", js, "三步说明必须写出真正的开始动作")
 
     def test_app_js_wires_settings_actions(self):
         """两处重播共用 replayTourFrom；版本/目录仍走既有接口；忙时禁用有可见原因。"""
@@ -1375,7 +1691,7 @@ class ErrorFeedbackContractTests(unittest.TestCase):
         body = js[start:js.index("function applyActivities", start)]
         self.assertEqual(body.count("setResult("), 1,
                          "refresh 内只允许「未连接本机脚本」一处结果框")
-        self.assertIn("还没有连接本机脚本", body)
+        self.assertIn("还没有连接本机程序", body)
         self.assertIn("S.listError = msg(err)", body,
                       "桥接异常与 worker 失败同口径：原话归列表空态")
 
@@ -1528,7 +1844,7 @@ window.onBackend.activities({ ok: false, text: "程序组件缺失，请重新�
 await Promise.resolve(); await Promise.resolve();
 const banners = document.querySelector("#banners").innerHTML;
 out.push({
-  bannerHint: (banners.match(/它没跟着程序一起到位/g) || []).length,
+  bannerHint: (banners.match(/无法找到所需程序组件/g) || []).length,
   recheck: (banners.match(/data-act="runtime-refresh"/g) || []).length,
   loginDisabled: document.querySelector("#btn-login").disabled,
   startDisabled: document.querySelector("#btn-plan").disabled,
@@ -1558,14 +1874,14 @@ window.onBackend.activities({ ok: false, text: "程序组件缺失，请重新�
   items: [], runtime_error: "worker_missing" });
 await Promise.resolve();
 const bannerAfterList = (document.querySelector("#banners").innerHTML
-  .match(/它没跟着程序一起到位/g) || []).length;
+  .match(/无法找到所需程序组件/g) || []).length;
 resolveCheck({ ok: true, queued: true });
 window.onBackend.check({ ok: true, result: "valid", hours_left: 10, session_present: true });
 await Promise.resolve(); await Promise.resolve();
 const banners = document.querySelector("#banners").innerHTML;
 out.push({
   bannerAfterList,
-  bannerAfterCheck: (banners.match(/它没跟着程序一起到位/g) || []).length,
+  bannerAfterCheck: (banners.match(/无法找到所需程序组件/g) || []).length,
   recheck: (banners.match(/data-act="runtime-refresh"/g) || []).length,
   runtime: S.runtime.error,
 });
@@ -1656,7 +1972,7 @@ resolveCheck({ ok: true, queued: true });
 window.onBackend.check({ ok: false, result: "unknown", hours_left: null, session_present: true });
 await Promise.resolve(); await Promise.resolve();
 const bannerRound1 = document.querySelector("#banners").innerHTML
-  .match(/它没跟着程序一起到位/g).length;
+  .match(/无法找到所需程序组件/g).length;
 /* 下一轮：check valid 先完成（list 未完成）→ 不得提前撤 */
 window.pywebview = { api: {
   check: () => Promise.resolve({ ok: true, queued: true }),
@@ -1667,7 +1983,7 @@ await Promise.resolve();
 window.onBackend.check({ ok: true, result: "valid", hours_left: 10, session_present: true });
 await Promise.resolve();
 const bannerMidRound = document.querySelector("#banners").innerHTML
-  .match(/它没跟着程序一起到位/g).length;
+  .match(/无法找到所需程序组件/g).length;
 window.onBackend.activities({ ok: true, items: [] });
 await Promise.resolve(); await Promise.resolve();
 const bannerGone = document.querySelector("#banners").innerHTML
@@ -1721,7 +2037,7 @@ const loginResult = document.querySelector("#result");
 out.push({
   keptDuring, keptAfter,
   bannerUp: document.querySelector("#banners").innerHTML
-    .indexOf("它没跟着程序一起到位") >= 0,
+    .indexOf("无法找到所需程序组件") >= 0,
   normalLoginResultShown: !loginResult.hidden &&
     loginResult.innerHTML.indexOf("登录没能开始") >= 0,
 });
@@ -1762,7 +2078,7 @@ const kept = {
   error: S.runtime.error,
   roundError: S.runtime.roundError,
   bannerHint: (document.querySelector("#banners").innerHTML
-    .match(/它没跟着程序一起到位|被系统拦住或没有权限|组件在但没能启动/g) || []).length,
+    .match(/无法找到所需程序组件|被系统拦住或没有权限|组件在但没能启动/g) || []).length,
   recheck: (document.querySelector("#banners").innerHTML
     .match(/data-act="runtime-refresh"/g) || []).length,
   resultVisible: !document.querySelector("#result").hidden,
@@ -1963,7 +2279,7 @@ out.push({ phase: view.phase, taskId: view.task.task_id, count: view.count,
         self.assertEqual(case["phase"], "waiting")
         self.assertEqual(case["taskId"], "C", "当前目标必须是还没结束的 C")
         self.assertEqual(case["count"], 1, "取消 A 后同批只剩 1 场")
-        self.assertIn("本批 1 场待执行", case["countdown"])
+        self.assertIn("同时开放 1 场", case["countdown"])
         self.assertNotIn("2 场", case["countdown"], "已取消的场次不得继续计入批次")
         self.assertEqual(case["title"], "活动C", "标题必须跟着当前执行目标")
 
@@ -1985,7 +2301,7 @@ out.push({ taskId: executionView().task.task_id,
 """)
         case = res[0]
         self.assertEqual(case["taskId"], "A", "立即场成功后目标必须落到未来场")
-        self.assertIn("本批 1 场待执行", case["countdown"])
+        self.assertIn("同时开放 1 场", case["countdown"])
         self.assertNotIn("00:00:00", case["countdown"], "未来场不得显示成全开放")
         self.assertEqual(case["label"], case["expected"],
                          "LED 标注必须直接格式化开放时刻（now+left 会差 1 秒）")
@@ -1993,9 +2309,8 @@ out.push({ taskId: executionView().task.task_id,
     def test_preview_open_label_uses_absolute_time(self):
         """未选择与选择预览也必须直接显示开放时刻，不能从取整倒计时反推。"""
         res = run_js(r"""
-const realNow = Date.now;
 const start = "2099-01-01 09:00:00";
-Date.now = () => (toTs(start) - 60) * 1000 + 250;
+setBusinessNow((toTs(start) - 60) * 1000 + 250);
 const item = { id: "preview", name: "预览场", sign_start: start,
   sign_end: "2099-01-01 10:00:00", act_start: "2099-01-02 10:00:00",
   act_end: "2099-01-02 11:00:00", signed: false };
@@ -2006,7 +2321,6 @@ const idle = document.querySelector("#led-label b").textContent;
 S.selected.add(item.id);
 paintLed();
 const selected = document.querySelector("#led-label b").textContent;
-Date.now = realNow;
 out.push({ idle, selected, expected: fmtClock(toTs(start)) });
 """)
         self.assertEqual(res[0]["idle"], res[0]["expected"])
@@ -2118,7 +2432,7 @@ out.push({ restored, unknown });
         self.assertEqual(case["restored"]["itemName"], "活动A", "列表项缺失时用任务字段现构")
         self.assertEqual(case["restored"]["title"], "活动A")
         self.assertTrue(case["restored"]["route"], "路线目标必须仍能从任务快照得到")
-        self.assertIn("本批 1 场待执行", case["restored"]["countdown"])
+        self.assertIn("同时开放 1 场", case["restored"]["countdown"])
         self.assertIsNone(case["unknown"]["openAt"])
         self.assertIn("时间待公布", case["unknown"]["countdown"])
         self.assertEqual(case["unknown"]["label"], "待公布")
@@ -2160,7 +2474,7 @@ out.push({ running, failed, colors });
                         "运行中的单场失败不得抢写结果框")
         self.assertIn("task-state is-bad", case["running"]["tasksHtml"],
                       "任务卡要照实显示这一场失败")
-        self.assertIn("失败", case["running"]["tasksHtml"])
+        self.assertIn("报名未成功", case["running"]["tasksHtml"])
         self.assertIn("达到最大提交次数", case["running"]["tasksHtml"],
                       "任务卡要写出到达的停止条件")
         self.assertEqual(case["failed"]["board"], "failed")
@@ -2292,19 +2606,17 @@ class DisplayPhaseBoundaryTests(unittest.TestCase):
     def test_activity_row_tracks_phase_and_open_time(self):
         """活动行与任务卡共用阶段，缓存的未开放文本不能阻止跨开放时刻换组。"""
         res = run_js(r"""
-const realNow = Date.now;
 const open = toTs("2099-01-01 09:00:00");
 const item = { id: "A", sign_start: "2099-01-01 09:00:00",
   sign_end: "2099-01-01 10:00:00", state: "未开放" };
 const task = { ...item, task_id: "A", status: "submitting", attempts: 0 };
-Date.now = () => (open - 10) * 1000;
+setBusinessNow((open - 10) * 1000);
 const waiting = stateCellHtml(item, stateOf(item), "10 秒", task);
-Date.now = () => (open + 1) * 1000;
+setBusinessNow((open + 1) * 1000);
 const preparing = stateCellHtml(item, stateOf(item), "已开放", task);
 const rowState = stateOf(item);
 task.attempts = 1;
 const retrying = stateCellHtml(item, rowState, "已开放", task);
-Date.now = realNow;
 out.push({ waiting, preparing, retrying, rowState });
 """)
         self.assertIn("等待开放", res[0]["waiting"])
@@ -2331,21 +2643,20 @@ const before = { phase: executionView().phase, display: executionView().display,
   tag: document.querySelector("#board-tag-text").textContent,
   led: document.querySelector("#led-label b").textContent,
   html: document.querySelector("#plan-tasks").innerHTML };
-const realNow = Date.now;
-Date.now = () => (openTs + 1) * 1000;
+const openTs0 = openTs;
+setBusinessNow((openTs0 + 1) * 1000);
 tick();
 const after = { phase: executionView().phase,
   countdown: document.querySelector("#countdown").textContent,
   tag: document.querySelector("#board-tag-text").textContent,
   detail: document.querySelector('.task-row[data-task-id="A"] .task-detail').textContent,
   label: document.querySelector('.task-row[data-task-id="A"] .task-state').textContent };
-Date.now = realNow;
 out.push({ before, after, openClock: fmtClock(openTs) });
 """)
         case = res[0]
         self.assertEqual(case["before"]["phase"], "waiting", "未来预热不是提交阶段")
         self.assertEqual(case["before"]["display"], "preopen")
-        self.assertIn("本批 1 场待执行", case["before"]["countdown"])
+        self.assertIn("同时开放 1 场", case["before"]["countdown"])
         self.assertEqual(case["before"]["tag"], "等开放")
         self.assertEqual(case["before"]["led"], case["openClock"],
                          "LED 必须走到原定开放，不是重试窗口")
@@ -2436,7 +2747,7 @@ out.push({ none, expired, unknown });
         self.assertIn("「登录」", case["none"]["text"])
         self.assertIn("重新登录", case["expired"]["title"])
         self.assertIn("「重新登录」", case["expired"]["text"])
-        self.assertEqual(case["unknown"]["title"], "暂时无法确认登录态")
+        self.assertEqual(case["unknown"]["title"], "暂时无法确认登录状态")
         for banned in ("过期", "重新登录"):
             self.assertNotIn(banned, case["unknown"]["text"],
                              "unknown 一律不得说成过期或要求重登")
@@ -2459,7 +2770,7 @@ const error = snapshot();
 out.push({ idle, error });
 """)
         case = res[0]
-        self.assertEqual(case["idle"]["title"], "还没拉到活动列表")
+        self.assertEqual(case["idle"]["title"], "还没有加载活动列表")
         self.assertEqual(case["idle"]["total"], "—", "没拉到之前是未知，不是 0")
         self.assertNotIn("学校当前没有返回活动", case["error"]["title"],
                          "网络失败不得伪装成学校零活动")
@@ -2477,7 +2788,7 @@ out.push({ title: document.querySelector("#empty-title").textContent,
   text: document.querySelector("#empty-text").textContent,
   actionHidden: document.querySelector("#empty-action").hidden,
   rechecks: (html.match(/data-act="runtime-refresh"/g) || []).length,
-  hints: (html.match(/它没跟着程序一起到位/g) || []).length });
+  hints: (html.match(/无法找到所需程序组件/g) || []).length });
 """)
         case = res[0]
         self.assertEqual(case["title"], "活动列表未加载")
@@ -2649,12 +2960,12 @@ const checkThenList = snap();
 out.push({ whileChecking, afterExpired, checkingAgain, afterUnknown, checkThenList });
 """)
         case = res[0]
-        self.assertEqual(case["whileChecking"]["title"], "正在检查登录态",
+        self.assertEqual(case["whileChecking"]["title"], "正在检查登录状态",
                          "检查没结束时不得提前宣布「登录是有效的」")
         self.assertIn("重新登录", case["afterExpired"]["title"],
                       "后到的 expired 必须自己刷新空态，不靠手动 render")
-        self.assertEqual(case["checkingAgain"]["title"], "正在检查登录态")
-        self.assertEqual(case["afterUnknown"]["title"], "暂时无法确认登录态")
+        self.assertEqual(case["checkingAgain"]["title"], "正在检查登录状态")
+        self.assertEqual(case["afterUnknown"]["title"], "暂时无法确认登录状态")
         self.assertNotIn("过期", case["afterUnknown"]["text"], "unknown 不说过期")
         self.assertEqual(case["checkThenList"]["title"], "学校当前没有返回活动",
                          "check 先到、list 后到也要收敛到真实状态")
@@ -2719,17 +3030,18 @@ class AssistanceBehaviorTests(unittest.TestCase):
     _EXPECTED_COPY = {
         "title": "使用帮助",
         "subtitle": "使用说明、版本更新与本机数据",
-        "note": "仅操作本人账号，报名结果以学校活动页为准。",
+        "note": "适用于天津市大学软件学院（天软）专升本学生使用的活动中心。"
+                "活动要求与报名结果以学校活动页为准。",
         "steps": [
-            (1, "确认登录",
-             "首次点「登录」，在浏览器里完成登录。重开会自动检查；"
-             "仅在提示失效时重新登录，暂时无法确认就刷新。"),
-            (2, "选活动并开始",
-             "勾选不冲突的活动，设置重试时长和最多次数，再点「开始报名计划」。"
-             "未来场次等开放，已开放场次立即尝试。"),
-            (3, "看进度与结果",
-             "电脑保持唤醒和联网，窗口可最小化。逐场看结果；"
-             "停止会结束本机任务，不会撤销学校报名。"),
+            (1, "登录账号",
+             "选择「登录」，在打开的浏览器中完成登录。下次启动会检查已保存的登录状态；"
+             "只有提示失效时才需要重新登录。"),
+            (2, "设置报名计划",
+             "选择活动，设置尝试时长和最多提交次数，再选择「开始报名计划」。"
+             "预报名会在开放后尝试提交，已开放活动会在计划启动后尝试提交。"),
+            (3, "查看报名结果",
+             "运行期间可最小化窗口，但需保持电脑唤醒与联网。结束后查看各活动的报名结果；"
+             "开始计划不代表报名成功。"),
         ],
     }
 

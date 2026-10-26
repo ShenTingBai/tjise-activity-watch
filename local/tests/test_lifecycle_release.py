@@ -100,20 +100,33 @@ class VersionSourceTests(unittest.TestCase):
 
 
 class AssetNamingTests(unittest.TestCase):
-    """Release 资产命名：正式产品名 + 版本 + win-x64。"""
+    """Release 资产命名：英文下载基名 + 版本 + win-x64（R16）。
+
+    v1.1.0 的上传把中文前缀交给 GitHub 规范化过，只能发布后人工改名。
+    所以下载名固定 ASCII；中文产品名只用于 Release 标题与说明。
+    """
 
     def setUp(self):
         self.rel = load_release()
 
-    def test_asset_names_use_formal_product_name(self):
+    def test_asset_names_are_stable_ascii(self):
         version = "1.2.3"   # 独立合法样本：命名函数契约与当前发行号解耦
         self.assertEqual(self.rel.exe_asset_name(version),
-                         "天软活动预报名工具-v1.2.3-win-x64.exe")
+                         "tjise-activity-watch-v1.2.3-win-x64.exe")
         self.assertEqual(self.rel.zip_asset_name(version),
-                         "天软活动预报名工具-v1.2.3-win-x64.zip")
+                         "tjise-activity-watch-v1.2.3-win-x64.zip")
         self.assertEqual(self.rel.tag_of(version), "v1.2.3")
-        self.assertNotIn("tjise", self.rel.zip_asset_name(version).lower(),
-                         "用户可见资产名不得回到英文内部名")
+        for name in (self.rel.exe_asset_name(version), self.rel.zip_asset_name(version)):
+            self.assertTrue(name.isascii(), "下载名必须是 ASCII：%r" % name)
+            self.assertNotIn("天软", name, "中文名交给 Release 标题，不进文件名")
+
+    def test_release_label_keeps_chinese_product_name(self):
+        """中文产品名仍用于 Release 标题/说明，不能因为改文件名就丢掉品牌。"""
+        self.assertEqual(self.rel.PRODUCT_NAME, "天软活动预报名工具")
+        notes = self.rel.release_notes("v1.2.3")
+        self.assertIn("tjise-activity-watch-v1.2.3-win-x64.exe", notes,
+                      "说明里的下载名必须与资产名同源")
+        self.assertIn("tjise-activity-watch-v1.2.3-win-x64.zip", notes)
 
     def test_zip_whitelist_members(self):
         """完整 ZIP 白名单：主 EXE、README、启动说明、LICENSE——worker 已内置进 EXE，

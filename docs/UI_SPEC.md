@@ -129,7 +129,7 @@
 | `onBackend.plan_done(payload)` | `{plan_id, status, ok, summary}`；`status` 为 `completed` / `partial` / `failed` / `stopped` |
 
 约定：
-- **登录三态**（验收条款）：「没有登录」= `session.json` 不存在、无法解析或缺少 `token`（`session_present:false`，按钮显示「登录」，胶囊「未登录」）；仅「登录过但 token 已过期或校验失败」（`session_present:true` 且 `ok:false`/过期）才算登录态失效（按钮「重新登录」）。`hours_left=0` 不能单独代表首次未登录；缺 token 时 `hours_left` 必须为 `null`，不得按 `saved_at` 报假的小时数。三态由 `login_state()` 统一产出，`bootstrap` 与 `check` 载荷口径一致。
+- **登录四态**（验收条款，2026-10-26 起取代旧的「三态/校验失败即过期」口径）：「没有登录」= `session.json` 不存在、无法解析或缺少 `token`（`session_present:false`，按钮显示「登录」，胶囊「未登录」）；只有学校接口明确返回 4001/失效才是「登录已过期」；网络异常、超时、组件缺失与认不出的失败一律「暂时无法确认」，不得诱导重新登录，也不得撤销已保存的会话。`hours_left=0` 不能单独代表首次未登录；缺 token 时 `hours_left` 必须为 `null`，不得按 `saved_at` 报假的小时数。四态由 `login_state()` + `_check_result()` 统一产出，`bootstrap` 与 `check` 载荷口径一致。
 - **check 归因看来源行**（验收条款）：`reason`/`hint`/`result` 都基于输出中第一条 `[X]` 来源行判定，失败输出末尾的「请重新登录」指引不得参与归因——HTTPError、URLError、超时、接口异常和认不出的失败一律 `unknown`，只有 4001/明确身份验证失败是 `expired`；网络异常不得转化为重新登录提示。`_do_check` 捕获 worker 启动/解析异常并保证发出一次 `unknown` 结论。
 - `grab` 的 `ok` 由后端从输出里判断（含「报名成功」且退出码 0），`reason` 已去掉 `[X]` 前缀的来源行。
 - `login` 的 `ok` 只看退出码；成功后**前端自己调一次 `list_activities()`** 刷新列表。
@@ -245,12 +245,22 @@
 
 ### 5.11 应用生命周期提示与六步可重播引导（验收条款）
 
-1. **生命周期元数据只写 `ui.json`**：进程启动在同一原子写入里完成「冻结上一运行周期 → 记录本次 `last_started_at` + 首个 `last_heartbeat_at` + `run_open=true`」；运行中每分钟原子写 `last_heartbeat_at`；窗口正常关闭先置停（锁内核验停止标记，迟到的 heartbeat 直接放弃），再原子写 `last_closed_at` + `run_open=false`，且不得持锁 join 心跳线程。生命周期字段绝不写入 `session.json` / `storage_state.json`；心跳与界面偏好（`save_prefs`）共用同一把持久化锁，做原子读-合并-写，互不覆盖。F5 / 页面重载不重置进程级生命周期（重复 `bootstrap` 返回同一快照）。
-2. **关闭时长口径**（运行周期以 `run_open` 标记区分）：上一周期 `run_open=false` 且关闭时刻不早于该周期启动、心跳不晚于关闭 → `clean` 精确值；`run_open=true`（没走正常关闭）→ `abnormal`，参考点取最近有效心跳（不可解析退该周期启动时刻）——**绝不能拿更早周期的关闭时间冒充本周期正常退出**；`run_open=false` 但时间自相矛盾（`last_closed_at` 早于可解析的该周期 `last_started_at`，如系统回拨后关机）→ `unknown` 且不给时长——正常关闭标记不能覆盖时间顺序矛盾，同一秒关闭与启动允许等号；旧格式 `ui.json`（无标记）按时间戳兼容，`last_closed_at` 早于 `last_started_at` 时必须降级 abnormal；首次运行 / 时间不可解析 / 系统时钟回拨给 `unknown`，不编造时间。启动即写首个心跳：短启动就崩溃的周期也有存活参考点；同一秒「关闭→重开」由标记区分。
-3. **登录估算同一来源**：`bootstrap.login` 与 `check` 事件携带同一份 `login_state()` 锚点（`saved_at`、`estimated_expires_at = saved_at + 约 17.5h`，绝对墙钟，关闭期间照算）；界面把锚点存进唯一登录显示状态，胶囊、时钟浮层、计划检查条都按 `Date.now()` 对锚点现算并随每秒走字递减。窗口内重新登录成功 → 旧锚点立即作废（清空），随后的校验事件带新锚点回来；同一凭证反复「刷新」不重置寿命（锚点是绝对时刻，不是 now+hours）；没有锚点显示「未知（以学校校验为准）」，不编 17 小时。估算到点但学校校验 `valid` 时仍显示「登录有效」（估算降为提醒文案）；估算不得参与 `start_plan` 放行/拦截、不得强制过期、清理会话或刷新 `saved_at`。时钟浮层的离线行写「上次关闭后离线 N（从上次关闭到本次启动）」——固定离线间隔，不用「N 前」冒充持续计时。
-4. **六步引导**（验收条款）：步骤固定为「登录状态 → 活动与模式 → 筛选 → 选择与冲突 → 重试与开始 → 运行与结果」，六处目标用稳定 `data-tour-target` 标识（`login/list/filters/select/start/run`）；自动开始只按**内容版本**判定——`tour_version >= TOUR_VERSION` 即不弹，完成/跳过时间戳只描述当时那版，**不得挡住更新的内容版本**，软件版本变化不提升 `TOUR_VERSION`；重播有两个并列入口——「更多 → 重看引导」与「说明 → 重看引导」——共用同一处理函数（先确认非忙、关掉当前弹窗、把焦点还回对应顶栏入口，再 `startTour(0)`；历史变更：重播入口原只在说明弹窗，决策 010 时迁入设置，本轮返修改为两处并列，说明弹窗不再只剩帮助）；完成/跳过状态（`tour_version`/`tour_completed_at`/`tour_skipped_at`）立即落盘。
+1. **生命周期元数据只写 `ui.json`**：进程启动在同一原子写入里完成「冻结上一运行周期 → 记录本次 `last_started_at` + 首个 `last_heartbeat_at` + `run_open=true`」；运行中每分钟原子写 `last_heartbeat_at`；窗口正常关闭先置停（锁内核验停止标记，迟到的 heartbeat 直接放弃），再原子写 `last_closed_at` + `run_open=false`，且不得持锁 join 心跳线程。生命周期字段绝不写入 `session.json` / `storage_state.json`；心跳与界面偏好（`save_prefs`）共用同一把进程内锁，做原子读-合并-写，互不覆盖。同一 `ui.json` 路径的「读-核验-合并-写」还必须在跨进程短时排他事务内完成（标准库区域锁，锁文件 `ui.json.lock`；事务内绝不联网或等待子进程）：文件中 `lifecycle_v2.run_id` 已属于其他实例时，旧实例整份放弃本次生命周期写入；拿不到锁也放弃本次元数据写入，绝不写回未核验归属的旧快照。F5 / 页面重载不重置进程级生命周期（重复 `bootstrap` 返回同一快照）。
+2. **关闭时长口径**（运行周期以 `run_open` 标记区分）：上一周期 `run_open=false` 且关闭时刻不早于该周期启动、心跳不晚于关闭 → `clean` 精确值；`run_open=true`（没走正常关闭）→ `abnormal`，参考点取最近有效心跳（不可解析退该周期启动时刻）——**绝不能拿更早周期的关闭时间冒充本周期正常退出**；`run_open=false` 但时间自相矛盾（`last_closed_at` 早于可解析的该周期 `last_started_at`，如系统回拨后关机）→ `unknown` 且不给时长——正常关闭标记不能覆盖时间顺序矛盾，同一秒关闭与启动允许等号；旧格式 `ui.json`（无标记）按时间戳兼容，`last_closed_at` 早于 `last_started_at` 时必须降级 abnormal；首次运行 / 时间不可解析 / 系统时钟回拨给 `unknown`，不编造时间。启动即写首个心跳：短启动就崩溃的周期也有存活参考点；同一秒「关闭→重开」由标记区分。v2 记账：初始化/心跳/正常关闭只要**本次**取不到可信业务 epoch，`quality=unknown`，不沿用旧 `heartbeat_epoch` / `closed_epoch` 凑新的可信事实；生产时钟路径缺 `lifecycle_v2` 或质量不足一律 unknown，旧墙钟文本不迁移、不猜偏移；正常关闭文本事实仍如实落盘。
+3. **登录估算同一来源（决策 012 返修轮口径）**：`bootstrap.login` 与 `check` 事件携带同一份
+   `login_state()` 锚点；估算锚点 `session_timing_v2`（`credential_id`=token 摘要、`saved_epoch`、
+   `time_source`、`uncertainty_s`）**只在登录 worker 的真实成功路径**建立且要求当时有可信北京时间，
+   `estimated_expires_at` 按业务北京时间推算（绝对时刻，关闭期间照算）。界面把锚点存进唯一登录
+   显示状态，胶囊、时钟浮层、计划检查条都按业务时刻现算并随每秒走字递减。窗口内重新登录成功 →
+   旧锚点立即作废（清空），随后的校验事件带新锚点回来；同一凭证反复「刷新」/复用**不续期**
+   （锚点是绝对时刻，不是 now+hours）；无锚点/凭证不匹配/时钟不可用 → `hours_left=null`，
+   胶囊不报数、详情写「未知（以学校校验为准）」，不编 17 小时。估算到点但学校校验 `valid`
+   时仍显示「已登录」（估算降为提醒文案）；估算不得参与 `start_plan` 放行/拦截、不得强制过期、
+   清理会话或续期。时钟浮层的离线行写「上次退出至本次启动 N」（`lifecycle_v2` 业务 epoch 推导，
+   abnormal 带「约」）——固定离线间隔，不用「N 前」冒充持续计时。
+4. **六步引导**（验收条款）：步骤固定为「登录状态 → 活动与模式 → 筛选 → 选择与冲突 → 重试与开始 → 运行与结果」，六处目标用稳定 `data-tour-target` 标识（`login/list/filters/select/start/run`）；自动开始只按**内容版本**判定——`tour_version >= TOUR_VERSION` 即不弹，完成/跳过时间戳只描述当时那版，**不得挡住更新的内容版本**，软件版本变化不提升 `TOUR_VERSION`；重播唯一入口是帮助面板的「重看引导」（决策 011 单入口；历史上的「更多/说明」两处并列与旧 `#settings` 已删除）——共用同一处理函数：先确认非忙、关掉帮助、把焦点还回 `#btn-help`，再 `startTour(0)`；完成/跳过状态（`tour_version`/`tour_completed_at`/`tour_skipped_at`）立即落盘。
 5. **引导行为边界**：中性遮罩 + 琥珀高亮，说明卡片含步骤号、进度点、上一步/下一步/跳过/完成；引导**可见且未暂停**时：Esc=跳过，Tab/Shift+Tab 在卡片按钮（跳过/上一步/下一步）间首尾循环，背景 Ctrl+F、`/`、Enter 被隔离（不移焦点、不开始计划；卡片内 Enter 放行按钮原生激活）；关闭/跳过/完成时恢复引导开始前的焦点；主界面 `render()` 重画导致目标挪动时重新定位现有高亮（不重开、不自动点击）；窄窗口（≤980 视口）或目标缺失/隐藏时退回底部静态说明条，不伪造定位；计划运行中自动暂停（暂停期间键盘约束全部放行，不挡「停止」）、结束后从原步骤继续；引导绝不代替用户点登录、选活动或开始报名（引导代码不得调用 `login/start_plan/check/list_activities`）；Chrome 登录窗口是系统窗口，只能文字说明不能高亮。
-6. **版本与发布页**：「更多」弹窗是版本**唯一**显示位（`bootstrap.version`，不写死候选号），旁边「查看发布页」按钮——用户点击时经既有 `open_latest_release()` 用系统默认浏览器打开固定 `releases/latest` 常量地址；启动时不自动联网、不在 WebView 内跳转、不收任意 URL；打开失败只在该弹窗内给局部反馈并把固定地址摆成可选文本。
+6. **版本与发布页（决策 011 单入口口径）**：帮助弹窗是版本**唯一**显示位（`bootstrap.version`，不写死候选号），旁边「前往下载页」按钮——用户点击时经既有 `open_latest_release()` 用系统默认浏览器打开固定 `releases/latest` 常量地址；启动时不自动联网、不在 WebView 内跳转、不收任意 URL；打开失败只在帮助内给局部反馈并把固定地址摆成可选文本。（历史上的「更多」弹窗与「查看发布页」措辞已由决策 011/文案规范取代。）
 
 ### 5.13 辅助入口、组件失败闭环与独立 EXE 验收（验收条款，决策 010 / 现行入口见 design/specs/assistance-panels.md）
 
@@ -292,13 +302,13 @@
 7. **已知零与未知分开**：列表成功返回 0 场时，列表计数与大屏「列表/可报名」指标写 `0`；只有还没成功拉到（`idle`/首次加载）或失败时才用未知占位（`—`）。有旧缓存快照时保留缓存口径，不把网络失败伪装成「学校零活动」。
 8. **截止回退锚点必须稳定**（2026-10-25 边界轮）：没有 `retry_deadline` 遥测时，界面推导的锚点固定为 `max(原定开放, 启动参考点)`；启动参考点优先 `run_started_at`，其次稳定的 `submitSeen`；缺 `sign_start` 时只用启动点；只有「未来场且还没启动」才拿原定开放作计划参考。**「直到报名截止」且 `sign_end` 已知时，截止就是 `sign_end`，与启动点/开放点无关**——排队中或快照字段还没齐时正会出现「有绝对截止、没有启动参考点」，这时不得判未知。除此之外，已开放又没有任何启动参考点才返回未知（显示「待定」），且不得逐帧用当前时刻重锚。跨过开放时刻**不得让截止倒退**——预报名提前 100 秒开页，界面不能提前 100 秒归零。遥测一旦到达即优先采用；界面参考点不等于 worker 的实际停止时机。时长 0（直到报名截止）、缺 `sign_end` 回退 120 秒、`sign_end` 硬截断都不变。
 9. **原始工作状态与显示阶段分开**（2026-10-25 边界轮）：后端在拉起 runner **之前**就把任务置 `submitting`，其中包含开放前 `lead_s` 秒打开活动页的预热，因此 `submitting` 不等于已提交。显示阶段由纯函数 `taskDisplayPhase(task, now)` 解释：`preopen`（还没到原定开放，哪怕 worker 已在开页）说「等待开放」并走向开放的倒计时；`preparing`（已开放但还没有真正发起的提交）说「准备报名」，不给 0 秒倒计时；`retrying`（`attempts > 0` 且非终态）才说「正在提交」并显示第 N 次/重试截止。映射固定为：计划外 `idle`；没有任务 `preparing`；逐任务 `preopen → waiting`、`preparing → arming`、`retrying → submitting`；全部终态等待汇总 `settling`。目标优先级 `retrying > preparing > preopen`；`retrying` 取已知且最早的有效截止（未知排最后），`preparing`/`preopen` 取较早开放时刻，并列一律保持快照顺序；提交计数只取非终态且 `attempts > 0` 的任务，不按原始工作状态计。标题、LED、路线、任务卡与每秒 `tick`（含阶段标签）必须用同一份解释，不得初次渲染正确、下一秒又被原始 `submitting` 文案改回。此解释只影响展示，不写回 `task.status`、不改取消条件与调度。
-10. **非空但无可执行目标**（2026-10-25 边界轮）：`listState=ready` 且 `items.length > 0`、但没有可执行目标（全已报名/全已截止/报名时间待公布）时，大屏说「没有可报名的场次」，列表数据原样保留；**只有 `items.length === 0`** 才是「学校这次没有返回活动」。
+10. **非空但无可执行目标**（2026-10-25 边界轮）：`listState=ready` 且 `items.length > 0`、但没有可执行目标（全已报名/全已截止/报名时间待公布）时，大屏说「没有可报名的场次」，列表数据原样保留；**只有 `items.length === 0`** 才是「学校这次没有返回活动」。没有可信当前时间时不适用本条的断言口径，见 §5.15.13（只说「时间待校准」，不断言没有可报名场次）。
 11. **检查中不宣布有效，后到结论要更新空态**（2026-10-25 边界轮）：`loginEmptyState()` 先判 `checking`；只有「不在检查中且结论为 `valid`」才返回 valid，结论缺失或无法判定一律 unknown。`check` 事件与 `check` 调用失败后都要刷新依赖登录状态的列表空态（有缓存数据或骨架在场时不插手），不得把「正在检查」留成「登录是有效的」。组件横幅唯一归属、同轮故障累计、真实结果与开始门禁不变。
 12. **空态动作按意图分派**（2026-10-25 边界轮）：`paintEmpty` 每次渲染把当前动作写进 `#empty-action` 的 `dataset.action`（`refresh` / `clear-filters`），点击只按该键分派。**不得**按 `items.length` 或按钮文字推断——「有缓存 + 列表桥接失败」显示的是「重试」，必须真的再发 check/list，而不是清筛选把错误藏起来。清筛选仍只写 filter 差量。
 
 ### 5.15 统一帮助与手动检查更新（现行验收契约，决策 011）
 
-1. **一个入口一个模态**：顶栏只留 `#btn-help`「帮助」，内联问号 SVG，可访问名称为「帮助：使用说明、版本更新与本机数据」。只有原生 `#help` dialog；移除旧更多按钮、`#settings` 及专属绑定，不保留隐藏兼容节点。上部为三步使用说明与唯一「重看引导」，下部为当前版本、检查更新、查看发布页、本机数据。`Api.help()` 与 `DEFAULT_HELP` 的标题「使用帮助」、副标题和三步载荷逐字段一致；软件正式名不变。
+1. **一个入口一个模态**：顶栏只留 `#btn-help`「帮助」，内联问号 SVG，可访问名称为「帮助：使用说明、版本更新与本机数据」。只有原生 `#help` dialog；移除旧更多按钮、`#settings` 及专属绑定，不保留隐藏兼容节点。上部为三步使用说明（登录账号 / 设置报名计划 / 查看报名结果）与唯一「重看引导」，下部为当前版本、检查更新、前往下载页、本机数据；尾注写明适用范围（天津市大学软件学院（天软）专升本学生使用的活动中心）。`Api.help()` 与 `DEFAULT_HELP` 的标题「使用帮助」、副标题、三步载荷与尾注逐字段一致；软件正式名不变。
 2. **主题与窄窗**：黑底低对比点阵标题、琥珀短线、白纸正文、路线式三步与浅灰工具行，沿用主界面字体和按钮，不用大面积黄色卡片。宽 `min(680px, 100vw - 32px)`、高不超过视口减 32px；固定头尾，仅正文滚动。746×512 与 680×512 无越界；按钮换行、长发布地址可换行；局部反馈到达时滚到可见位置。主界面、大屏、LED、时间线与停止确认视觉不变。
 3. **帮助不打断业务**：未登录、组件错误、列表失败、运行中都能打开帮助；运行中仅重播禁用并写「计划结束后可重看引导」，版本检查与数据目录可用。重播先关帮助、焦点还给 `#btn-help`，再从六步第一步开始；退出返回该入口。`TOUR_VERSION=2` 与既定锚点、窄窗降级、暂停机制不变。Enter/Esc 不穿透到背景开始、清空或停止；停止弹窗 Esc 仍是不停止。
 4. **手动、只读、有限查询**：只在点击「检查更新」时调用 `check_update(request_id)`；启动、打开帮助、活动刷新、重开帮助与 F5 不查版本。后端后台线程对固定 GitHub `releases/latest` API 发一次 GET；8 秒超时，最多读取 256KiB，无自动重试、学校凭证、学校请求、下载或安装。发布页始终使用既有固定 URL，不消费远端任意地址。
@@ -306,6 +316,206 @@
 6. **单飞与重载**：点击前前端登记 `request_id`、禁用按钮，事件即使先于 ack 也可收；重复点击不重复查询，其他旧请求结果不覆盖当前状态。后端 `_lock` 下单飞并拒绝关闭期新请求，`finally` 收口。`bootstrap.update_check` 只恢复内存中的在途请求和最近结果；新实例初始未检查。桥接拒绝、异常和丢事件都结束检查中，前端最多 15 秒兜底恢复按钮；不冒充检查成功。
 7. **局部反馈唯一归属**：更新状态只在帮助更新行，不写登录态、组件故障、报名结果或运行记录；数据目录和发布页失败只在帮助局部说明，发布页失败附可复制固定地址。`open_data`、`open_latest_release` 沿用既有方法。不得因更新失败阻止或停止报名。
 8. **版本与证据**：此轮仍为未发布候选 `1.1.0`，不因返修轮升版。单测、隔离浏览器、独立预览 EXE 离线探针与用户有效登录验收分开记录；更新真实 HTTP 测试用 mock，不访问学校，不提交真实报名。当前截图必须注明模拟数据、生成环境与候选身份，不能替代 EXE 用户验收。
+
+### 5.16 运行可靠性、时间契约与失联对账（现行验收契约，2026-10-26 返修轮）
+
+对应用户台账 R01–R20。以下条款以**行为**验收，不以源码里出现某个字符串验收。
+
+1. **次数只认真实提交**：`attempts` 只在监听本场目标 `signUp` 请求**发起**时递增；
+   点击按钮、点「确定」、刷新页面、`getJoinInfo` 查询一律不计数。开放前按钮提前
+   可见也只等不点；同一轮动作里重复观察到的同一请求只计一次，下一次合法提交仍可计数。
+   请求发出即上报进度，不等响应；响应丢失仍算一次。
+2. **结果未确认单独成态**：最后一次请求已发出但没有拿到响应/查询也确认不了时，
+   终态必须是「结果未确认，请到活动页核对」，不得显示成「没抢到（名额已满）」。
+3. **固定策略起点 + 单调预算**：计划接纳时只取一次 `accepted_at`；未来场起点
+   固定为 `sign_start`，已开放场固定为 `accepted_at`，随 `TaskSpec` 快照携带并作为
+   `--retry-start` 传给 worker。鉴权、校时、开页、查询、刷新、确认、`expect_response`
+   与等待全部消费同一预算（`RetryBudget`：绝对截止与单调时长取更紧者）；
+   阻塞超时必须 ≤ 剩余预算；预算到点**抛 `BudgetExhausted` 并拒绝发起动作**，
+   不把 0 剩余缩成 1ms/50ms 去「尽力试一次」（动作已发起就不是拒绝了）。
+   墙钟回拨不得延长用户选择的时长；`sign_end` 仍是独立硬上限；窗口已过则不启动浏览器。
+4. **学校时间恒为 UTC+8，且业务时刻来自独立北京时间**（决策 012，2026-10-26）：
+   前后端都按东八区解析 `YYYY-MM-DD HH:MM:SS`；非法日历日期（2 月 30 日、非闰年
+   2 月 29 日、13 月、24:01）两端都返回不可用，界面显示「时间待确认」且不能开始；
+   学校时刻展示固定 `Asia/Shanghai`。顶栏时钟显示的是**工具的独立北京时间**
+   （公共 NTP 锚点 + 应用内经过时长），未校准时显示「待校准」，不回退本机时间；
+   本工具不读取、不修改系统时间设置。本机 `saved_at`、生命周期文本不走学校时区。
+5. **节点时间来自源事件**：worker 输出 `[checkpoint] {"kind","at"}`，父层按 `at`
+   记账并另存 `worker_spawned_at`（Popen 时刻）；`run_started_at` 只来自 worker
+   入口事件。日志转发慢多少都不移动节点；未发生的节点显示「待启动/待打开/待发生」。
+6. **接纳以本进程缓存为准**：`start_plan` 按活动 ID 从缓存取权威 `signed` 与
+   起止时间；前端只表达「选了哪一场」。时间/资格与缓存不一致时返回
+   「活动信息已变化，请刷新后重新确认」，不静默换成另一个时间；未知 ID、
+   列表未加载、坏项、重复 ID 都返回可恢复错误且不创建协调器。
+7. **粗校时可解释**：`clock` 结构化载荷含 `source/checked_at/rtt_s/offset_s/
+   uncertainty_s/state`；HTTP Date 只有整秒分辨率，差值区间跨过 3 秒阈值时为
+   `unknown`，不得断言「本机慢 N 秒」；每轮 check 整份替换旧结论，正常/未知
+   都清除旧告警；不自动把差值加到报名时刻，也不改系统时间。该粗测只是诊断，
+   与独立北京时间的 NTP 校准（下条）是两回事。
+8. **失联可恢复且不重复报名**：check/list 携带每轮 `request_id`，旧轮迟到事件
+   被丢弃；同步拒绝立即离开「检查中/骨架」；100 秒无检查终态落 unknown，
+   130 秒无列表终态转可重试。`start_plan` 带 `request_id` 幂等：15 秒无响应
+   转「正在确认是否启动」，只调 `start_request_state` 对账；accepted 恢复任务与
+   停止入口，rejected 如实报错，pending 继续等，unknown 明说「请勿重复启动」
+   并保留重新确认入口——绝不清掉开始标志放行第二次提交。每次对账查询有 5 秒本机
+   响应期限和独立查询代次：永不返回的 Promise 也会退出查询态，旧代次的迟到回复
+   不得落到后来的计划上。check/list 的旧 owner 终态先有界暂存（最多 16 项、130 秒、
+   按分支与请求 ID 区分、不含凭证），skipped ack 接续回原 ID 后重放一次；
+   同一终态重复到达只生效一次，旧 ack 不得重绑新一轮。
+9. **次数上限可见**：有限次数显示「已提交 N/M 次」，0 明确「不限次数」；
+   次数真实递增与最近原因共存，终态保留真实计数。
+10. **空闲目标同源**：没有选择时标题、元数据、快捷选择与 LED 使用同一个
+    `nextOpen` 目标；当前目标已开放就显示「已开放，可立即报名 / 现在」，
+    绝不把另一场未来活动的倒计时配给这个标题。
+11. **演示模式离线**：`--demo` 的 bootstrap/check/list/start 只用内存样例，
+    不读 `session.json`/`storage_state`、不起 worker、不访问学校；登录动作只给
+    演示说明；界面明确标「演示模式」，不伪装登录有效。
+12. **下载名固定 ASCII**：`tjise-activity-watch-v<版本>-win-x64.exe/.zip`；
+    中文产品名只用于 Release 标题与说明，manifest/说明/校验共用同一命名函数。
+13. **独立北京时间（决策 012，2026-10-26 最终边界轮口径）**：`BusinessClock` 以公共 NTP
+   （ntp.aliyun.com / ntp1.aliyun.com / time.cloudflare.com，UDP 123）有界校时：
+   一轮三源共享 5 秒期限、每源至多一次；64 位随机请求标识 + 8 字节 originate 全回显
+   对应、已解析 endpoint 的 connected UDP（peer 校验）、DNS 后真实发/收 tick 计 RTT、
+   15.625ms 保守分辨率、有符号根延迟取绝对值。
+   **一致组（CB01）**：≥2 源先对齐到同一 tick，按「组内任意两人一致」枚举两两一致子集
+   （每对差 ≤ 双方误差和 + 0.25 秒），去掉真子集后只比较极大组；最高支持数对应多个
+   互相矛盾的极大组时拒绝发布，不按 RTT、枚举顺序或三源排列任选；取组内最小 RTT。
+   **网络半程（CB02）**：服务器处理耗时 = `T3 − T2`，网络往返 = 本地 RTT − 处理耗时，
+   收包中心 = `T3 + (RTT − (T3−T2))/2`；容差内（处理耗时超过 RTT 不超过 50ms）负网络
+   时长夹到 0（不早于 `T3`），超容差拒绝。误差界仍为
+   `RTT/2 + 根延迟/2 + dispersion + 计时分辨率`，不因扣除处理耗时缩小。
+   不确定度 ≤0.5 秒才 ready。sync 单飞 + 轮次围栏：新轮发布后旧轮永不再发布；
+   300 秒后台重校，holdover 计 100ppm 漂移，>900 秒或超阈值 → unavailable。
+   任何失败有原因、**绝不回退系统墙钟**。快照合同：`epoch_s` 只对应 `tick_s`，
+   `sampled_tick_s` 是快照生成时刻，`age_s = sampled_tick_s − tick_s`；
+   `uncertainty_s` 是**采样时**误差（已含锚点到采样的漂移），客户端只补
+   `sampled_tick_s` 之后的单调漂移（CB04）；重写快照不重置持有期与误差。
+   bootstrap 带 `business_clock` 快照；`clock_snapshot` 供界面 10 秒轮询；
+   快照 `sync_status` 区分 pending/syncing/succeeded/failed；收到 bootstrap 不等于
+   首轮校准完成。没有可读锚点且首轮仍在进行时显示「校准中…」，尝试结束未成功才
+   显示「待校准」。已有可读锚点的后台重校不抹掉当前时间。
+   `sync_round` 是校准尝试编号，失败也递增；授时 `generation` 只在取得新锚点时递增。
+   手动校准按本次尝试编号收口，失败不等待成功代次；结果早于 ack 时不重新挂超时。
+   同代次失败在详情及时说明，仍有效的旧时间可继续使用，不把失败说成「没有返回结果」。
+   `sync_clock` 去重重校并推 `business_clock` 事件（更高 generation 才可更新界面锚点；
+   同代「不可用」不抹已建立锚点）。
+   界面：顶栏唯一时间入口五态（已校准/校准中…/使用上次校准结果/待校准/演示时间），
+   340px 详情浮层承载最近校准/估计误差/使用记录/时间来源与重新校准；浮层状态图形与
+   顶栏同源（失败/等待警告色、已校准成功色、演示中性色）。
+   顶栏/现在线（含每秒 tick 重绘）/分类/倒计时/LED/登录剩余/日志统一业务时刻，
+   前端日志使用业务北京时间；worker 已带真实源时间的日志不重复添加接收时间。
+   缺可信时间的前端日志标「待校准」；「今天」筛选使用北京自然日，不随 OS 时区改变。
+   `nextOpen` 在无可信时间时仍返回完整空目标（best/bestId/openId/futureId=null，
+   openNow=false），避免 undefined 被误判成有效倒计时，LED 同样显示待校准。
+   未校准显示「待校准」。**年龄与误差（CB04）**：`age_s` 只用于 300/900 秒门禁与
+   「最近校准」展示；最近校准由权威 `age_s` 加接入后的经过时长推导，F5/bootstrap/
+   同代轮询都不续期；采样后漂移只按接入后的单调经过时长计一次，不把采样前漂移
+   重复叠加到可用性判断。门禁：时钟不可用时开始按钮禁用（单一可见原因
+   「北京时间未校准」）、后端拒绝启动；运行中失去校时停止自动动作（恰一次 plan_done：
+   canceled + 原因）——已提交未决保留 unconfirmed/次数，零提交不算失败。
+   **未知文案（CB05）**：只有学校确实没给 `sign_start` 才说「报名时间待公布」；
+   有已知 `sign_start` 但本机暂时没有可信当前时间时，保留绝对日期/时间并标
+   「待校准」，不得整体分进「待公布」或断言没有可报名场次；大屏只显示
+   「时间待校准」+ 一个恢复入口（打开现有时间详情），依赖时钟的下一场/可报名计数
+   显示「待确认」而不是伪 0/6；学校已报名等静态事实保留。恢复校准后原地重算
+   分组/计数/倒计时，选择与重试策略不丢。
+   **单调经过时长（CB06）**：请求超时、对账期限、暂存终态 TTL、桥接等待等期限一律
+   使用 `performance.now` 同域单调读数，OS 墙钟前移/回拨不得提前或延长；
+   `request_id` 唯一性与 OS 诊断差值仍可用 `Date.now`。
+   登录估算用 `session_timing_v2`（凭证摘要+saved_epoch+time_source+uncertainty，
+   仅登录成功路径建立），生命周期跨关闭时长用 `lifecycle_v2` 业务 epoch（晚校时倒推
+   启动 epoch；本次取 epoch 失败时 quality=unknown，不拿旧心跳凑可信关闭事实；
+   run_id 归属与写回在同一跨进程事务内核验）；旧墙钟文本不迁移、不猜偏移。
+   用户偏好和生命周期共用跨进程事务；线程锁与文件锁共享单调期限，拿锁超时不绕锁
+   写入。保存失败回执 ok=false，界面保留本会话设置并最多自动重试一次；新值优先，
+   最终失败只记一条提示，不声称已落盘，不无限重试。
+   demo 完全离线并标注「演示时间」。**这些规则不得在旧矛盾条款后追加互斥文本，就地生效。**
+
+
+### 5.17 进程监督、结果分类与界面证据（现行验收契约，2026-10-26 最终收口轮）
+
+对应复审 F01–F09。以下每一条都必须有行为证据，不以「源码里有这个字符串」代替。
+
+1. **真实列表入口可独立成功**：`cmd_list` 用独立入口的 `fetch_activities()`（作用域内没有
+   重试预算，保留既有有界网络超时）；`resolve_target` 按 ID（缺 `--at`）、按名称、按序号
+   三条路径都把调用方传入的同一个预算对象传到网络层。学校零行输出 `[]`；4001 归因
+   「登录态已失效」；网络错误归因「拉取活动失败」，不得说成登录过期。
+2. **创建前归属 + 有界监督**：worker 以 `CREATE_SUSPENDED` 创建，建 Job（`KILL_ON_JOB_CLOSE`）
+   → 归属 → `ResumeThread`，**归属成功之前 worker 主体一步都跑不了**；创建/设置/归属/恢复
+   任何一步失败都结束仍挂起的自有进程、关掉全部自有句柄并抛启动失败，**不降级成
+   「父进程活着才 taskkill」**。进度回调与日志一律移到所有权确定且锁已释放之后。
+   父进程先退出、孙进程仍握着 stdout 时，到达「有效截止 + `SUPERVISE_GRACE_S`（5 秒）」
+   必须结束监控并收走整棵树——退出条件不得以父进程仍存活为前提。监督等待用可取消
+   `Event.wait`；释放 Job 句柄前必须先撤销并有界 join 监督线程，防止迟到的 watchdog 使用
+   已关闭/已复用的句柄；读线程 join、`proc.wait`、清理各有上限，禁止在另一线程持读锁时
+   同步 `close`。监督余量只做清理，不延长 worker 的提交预算。
+3. **提交计数双通道归并**：`observed.attempts` 同时消费人话行
+   `第 N 次提交：…` 与结构化 `[retry] kind=submit attempts=N`，按已承认的最大值归并，
+   不重复累加，且不依赖 `status` 回调是否存在。
+4. **结果分类贯穿界面（含停止与整屏视觉）**：`unconfirmed` 与 `auth_unavailable` 必须
+   穿过 runner 返回、task 事件、`plan_done` 与 bootstrap 终态快照。任务卡标签分别是
+   「待核对」「未提交」，配色中性，不画失败叉；计划总结按「成功 / 确认未成功 / 待核对 /
+   未提交 / 取消」**逐项分列**，不得用 `unknown` 总数冒充「待核对」；两种未知同时存在时
+   标题写「有 N 场需确认」；大屏与 LED 用同一份 `unknownLabel`。
+   **停止只终止本地执行**：已确认的成功/已报名不被改写；已发出但没回应的保留
+   `max(遥测次数, 已观察次数)` 并记 `unconfirmed`；只有一次都没提交才是普通取消。
+   计划级主结论仍按用户停止显示「已停止」，未知场次**并列**说明。
+   整屏边框由展示状态决定：含未知的计划用中性琥珀（`data-plan-state="attention"`），
+   只有**确认失败**才用失败红；`paintBoardState`、标签、LED、结果框同源。
+   含未知时禁止「都没抢到」「XX 场都没抢到」这类全失败断言；`auth_unavailable`
+   不得出现「登录失效 / 请重新登录」，只给「检查网络后刷新」。
+5. **单场信息不重复**（R18）：单场计划不在标题、摘要、任务卡三处复读
+   「本批 1 场 · 每场独立结果」；任务卡只承载次数/最近原因，大屏承载当前阶段。
+6. **地点全文可达**（R19）：大屏 `#selected-meta` 的地点默认最多两行，可聚焦按钮
+   原生支持 Enter/Space 展开与收起（`aria-expanded`），展开后行高随内容增长、
+   不覆盖下一条；表格 `.c-place` 同样两行 + 聚焦展开；不使用只靠 hover/title 的方式。
+7. **可复用的离线 QA 证据**：`tools/qa_runtime_reliability.py` 只绑定 `127.0.0.1`，
+   原样读取 `local/ui` 四文件，只在 `app.js` 之前注入
+   `local/tests/fixtures/runtime_bridge.js`；桥的未实现方法直接抛错，结果类方法必须
+   两阶段（立即回执 + `onBackend` 事件）。外部请求全部拦截且必须为 0；端口占用报错
+   退出、不杀占用者；无 Playwright/Edge 时标 blocked，禁止安装依赖。
+   **用户可点击的动作必须用真实指针/键盘**（Playwright `locator.click`、`keyboard`），
+   不许用 `element.click()` 调处理器冒充；`--ui-root` 只能指向对照副本，用来证明修复前
+   的缺陷确实被断言抓住，正式场景永远读生产 UI。每个场景报告要记录动作、可见矩形、
+   `elementFromPoint` 命中目标与 DOM 计数。
+8. **视口与键盘实测**：常规 980×760、1120×800、1280×900，压力 746×512、680×480；
+   覆盖首次未登录、检查中、未知、有效零活动、筛选空态、混合计划、未确认/鉴权未知、
+   停止后未确认、同 owner 跨轮、完整 F5 终态、组件横幅恢复；键盘覆盖 Tab/Esc/Ctrl+F、
+   引导跳过/重播、地点展开；弹窗开启时背景快捷键不穿透。截图必须非空且逐场景落到报告。
+   **短窗验收判据是「可达」不是「在 DOM 里」**：`#rows` 必须有可操作高度，并且
+   要么落在视口可见带内、要么整页可纵向滚动；每行要能滚到定位后由真实指针点中
+   （命中目标必须是本行复选框，不是表头或分组标题），点完选择确实改变。
+   禁止靠截断大屏结论、线路/停止、重试策略或帮助入口来换空间。
+
+9. **完成态先提交、再发布；F5 恢复完整呈现**：`plan_done` 发出之前，必须在同一临界区
+   提交 `_plan` 清空、`_last_plan` 终态快照与 request_id 对账记录，再释放锁调用外部
+   `_emit`——同步回调里读到的完成状态必须是已提交的（`Api._lock` 非可重入，回调里再取锁
+   会当场死锁）。旧计划迟到的 `plan_done` 不得清空/覆盖后来计划与它的终态快照。
+   bootstrap 在同一临界区取「活动计划 / 最后快照 / busy」。界面侧
+   `ingestBootstrapPlan` 对终态必须走与 `plan_done` 相同的呈现入口，恢复结果框、卡片
+   次数与原因、LED、整屏边框、停止后动作与选择签名；恢复不置 busy、不重发
+   `start_plan`、不重复写失败日志。同一 plan_id 已在屏上时也要推进状态，不能直接 return。
+10. **跨轮次幂等只约束副作用**：请求身份与刷新轮次分成两层。`markRoundApplied` 的键含
+   「消费代次」，同一代次内同一终态只生效一次；新一轮刷新允许用同一个 owner 的既有结果
+   收口（否则页面会干等 100/130 秒）。日志/提示等一次性副作用按 `branch:request:tag`
+   幂等，重放不再刷屏；旧轮的 ack/catch 不得收口新一轮的 pending。
+11. **计划事件与终态快照按接纳代次归属**（P1，2026-10-26 归属轮）：Api 在最终接纳的同一
+   临界区内维护单调递增 `plan_generation` 与「最近接纳计划」，**槽为空（`_plan=None`）
+   不等同于「迟到回调属于最新计划」**——较新的计划可能已经结束；归属以代次判定，不随
+   `_plan` 清空遗失。内部桥接事件与 bootstrap 快照携带 `plan_id`、`plan_generation` 与
+   `request_id`。旧计划的 `plan/task/plan_done` 迟到时：可以完成它自己 request_id 的历史
+   留档并按 request_id **只读对账**，但**不得**清运行中计划的槽、覆写较新计划的终态快照，
+   也**不得**向当前界面广播。界面侧 `handlePlan`/`handleTask`/`handlePlanDone` 共用同一
+   归属路由：事件只有属于屏上计划、或携带比已接纳更大的 `plan_generation`（新计划的事件
+   **可能早于 start_plan 的 ack**）才可改当前状态；后到 ack 按同 plan_id 合并，不得清掉
+   已收任务、不得把已收提交次数抹回；同计划重复终态只补详情，不把已定结论改成另一状态；
+   被拒绝/取消的开始请求不得被旧事件复活成运行态；F5 以 bootstrap 权威快照建立归属后，
+   旧事件不得覆盖。停止按钮的实际调用必须指向屏上当前计划的 `plan_id`。
+   **开始 ack 不得复活终态**（终态早于 ack）：ack 只证明「已接纳」，不证明「此刻仍在
+   运行」。`startPlan` 成功回执与 `adoptPlan` 对账在该计划已通过 `plan_done` 到达终态
+   （completed/partial/failed/stopped）时，只清开始请求与计时器、幂等合并缺失信息，
+   **不得** `setBusy(true)`、不得把任务从终态回写成旧 running/queued 进度——此时没有
+   第二个 `plan_done` 会再来解锁；「提交中早到事件 + ack」的忙态路径保持不变。
 
 ## 6. 文案要求
 
@@ -336,6 +546,8 @@
 2. 内核是 WebView2（Chromium 110+）：可以用 flex/grid、CSS 变量、`dialog`、`backdrop-filter`；
    不要用需要 polyfill 的语法。JS 不要用 `type="module"`（file:// 下受限）。
 3. 窗口最小 980×700，默认 1120×800；100% / 150% 缩放都不能错位。
+   QA 额外覆盖 746×512 与 680×480 压力视口：允许内容换行，但不允许横向滚动，
+   「帮助 / 刷新 / 停止 / 开始」等关键操作必须仍可见可点。
 4. 首屏骨架 300ms 内可见；几百行要能顺畅滚动。
 5. 键盘：F5 刷新、Enter 抢选中项、`:focus-visible` 描边。
 6. **两个必踩的坑**（写 `app.py` 时踩过，改界面时别绕回去）：
@@ -344,6 +556,9 @@
    - 不要给 `Api` 实例挂公开属性；也不要试图 `import` `app.py` 里的东西到页面。
 
 ## 9. 验收清单
+
+> 2026-10-26 最终收口轮补充：新增条目对应 §5.17，旧条目已就地改为五视口口径。
+> 历史截图与「385 例」等测试总数只描述当时那一轮，不作为本轮证据。
 
 - [ ] 未登录 / 拉取失败 / 列表为空 三种状态都有明确引导
 - [ ] 多选活动后，举办时段重叠项被明确提示并阻止启动；不重叠项可保留
@@ -358,8 +573,8 @@
 - [ ] 登录成功后自动刷新列表，且不误报「没抢到」
 - [ ] 使用说明可反复打开（不是只弹一次）
 - [ ] 日志展开/收起正常，长日志不撑破布局
-- [ ] 980×700 与 1120×800、100%/150% 缩放均无横向滚动条
-- [ ] DevTools Network 只有本地文件，没有外部请求
+- [ ] 980×760、1120×800、1280×900 与压力视口 746×512、680×480 均无横向滚动条；100%/150% 缩放不错位
+- [ ] 离线 QA 报告记录每个场景的 DOM 断言、截图绝对路径与外部请求；外部请求必须为 0
 - [ ] `python app.py --demo` 下能看到已报名/开放中/未开放、同批非冲突并发、同批冲突、跨批次冲突、部分成功和停止
 - [ ] 未来场次显示「预报名」并等待原定开放；已开放场次显示「立即报名/抢名额」并立即执行；已截止场次只能查看，不能勾选或开始
 - [ ] 存在开放活动时，大屏目标场与快捷「选这一场」优先开放场次，而不是未来场次
@@ -383,12 +598,30 @@
 - [ ] check 外层兜底异常后：前端 unknown、后端判定同步 unknown、开始按钮被拒；随后正常校验恢复 valid 可开始
 - [ ] 组件故障经 check/list 任一入口、登录/开始同步失败都能挂上唯一横幅；同轮另一分支成功不撤横幅；下一轮两分支完成才恢复；同步拒绝不卡 pending；真实业务结果与横幅并存
 - [ ] 窄窗口（≤980）或目标隐藏时引导退回底部说明条；计划运行中引导自动暂停，结束后从原步骤继续
-- [ ] 版本只在「更多」显示（与 VERSION 一致，不写死候选号）；「查看发布页」点击才用系统浏览器打开，启动时不联网；打不开时弹窗内有局部反馈与可复制的固定地址
+- [ ] 版本只在帮助面板显示（与 VERSION 一致，不写死候选号）；「前往下载页」点击才用系统浏览器打开，启动时不联网；打不开时帮助内有局部反馈与可复制的固定地址
 - [ ] `python tools/release.py`（默认 check）零副作用输出资产名与门禁预演；prepare 产出的 ZIP 只含白名单成员并附 SHA-256 清单；publish 未获授权时不创建 tag、不上传
 - [ ] 取消同批某一场后，批次数与 LED 目标立即只跟剩下的非终态场次；立即场成功后目标回到仍等待的未来场，LED 不再停在 00:00:00
 - [ ] 全终态但 `plan_done` 未到显示「正在汇总结果」；单场成功/失败不会把整屏染成计划结论
 - [ ] 登录有效且学校返回 0 场：列表写 0、大屏不重复原因、不给登录引导；无法确认登录态时不说「过期」
 - [ ] 先设 10 分钟/3 次，再触发筛选空态并清除筛选：控件、偏好与下一次 `start_plan` 载荷仍是 600/3（引导/日志/浏览器偏好不丢）
+- [ ] `cmd_list` 在生产入口可独立成功（无 `NameError`）；按 ID/名称/序号三条路径共用同一个预算对象；零行输出 `[]`
+- [ ] 父进程先退出且孙进程握着 stdout 时，监督在「截止 + 5 秒」内收走整棵树；正常完成立即撤销监督，不留睡到截止的线程
+- [ ] 任务卡/总结/大屏/LED 对「待核对」「未提交」同一分类同一数字；含未知时不出现「都没抢到」，鉴权未知不出现「重新登录」
+- [ ] 对账查询 5 秒退出查询态；旧代次迟到回复不落地；终态先于 skipped ack 时能重放，不再干等 100/130 秒
+- [ ] 大屏与表格的超长地点默认两行、Enter/Space 展开全文、不遮挡下一条；单场计划不在三处复读「本批 1 场」
+- [ ] worker 主体第一条指令的时刻不早于 Job 归属成功时刻；创建/设置/归属/恢复任一失败时主体零动作、零进程残留
+- [ ] 取消前已发过请求：次数保留、结论「待核对」；已确认成功/已报名不被停止改写；零提交取消仍是普通取消
+- [ ] 同 owner 终态已消费后再次刷新：新轮次立即收口，不干等 100/130 秒；同轮重复只生效一次；旧 ack 不清新轮 pending
+- [ ] `plan_done` 的同步回调里 `_plan` 已为 None、终态快照与 request_id 对账记录可读（无死锁）
+- [ ] F5 后结果框、卡片次数、LED、整屏边框、停止后动作与选择变化全部与结束当时一致；不重发 start_plan
+- [ ] 待核对与未提交分列计数；含未知的整屏是中性边框；确认失败才是失败红
+- [ ] 680×480 下活动列表可达（视口内或整页可滚动），真实指针能点中行、开始与停止按钮
+- [ ] 旧计划的 plan/task/plan_done 迟到：不清运行中计划的忙态/任务/停止入口（停止实参仍是当前计划）；较新计划已结束后不覆盖终态快照；重复终态不改已定结论
+- [ ] 新计划事件早于 start_plan ack 可接纳；后到 ack 不清已收任务、不抹已收次数；被拒的开始不被旧事件复活；F5 恢复后旧事件不覆盖
+- [ ] 终态早于 ack：原 start_plan 回执落地后 busy 仍为 false、终态结论/次数/任务不变、不重发开始；提交中早到事件 + ack 的忙态路径保持
+- [ ] 顶栏唯一时间入口五态齐全，未校准显示「待校准」、开始禁用原因单一可见；详情给最近校准/估计误差/使用记录/时间来源与重新校准；现在线（含每秒重绘）不回退本机墙钟
+- [ ] boot 前 / 运行中注入 ±8 小时 / ±30 天：顶栏、现在线、倒计时、接纳窗口、监督截止全部按业务时钟走；校时不可用时开始禁用且登录校验不受影响
+- [ ] 登录剩余只在 v2 锚点匹配时报数；跨关闭时长按 lifecycle_v2 业务 epoch，旧文本不迁移、不猜偏移
 
 ## 10. 怎么跑、怎么看
 
@@ -401,5 +634,43 @@ python app.py --demo     :: 假数据，调样式用
 - 截图：`Win+Shift+S`，或用脚本 `ImageGrab.grab(bbox=窗口矩形)` 抓窗口本身。
 - 想看 DevTools：把 `app.py` 里 `webview.start(debug=False)` 临时改成 `debug=True`
   （这是唯一允许你碰 `app.py` 的情形——改完记得改回去）。
-- 改完至少跑一遍：`python -m py_compile app.py grab.py signup_plan.py`、`node --check ui/app.js`，
-  再用 `--demo` 截图自查一遍 §9。
+- 改完至少跑一遍（仓库根，获运行授权后）：
+  - `python -X utf8 -m unittest discover -s local/tests -p "test_*.py" -v`
+  - `python -X utf8 -m compileall local server`、`node --check local/ui/app.js`
+  - `python -X utf8 tools/qa_runtime_reliability.py --host 127.0.0.1 --port 8388 --evidence-root <临时目录> --run`
+  - 再用当前 EXE `--demo` 做原生点击自查（mock 截图不能代替）。
+
+### 10.1 本轮旧条款对照（旧句 → 新规则 → 代码位置 → 当前证据）
+
+| 旧句 | 新规则 | 代码位置 | 当前证据 |
+|---|---|---|---|
+| 「阻塞超时不得为 0」 | 预算到点抛 `BudgetExhausted`，拒绝发起 | `local/time_contract.py` `RetryBudget.timeout_s/ms` | `test_worker_boundaries` 预算用例；`test_time_contract` |
+| 「旧轮迟到事件被丢弃」（无暂存） | 旧 owner 终态先暂存，skipped ack 后重放一次 | `local/ui/app.js` `cacheRoundPayload/takeRoundPayload` | `test_ui_reliability.RefreshRoundRaceTests` |
+| 「unknown 明说请勿重复启动」（无查询期限） | 每次对账 5 秒期限 + 查询代次 | `local/ui/app.js` `reconcileStart` | `StartReconcileQueryTests`；QA `reconcile-hang` |
+| 「没抢到」覆盖全部失败 | 待核对/未提交单列，含未知不得全失败断言 | `local/ui/app.js` `planOutcome/unknownLabel` | `UnknownOutcomeUITests`；QA `unknown-outcomes` |
+| 「窗口最小 980×700」只测两种视口 | 五视口 + 压力视口 + 键盘 + 顶栏矩阵 | `tools/qa_runtime_reliability.py` | 返修轮 `qa-report.json` 39 场景 / 51 图（历史轮 15 场景 / 22 图只作历史证据） |
+| 「界面不显示 3/10 这种总数」 | 有限次数显示「已提交 N/M 次」，0 写「不限次数」 | `local/ui/app.js` `submittingDetail` | `AttemptsDisplayTests`；`test_retry_policy` |
+| 「worker 一创建就取得所有权」（实为 Popen 后才 Assign，且失败静默降级） | 挂起创建 → 建 Job → 归属 → 恢复；失败即启动失败 | `local/app.py` `spawn_owned_worker` | `WorkerOwnershipTests`（红 10 → 绿） |
+| 「停止即取消」（实为取消分支先返回、次数回落 0） | 已获得证据优先：成功/已报名 > 确定失败 > 待核对 > 取消 | `local/app.py` `_run_plan_task` | `StopPreservesFactsTests`（红 4 → 绿） |
+| 「旧轮迟到事件丢弃」（无跨轮恢复） | 幂等键含消费代次；同 owner 可收口新轮，副作用按请求幂等 | `local/ui/app.js` `markRoundApplied/firstNotice` | `CrossRoundConsumptionTests`（红 3 → 绿） |
+| 「F5 只恢复 tasks/status」 | 终态走同一呈现入口：结果框/LED/边框/次数/动作/选择签名 | `local/ui/app.js` `presentPlanDone/ingestBootstrapPlan` | `BootstrapTerminalViewTests`（红 2 → 绿） |
+| 「含未知仍用 failed 红色边框」「待核对=unknown 总数」 | 展示状态 `attention` 中性色；待核对与未提交分列 | `local/ui/app.js` `boardPlanState/unknownLabel` | `BoardStateSemanticsTests`（红 3 → 绿） |
+| 「压力视口只查按钮 is_visible」 | 真实指针 + 可见带/可达性几何 + `elementFromPoint` 命中 | `tools/qa_runtime_reliability.py` `_narrow` | `narrow-680/746`（红：可见带 11px、点击被表头拦截 → 绿） |
+| 「旧计划的 plan_done 仍转发给界面」「槽为空即归属最新计划」 | 接纳代次归属：旧事件只留历史对账不广播；`_last_plan` 只由最近接纳计划写 | `local/app.py` `start_plan` emit 闭包 / `local/ui/app.js` `planEventOwns` | `PlanDoneCommitOrderTests`（红 5 → 绿）+ `PlanEventOwnershipTests`（红 6 → 绿）；QA `stale-plan-events`/`stale-after-done`/`early-events-before-ack` |
+| 「ack 整表替换已收任务」 | ack 快照按 plan_id 合并，提交次数只增不减 | `local/ui/app.js` `adoptPlan` | `test_new_plan_events_before_ack_are_adopted_and_ack_keeps_telemetry`；QA `early-events-before-ack` |
+| 「已接纳 = 此刻仍在运行」（终态早于 ack 时置忙复活已结束计划） | 终态先到则 ack 只清开始请求，保持 busy=false 与终态呈现 | `local/ui/app.js` `startPlan` 成功回执 / `adoptPlan` | `TerminalBeforeAckTests`（红 5 → 绿）；QA `early-terminal-before-ack` |
+| 「顶栏显示本机时间」「按本机时间执行/建议同步系统时间」 | 独立北京时间：NTP 锚点 + 经过时长；粗测只作诊断；现在线每秒重绘也只认业务时钟 | `local/business_clock.py` / `local/ui/app.js` `businessNowMs`、`tick` | 返修轮 `test_business_clock` 全绿 + `test_business_clock_wiring`；QA `clock-skew-boot-8h`（先红：现在线显示本机时刻 → 修 `tick` 后绿）/ `clock-skew-boot-30d` / `wall-jump-during-plan` / `clock-skew-runtime-minus8h` / `clock-unavailable-start` / `clock-holdover-expiry` / `clock-first-sync-delay` / `clock-status-after-reload` / `clock-sync-failure-feedback` |
+| 「登录剩余按 saved_at 墙钟估算」「关闭时长按本机文本」 | v2 可信锚点才报数；未知不判失效不诱导重登 | `local/app.py` `token_hours_left` / `compute_lifecycle_v2` | `test_session_persistence` v2 用例（红 → 绿）；QA `legacy-session-valid-no-estimate` |
+
+### 10.2 本轮边界缺陷（CB01–CB06）验收映射（2026-10-26 最终边界轮）
+
+| 编号 | 根因（复审） | 现行口径 | 代码位置 | 本轮证据（红 → 绿） |
+|---|---|---|---|---|
+| CB01 | 星形邻接把「A-B、B-C 成立但 A-C 矛盾」合并成三源支持 | 两两一致子集 + 去真子集 + 极大组；同支持矛盾组拒绝 | `local/business_clock.py` `_accept_cluster` | `test_business_clock.ConsistentClusterTests`（0/0.20/0.40、三源 6 置换：红 `ready` → 绿拒绝；正对照三源全一致/唯一 AB/两源） |
+| CB02 | `epoch = T3 + RTT/2` 把服务器处理耗时重复算进网络半程 | `T3 + (RTT − (T3−T2))/2`；容差内负网络夹 0，超容差拒绝；误差界不缩小 | `local/business_clock.py` `_one_source` | `NetworkRoundFenceTests`（20ms 处理：红多算 10ms → 绿 1ms 容差；0/近 RTT/负网络/超容差） |
+| CB03 | 本次取时失败仍写 quality=ready；外来 run_id 先清空再写成自己；旧文本被当精确值 | 缺本次可信 epoch 即 unknown；初始化/迟到校准缺 v2 一律 unknown；读核验+写回同一跨进程事务 | `local/app.py` `AppLifecycle` / `_prefs_transaction` | `LifecycleTransactionTests`（心跳/关闭失效、旧文本、迟到校准：红 2 → 绿；真实双进程 A/B 接管与 0.4 秒持锁交错：红确认 A 覆盖 B → 绿整份让位） |
+| CB04 | UI 把 `uncertainty_s` 与整段 `age_s` 的漂移相加；F5 用接入时刻冒充「最近校准」 | 只补采样后单调漂移；年龄只做 300/900 门禁；最近校准 = 权威 age + 接入后经过时长 | `local/ui/app.js` `clockReading/clockAgeMs/clockLastSyncText` | `ClockModelReliabilityTests`（age400/unc0.47：红判不可用 → 绿可用；F5 600s：红「刚刚」→ 绿「10 分钟前」） |
+| CB05 | `stateOf=unknown` 同时承载「缺 sign_start」与「无可信 now」，统一说「待公布」 | 有 sign_start 保留绝对时间标「待校准」；大屏「时间待校准」+ 单一入口；计数「待确认」；已报名事实保留 | `local/ui/app.js` `signStartKnown/leftTextOf/groupTimetable/paintSelected/paintRail` | `UnknownClockDisplayTests`（红 3 → 绿）；QA `clock-unknown-known-open-time`（17 断言，含恢复后选择/策略保持） |
+| CB06 | 暂存终态 TTL 与桥接等待用 `Date.now`，随 OS 跳变提前/延长 | TTL 与 15 秒桥接等待改用 `performance.now` 同域经过时长；请求 ID/诊断仍可用 Date.now | `local/ui/app.js` `cacheRoundPayload/takeRoundPayload/waitForBridge` | `ClockModelReliabilityTests`（OS ±8h/30d：红 6 → 绿 3）；QA `clock-cached-terminal-wall-forward/back` |
+
+补充验收：五态 DOM/截图（`clock-five-states`、`clock-state-demo`）、浮层色彩对照（`clock-failure-icon-color`）、顶栏名称单行 980/1120/1280（`topbar-matrix-*`）、746/680 操作可达（`narrow-746/680`）。以上均为**隔离回环**证据，不代表真实学校时钟差异或真实报名已验收。

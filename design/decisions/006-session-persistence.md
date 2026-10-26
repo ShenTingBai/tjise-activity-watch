@@ -53,3 +53,17 @@
 数据根或四态语义改动需同步 `local/app.py`（`_env()`、`login_state()`、`_do_check`）、
 `docs/UI_SPEC.md` §5.9、`local/README.md` 与 `local/tests/test_session_persistence.py`；
 `result` 四态值与 `session_present` 等字段名是界面契约，不得重命名。
+
+## 2026-10-26 返修补记（1.1.1 候选）
+
+四态不变；登录剩余一律写「预计/约」，不再出现「一定撑得到」的保证句；粗校时只作提示、不自动校准；演示模式不读凭证。
+
+
+## 决策 012 修订（2026-10-26 返修轮更新）：登录剩余估算换可信锚点
+
+saved_at 是本机墙钟文本，无法反推真实 UTC：不再拿 datetime.now 减它冒充准确小时数。
+锚点只在**登录 worker 的真实成功路径**建立（`_anchor_login_success` 写 `session_timing_v2`：
+credential_id/saved_epoch/time_source/uncertainty_s），并要求当时有可信北京时间；
+复用与刷新不续期、换凭证换锚点；无锚点/不匹配/时钟不可用 → hours_left=null
+（胶囊不报数，时间详情显示「未知（以学校校验为准）」），登录有效性仍只由学校真实校验决定，
+估算缺失不要求重登。旧凭证有效性结论不变；未知时间不清凭证、不依赖 OS 估算。

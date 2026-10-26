@@ -56,8 +56,28 @@
 
 demo / 假会话的证据**不得**当作有效登录验收记录。
 
+## 决策 012 修订（2026-10-26 返修轮更新）：全部真实节点同业务北京时间
+
+- 「本次启动 / 活动页已打开 / 盯按钮 / retry_deadline」等 checkpoint 的时刻读数与
+  截止比较全部按**独立北京时间**（业务 epoch + 经过时长）记录与展示；
+  「原定开放」等学校参考节点不再被本机系统时钟提前改写（`--at` 改写、
+  分类、接纳窗口、监督截止同源业务时钟）。
+- 运行中重校只影响单次读数的不确定度，不改写已落库的历史 checkpoint 事实；
+  系统墙钟跳变 ±8 小时 / ±30 天不影响节点显示与倒计时
+  （QA：clock-skew-boot-8h / clock-skew-boot-30d / wall-jump-during-plan /
+  clock-skew-runtime-minus8h）。
+
 ## 变更方式
 
 站点语义或字段改动需同步 `local/signup_plan.py`（`CHECKPOINT_FIELDS`）、`local/grab.py`（事件输出）、
 `local/ui/app.js`（`paintRoute` / `effectiveRetryDeadline` / `mergeTask`）、`docs/UI_SPEC.md` §5.10 与本记录；
 `run_started_at` 等四个字段名不得重命名（快照与事件契约）。
+
+## 2026-10-26 返修补记（1.1.1 候选）
+
+节点时间改由 worker 的 `[checkpoint]` 源事件提供，父层另存 `worker_spawned_at`；计划策略起点、worker 入口、页面打开、盯按钮与父层接收时刻分开表达。
+
+
+## 决策 012 修订（2026-10-26）：时间线 epoch 来自统一业务时钟
+
+节点仍只来自真实事件（worker_started/page_opened/watch_started），但事件 at 与调度、截止监督全部使用独立北京时间（网络锚点+经过时长）；原定开放是参考时刻，重校产生的新锚点带新 generation，不修改历史 checkpoint。
