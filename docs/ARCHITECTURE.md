@@ -1,13 +1,17 @@
 # 架构与数据流
 
-服务器上一共三个 systemd 服务、一个 timer、九条 cron。所有脚本都跑在 `/root/tjise-activity-watch`，
+服务器上一共五个 systemd 服务（含两个机器人角色实例）、一个 timer、十一条 cron。所有脚本都跑在 `/root/tjise-activity-watch`，
 只有登录态文件放在 `/root/tjise-login`，机器人跑在 `/root/tjise-bot`。
+
+三个机器人角色对应三条权限边界：**自动推送只发消息、群查询只回答问题、owner 私聊才动手**。
+它们共用同一份「学校公开活动」数据，但不共享任何个人执行状态。
 
 ## 数据流
 
 ```
                  ┌──────────────────────────── cron ────────────────────────────┐
                  │ 07:00/10:30/16:30/21:30 run.py   */5 scan.py  */15 token_probe │
+                 │ */1 activity_watch.py（自己按 next_poll_at 控频）              │
                  └───────────────┬──────────────────────────┬───────────────────┘
                                  │                          │
         ┌────────────────────────▼───────────┐   ┌──────────▼──────────┐
@@ -18,31 +22,34 @@
                                  ▼                          ▼
              POST /dr/api/rjyHd/listActivity        auto_login.py（验证码 OCR，≤3 次）
                                  │                          │
-                    ┌────────────┴────────────┐             │
-                    │ 数据 + 去重（state.json）│             │
-                    └────────────┬────────────┘             │
-                                 ▼                          │
-            run.py ──► notify.py ──► 飞书群卡片 / owner 私聊卡片
-                                 │
-            scan.py（报名冲刺 / 晚归签到）┘
-                                 │
-            bot.js（长连接）── @查询 / 私聊按钮 ──► watchlist.py ──► watchlist_runner.py
-                                                                          │
-                                                            到点 systemd-run grab_signup.py
-                                                                          │
-                                                                    结果私聊回报
+                 ┌───────────────┴────────────────┐         │
+                 │ 公开活动 + 去重（state.json）  │         │
+                 │ 发现时刻/状态（activity_watch）│         │
+                 └───────┬───────────────┬────────┘         │
+                         ▼               ▼                  │
+    run.py ──► notify.py ──► 飞书群卡片 │                    │
+    activity_watch.py ──► run.send_watch_events ──► 群卡片   │
+    scan.py（临近提醒）─────────────────┘                    │
+                         │                                   │
+    bot.js（group_query，只读）── 群 @ 查询 ──► query.py ─────┘
+    bot.js（private_owner）── owner 私聊/按钮 ──► watchlist.py ──► watchlist_runner.py
+                                                                        │
+                                                          到点 systemd-run grab_signup.py
+                                                                        │
+                                                                  结果私聊回报
 ```
 
 ## 模块职责
 
 | 文件 | 职责 | 谁调用 |
 |------|------|--------|
-| `server/scripts/common.py` | 学校地址唯一来源、会话读写、原子写 | 所有脚本 |
-| `server/scripts/fetch.py` | 取 token → 分页拉活动 → 归一化 → 去重标记 | run/scan/remind/probe |
-| `server/scripts/run.py` | 一轮推送：抓取 → 卡片 → 群推送 → 私聊预报名卡 | cron |
-| `server/scripts/scan.py` | 每 5 分钟：报名冲刺、晚归签到提醒 | cron |
+| `server/scripts/common.py` | 学校地址唯一来源、会话读写、原子写、跨进程锁、业务北京时间、动态监测配置 | 所有脚本 |
+| `server/scripts/fetch.py` | 取 token → 分页拉活动 → 归一化（含公开字段白名单）→ 公开状态分类 | run/scan/query/activity_watch |
+| `server/scripts/activity_watch.py` | 公共活动动态发现：指纹、首次发现、状态转移、改期事件、固定节奏轮询、单飞锁、退避；首轮只建静默基线 | cron（每分钟唤醒） |
+| `server/scripts/run.py` | 一轮推送：抓取 → 卡片 → 群推送 → 私聊预报名卡；动态事件聚合通知入口 | cron / activity_watch |
+| `server/scripts/scan.py` | 每 5 分钟：开放前 10 分钟的临近提醒（只报时间） | cron |
 | `server/scripts/remind.py` | 07:05 当天活动私聊提醒 | cron |
-| `server/scripts/card.py` | 飞书卡片 JSON 构造（含按钮 value 编码） | run/scan/remind/bot |
+| `server/scripts/card.py` | 飞书卡片 JSON 构造：公共只读卡片 + 私聊预报名卡片，状态词唯一来源 | run/scan/remind/query/bot |
 | `server/scripts/render.py` | 文案排版（纯文本与卡片共用） | card/run/scan |
 | `server/scripts/notify.py` | 推送通道：webhook / 飞书应用、卡片、私聊、更新卡片 | 全部发送方 |
 | `server/scripts/token_probe.py` | token 有效性探针 + 连续失败告警 | cron |
@@ -56,7 +63,7 @@
 | `server/deploy/auto_login.py` | 失效时无人值守重登：验证码 OCR + 页面提交 + 原子写会话 | timer（5 分钟） |
 | `server/deploy/grab_signup.py` | 到点进详情页点「立即报名」，结果私聊回报 | watchlist_runner |
 | `server/deploy/set_credentials.py` | 交互写入 `credentials.json`（唯一放账号密码的地方） | 人工一次 |
-| `server/bot/bot.js` | 飞书长连接：@ 查询、私聊按钮回调 | systemd |
+| `server/bot/bot.js` | 飞书长连接：`BOT_ROLE=group_query` 群只读查询 / `BOT_ROLE=private_owner` owner 私聊动作 | systemd（两个实例） |
 
 ## 接口清单
 
@@ -71,19 +78,36 @@
 
 失效响应统一是 `{"code":4001,"message":"身份验证失败！"}`，`fetch.py` 见到即抛 `PermissionError`、退出码 2。
 
-## 去重机制
+## 去重机制与状态文件
 
-`data/state.json` 里三份状态，各有明确语义：
+### `data/state.json`（推送进度）
 
 | 键 | 语义 | 写入时机 |
 |----|------|----------|
 | `announced` | 已推送过的活动（id → 首次推送时间） | **推送成功后**才写 |
 | `last_push_ts` | 上一次成功推送的时间戳 | 同上 |
-| `reminded_signup` | 已提醒过「报名开始」的活动 | 提醒成功后 |
+| `reminded_signup` | 已提醒过「报名开始」的活动 | 临近提醒成功后 |
 
-`run.py` 用 `data/push.lock`（`LOCK_NONBLOCK`）在锁内先占位、推送成功再落盘；
+`run.py` 用 `data/.state.lock` 在锁内先占位、推送成功再落盘；
 进程崩溃或推送失败会回滚占位，所以「失败」不会被误记成「已推送」。
 `GUARD_MINUTES=60` 防同一时点重复跑。
+
+### `data/activity_watch.json`（动态发现）
+
+| 键 | 语义 |
+|----|------|
+| `initialized_at` | 首次成功抓取建立基线的时间；空串 = 还没建过基线 |
+| `baseline_initialized` | 基线是否已建立。为 `true` 后即使活动库被清空也不再重建基线，避免把之后的第一条新活动静默吞掉 |
+| `activities[id].discovered_at` | **本次发现时刻**（第一次在活动库里看到这条的时间） |
+| `activities[id].sign_start` | **原定开放时间**（学校字段，两者必须分开保存） |
+| `activities[id].first_status` | 首次发现时的状态（`open` 说明是一发现就已经开放） |
+| `activities[id].status` | 上次判定的状态（pending/open/closed/unknown） |
+| `activities[id].missing_rounds` | 连续几轮没抓到（满 3 轮才移除，不推断「已结束」） |
+| `pending_events` | 已生成、还没推送成功的事件；推成功才清空。**首轮建基线时恒为空**，所以升级上线不会补发历史活动 |
+
+三份状态互不覆盖：清空 `announced` 不会让动态监测重发历史事件，反之亦然。
+`activity_watch.py` 不读也不写 `watchlist.json`。首次成功抓取只建立基线、
+不发送通知的完整理由见 [TIMING_AND_DEDUP_ANALYSIS.md](TIMING_AND_DEDUP_ANALYSIS.md) §7.7。
 
 ## 推送节奏
 
@@ -93,7 +117,8 @@
 | 07:05 | 「今天要参加的活动」 | 仅 owner 私聊 |
 | 10:30 / 16:30 | 增量日报 | 群 |
 | 21:30 | 晚归签到提醒 + 已开放清单 | 群 |
-| 每 5 分钟 | 报名冲刺（≤10 分钟开放的活动） | 群 |
+| 每 5 分钟 | 临近提醒（≤10 分钟开放的活动，只报时间） | 群 |
+| 每分钟唤醒 | 动态监测：白天每 3 分钟、夜间每 10 分钟真正访问学校（固定节奏，不做临近加密） | 群（有事件才发） |
 | 每 15 分钟 | token 探针（不推送，仅告警） | 私聊 |
 
 请求量账本见 [TIMING_AND_DEDUP_ANALYSIS.md](TIMING_AND_DEDUP_ANALYSIS.md) §3.1。
@@ -106,5 +131,6 @@
 | `token_probe.py` | 15 分钟 | 连续 2 次 `http-error`/`bad-json` | 学校接口探测不通，多半是出网/带宽问题 |
 | `net_probe.py` | 5 分钟 | 连续 2 次取不到学校静态页 | 区分「整机断网」与「仅学校站点不通」 |
 | `auto_login.py` | 5 分钟（timer） | 3 次登录失败 | 自动登录失败，需人工介入 |
+| `activity_watch.py` | 每次成功抓取后 | 连续失败按 120/300/900 秒退避 | 只写 `data/activity_watch.log`，不往群里发技术错误 |
 
 告警一律优先私聊 owner，失败回落群通道；同一失效周期只发一次，恢复后自动清零。

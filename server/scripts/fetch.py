@@ -19,15 +19,32 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import (ACTIVITY_API, DATA, REFERER, REPORTS, USER_AGENT,  # noqa: E402
-                    load_config, load_session, load_state, update_state)
+                    business_now, load_config, load_session, load_state,
+                    update_state)
 
 # 接口一次能返回的上限远大于 100：实测 pageSize=500 会把当时全部 285 条一次给全
 # （0.21s，code=1），pageSize=1000 结果相同。原先按 100 翻页，一次全量要打 3 个请求，
 # 而 scan.py 每 5 分钟跑一轮，一天白多花近 600 次请求。取 500 留足增长空间。
 PAGE_SIZE = 500
 
+# 单次 HTTP 请求超时。默认 30 秒沿用原值；动态监测会传更小的值，
+# 让「单轮超时」在请求层就先兜住，而不是靠线程半途放弃。
+REQUEST_TIMEOUT = 30
 
-def call_api(token: str, page_num: int, page_size: int = PAGE_SIZE) -> dict:
+# 公开字段白名单：卡片、事件、日志只允许出现这些字段。
+# signed（我报没报）属于个人执行状态，公共链路一律不带。
+PUBLIC_FIELDS = ("id", "name", "type", "place", "sign_start", "sign_end",
+                 "act_start", "act_end", "checkin")
+
+STATUS_PENDING = "pending"
+STATUS_OPEN = "open"
+STATUS_CLOSED = "closed"
+STATUS_UNKNOWN = "unknown"
+STATUSES = (STATUS_PENDING, STATUS_OPEN, STATUS_CLOSED, STATUS_UNKNOWN)
+
+
+def call_api(token: str, page_num: int, page_size: int = PAGE_SIZE,
+             timeout: int = REQUEST_TIMEOUT) -> dict:
     payload = {"pageSize": page_size, "pageNum": page_num,
                "hdmc": "", "hdzt": None, "jssj": "", "kssj": ""}
     req = urllib.request.Request(
@@ -42,7 +59,7 @@ def call_api(token: str, page_num: int, page_size: int = PAGE_SIZE) -> dict:
             "Referer": REFERER,
         },
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8", "ignore"))
 
 
@@ -57,6 +74,22 @@ def parse_dt(s: str):
     return None
 
 
+def _checkin_text(raw: dict) -> str:
+    """签到时间（可空）。
+
+    列表接口只在部分场次返回签到字段（qdkssj/qdjssj，字段名与详情接口一致），
+    实测大多数活动没有。取不到就返回空串，卡片直接不显示这一行——
+    绝不为了「看起来完整」去猜一个默认签到时间。
+    """
+    start = str(raw.get("qdkssj") or "").strip()
+    end = str(raw.get("qdjssj") or "").strip()
+    if not start and not end:
+        return ""
+    if start and end:
+        return "签到 %s–%s" % (start[11:16] or start, end[11:16] or end)
+    return "签到 %s 起" % (start[11:16] if start else end[11:16])
+
+
 def normalize(raw: dict) -> dict:
     return {
         "id": raw.get("id", ""),
@@ -67,8 +100,62 @@ def normalize(raw: dict) -> dict:
         "sign_end": raw.get("bmjssj") or "",
         "act_start": raw.get("hdkssj") or "",
         "act_end": raw.get("hdjssj") or "",
+        "checkin": _checkin_text(raw),
         "signed": raw.get("bmzt") == 1,
     }
+
+
+def public_item(item: dict) -> dict:
+    """公开字段视图：去掉 signed 这类「我报没报」的个人字段。
+
+    群卡片、增量事件、日志都只允许拿这份数据。少一个字段就少一次
+    「把个人报名状态发到公共群」的机会，所以这里用白名单而不是黑名单。
+    """
+    out = {}
+    for key in PUBLIC_FIELDS:
+        value = item.get(key)
+        out[key] = "" if value is None else value
+    return out
+
+
+def item_status(item: dict, now: datetime) -> str:
+    """按业务北京时间把一场活动分成四种公开状态。
+
+    - closed：报名已截止，或活动已经开始（再报名没有意义）
+    - unknown：学校没给报名开放时间，无法判断能不能报
+    - pending：还没到报名开放时间
+    - open：已开放、且报名还没截止
+
+    边界条件先判 closed 再判 pending：一条活动如果 sign_start 在未来、
+    但 sign_end 已经过去（学校改期没改全），按「已经结束」处理，
+    不能让它永远挂在「待开放」里。
+    """
+    sign_end = parse_dt(item.get("sign_end"))
+    if sign_end and now > sign_end:
+        return STATUS_CLOSED
+    act_start = parse_dt(item.get("act_start"))
+    if act_start and act_start <= now:
+        return STATUS_CLOSED
+    sign_start = parse_dt(item.get("sign_start"))
+    if not sign_start:
+        return STATUS_UNKNOWN
+    if sign_start > now:
+        return STATUS_PENDING
+    return STATUS_OPEN
+
+
+def classify_public(items: list, now: datetime) -> list:
+    """给每条活动补上公开状态，不做性别、黑名单、个人报名过滤。
+
+    动态监测要的是「学校最近新发布了什么」，不是「推给谁」；
+    过滤是推送侧（classify）的事，这里一旦过滤就会漏掉别人还没报的活动。
+    """
+    out = []
+    for it in items:
+        row = public_item(it)
+        row["status"] = item_status(it, now)
+        out.append(row)
+    return out
 
 
 def gender_mismatch(name: str, gender: str) -> bool:
@@ -82,8 +169,8 @@ def gender_mismatch(name: str, gender: str) -> bool:
     return False
 
 
-def fetch_all(token: str) -> list:
-    first = call_api(token, 1)
+def fetch_all(token: str, timeout: int = REQUEST_TIMEOUT) -> list:
+    first = call_api(token, 1, timeout=timeout)
     if first.get("code") == 4001:
         raise PermissionError(first.get("message", "身份验证失败"))
     if first.get("code") != 1:
@@ -95,7 +182,7 @@ def fetch_all(token: str) -> list:
     page = 1
     while len(items) < total and page < 30:
         page += 1
-        more = call_api(token, page)
+        more = call_api(token, page, timeout=timeout)
         code = more.get("code")
         if code == 4001:
             raise PermissionError(more.get("message", "身份验证失败"))
@@ -115,10 +202,14 @@ def fetch_all(token: str) -> list:
 
 
 def classify(items: list, gender: str, blocklist: list, now: datetime):
-    """把活动分成「待开放报名」和「已开放报名」两组。
+    """把活动分成「待开放报名」和「报名已开放」两组。
 
     两组都只保留活动本身还没开始、报名还没截止的条目。
-    已开放报名那组是给「碰运气」用的——名额可能已满，但仍然可能捡漏。
+    已开放报名那组是给「看到就能自己去报」用的——名额可能已满，
+    但活动详情页仍然会如实告诉你还能不能报。
+
+    状态判定统一走 item_status()，避免公共事件和日报各写一套时间边界：
+    两套边界一旦漂移，群里就会出现「事件说已结束、日报说待开放」。
     """
     pending, open_now = [], []
     for it in items:
@@ -129,19 +220,10 @@ def classify(items: list, gender: str, blocklist: list, now: datetime):
         if any(w in it["name"] for w in blocklist):
             continue
 
-        sign_end = parse_dt(it["sign_end"])
-        if sign_end and now > sign_end:
-            continue                                  # 报名已截止
-        act_start = parse_dt(it["act_start"])
-        if act_start and act_start <= now:
-            continue                                  # 活动已开始，没意义了
-
-        sign_start = parse_dt(it["sign_start"])
-        if not sign_start:
-            continue
-        if sign_start > now:
+        status = item_status(it, now)
+        if status == STATUS_PENDING:
             pending.append(it)
-        else:
+        elif status == STATUS_OPEN:
             open_now.append(it)
 
     pending.sort(key=lambda x: x["sign_start"] or "")
@@ -187,14 +269,15 @@ def main() -> int:
         print("[x] 接口返回 0 条活动，可能页面结构或有权限变化。")
         return 3
 
-    now = datetime.now()
+    now = business_now()
     fcfg = cfg["filter"]
     gender = session.get("gender", "")
     blocklist = [w for w in fcfg.get("keyword_blocklist", []) if w]
 
     # 只保留「还没开放报名」的活动。
-    # 已经开始报名的不推——名额往往在开放后几分钟内就没了，这时候推已经晚了；
-    # 抢名额靠 scan.py 在开放前 10 分钟的冲刺提醒。
+    # 已经开始报名的不进「待开放」清单——那份清单是预告，不是可报名列表；
+    # 已开放的活动由动态监测和固定日报的「报名已开放」部分单独展示，
+    # 开放前 10 分钟另有一条只提醒时间的临近提醒（scan.py）。
     pending, open_now = classify(items, gender, blocklist, now)
 
     # 「新增」= 从未成功推送过。这里只读判断，真正的标记在 run.py 发送成功后写入，
@@ -223,7 +306,8 @@ def main() -> int:
           f"抓取时间：{now:%Y-%m-%d %H:%M}　"
           f"活动库 {len(items)} 条　待开放 {len(pending)} 条　新增 {new_count} 条",
           "",
-          "> 只列还没开放报名的活动。已开放报名的名额通常很快满，靠开放前 10 分钟的冲刺提醒。",
+          "> 只列还没开放报名的活动。已开放报名的按「报名已开放」展示，"
+          "能否报名与名额以活动详情页为准；开放前 10 分钟会单独提醒。",
           ""]
     if not pending:
         md.append("暂时没有待开放报名的活动。")

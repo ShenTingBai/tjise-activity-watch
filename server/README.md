@@ -10,16 +10,22 @@
 
 ## 它做什么
 
+三个机器人，三条权限边界：**自动推送只发消息、群查询只回答问题、owner 私聊才动手**。
+
 | 能力 | 触发 | 说明 |
 |------|------|------|
 | 定时日报 | cron 07:00 / 10:30 / 16:30 / 21:30 | 群卡片 + 给 owner 私发带「预报名」按钮的卡片 |
-| 群里 @ 查询 | 飞书群 @机器人 | 待开放 / 已开放 / 全部，卡片回复 |
+| 动态发现 | cron 每分钟唤醒，自行控频 | `activity_watch.py`：新发布 / 转开放 / 改期才发一条；不报名、不碰个人清单 |
+| 群里 @ 查询 | 飞书群 @机器人（`BOT_ROLE=group_query`） | 只读：待开放 / 报名已开放 / 全部，卡片回复，没有任何个人动作 |
 | 私人提醒 | cron 07:05 | 只发 owner 私聊：今天要参加的活动 |
-| 预报名 | 私聊卡片按钮 | 点一下排队，可再点取消；到点由 runner 拉起抢报名 |
-| 到点抢报名 | watchlist_runner（每分钟） | 开放时刻点「立即报名」，结果私聊回报 |
+| 预报名 | owner 私聊卡片按钮（`BOT_ROLE=private_owner`） | 点一下排队，可再点取消；群里点会被拒绝 |
+| 到点抢报名 | watchlist_runner（每分钟） | **只执行 owner 自己清单里的场次**，开放时刻点「立即报名」，结果私聊回报 |
 | 登录态续期 | `tjise-login` 守护进程 | 每 2 小时校验，成功即刷新会话文件 |
 | 失效重登 | `tjise-autologin.timer`（每 5 分钟） | 探针判失效才动作；用满 8h 主动换新；验证码 OCR（ddddocr 主 + Tesseract 兜底），最多 5 次、间隔 30 秒 |
 | 监控告警 | token 探针 / 出网自检 | 连续 2 次失败才私聊告警，同一周期只提醒一次 |
+
+> 公共群这条线是**只读**的：任何一张群卡片都没有预报名、立即报名或重试按钮。
+> 报名动作只存在于 owner 私聊（卡片按钮）与本机工具里。
 
 ## 目录
 
@@ -76,9 +82,13 @@ mkdir -p /root/tjise-activity-watch /root/tjise-bot /root/tjise-login
 python3 scripts/run.py --dry                 # 看这一轮会推什么，不发
 python3 scripts/run.py --force               # 忽略「今天已推过」，真推一次
 python3 scripts/query.py pending             # 命令行查待开放活动
+python3 scripts/activity_watch.py --dry-run  # 看动态监测这一轮会发什么，不发送不写状态
 python3 scripts/watchlist.py list            # 看预报名清单
 python3 scripts/selfcheck.py                 # 运行时自检
 python3 tests/test_endpoints.py              # 站点地址测试（离线）
+python3 -m unittest tests.test_activity_watch -v   # 动态发现边界测试（离线）
+node bot/test_bot_runtime.js                 # 机器人角色门禁测试（离线）
+BOT_ROLE=group_query node bot/bot.js --selftest    # 打印该角色允许/拒绝的事件类型
 ```
 
 ## 配置
@@ -104,6 +114,9 @@ python3 tests/test_endpoints.py              # 站点地址测试（离线）
 ## 边界
 
 - 只服务**本人账号**：不代他人报名、不做多账号批量报名、不占位。
+- **公共群只读**：群机器人只回答公开活动查询，不含个人报名状态，也不提供任何报名按钮。
+- **私聊只服务 owner**：`PRIVATE_OWNER_OPEN_ID` 那一个人；别人私聊只能得到「只对账号主人提供」的固定回答。
+- **动态发现不执行动作**：`activity_watch.py` 只读学校公开活动，永不调用报名入口，也不读写个人清单。
 - 日志不写账号、密码、验证码、token、姓名；`credentials.json` 与 `storage_state.json` 权限 600。
 - 只有你点了「预报名」的活动才会自动抢，不做无差别报名。
 

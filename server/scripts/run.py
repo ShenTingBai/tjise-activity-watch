@@ -18,9 +18,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import (MAX_LIST_ITEMS, REPORTS, ROOT, fmt_when, load_state,  # noqa: E402
-                    save_state, state_lock, update_state)
-from render import digest_items, digest_lines, trim                    # noqa: E402
+from common import (MAX_LIST_ITEMS, REPORTS, ROOT, business_now,  # noqa: E402
+                    fmt_when, load_state, save_state, state_lock, update_state)
+from render import (BULLET, INDENT, digest_items, digest_lines,  # noqa: E402
+                    trim)
+import card                                                       # noqa: E402
 
 # 同一个时间窗内如果已经推过，就不再重复推（本机 + 云端双保险时用）
 GUARD_MINUTES = 60
@@ -45,7 +47,7 @@ def build_message(summary: dict) -> str:
     lines = [head, ""]
     lines += digest_lines(digest_items(summary), datetime.now())
     lines.append("开放前 10 分钟会单独提醒。" if pending
-                 else "名额随时会满，看到合适的先报名。")
+                 else "报名已开放的活动，能否报名以活动详情页为准。")
     return trim(lines)
 
 
@@ -115,6 +117,88 @@ def send_grab_card(summary: dict) -> None:
         print("[!] 预报名卡片构造/发送失败：%s" % exc)
 
 
+def _watch_event_lines(event: dict, now: datetime) -> list:
+    """一条动态事件固定 3-4 行，与日报同一套版式，方便群里扫读。
+
+    第一行是状态词（待开放报名 / 报名已开放 / 报名已开放一段时间 /
+    报名已结束 / 报名时间待确认），不是「抢」之类的动作暗示——
+    这张卡片只转述学校公开信息，能不能报由活动详情页说了算。
+    """
+    out = ["%s %s　%s" % (BULLET, card.status_label(event, now),
+                          event.get("name") or "活动")]
+    meta = [event.get("type") or "其他"]
+    if event.get("place"):
+        meta.append(str(event["place"]))
+    out.append(INDENT + "｜".join(meta))
+
+    tail = []
+    if event.get("sign_start"):
+        tail.append("原定开放 %s" % fmt_when(event["sign_start"], now))
+    if event.get("kind") in ("new_open", "opened"):
+        # 「本次发现」和「原定开放」必须同时出现：只给一个时刻，
+        # 用户没法判断自己是刚赶上还是已经晚了半天。
+        tail.append("本次发现 %s" % fmt_when(event.get("discovered_at"), now))
+    if event.get("sign_end"):
+        tail.append("截止 %s" % fmt_when(event["sign_end"], now))
+    if event.get("act_start"):
+        tail.append("活动 %s" % fmt_when(event["act_start"], now))
+    if event.get("checkin"):
+        tail.append(str(event["checkin"]))
+    if tail:
+        out.append(INDENT + "｜".join(tail))
+
+    changed = event.get("changed_fields") or []
+    if changed:
+        from activity_watch import FIELD_LABELS
+        out.append(INDENT + "变化：" + "、".join(FIELD_LABELS.get(k, k) for k in changed))
+    out.append("")
+    return out
+
+
+def build_watch_message(events: list, now: datetime = None) -> str:
+    """动态事件的纯文本兜底。
+
+    和卡片共用同一份事件与同一个条数上限（MAX_LIST_ITEMS），两条通道
+    不可能出现「卡片 8 条、文字 6 条」——那会让人以为卡片漏推了。
+    """
+    now = now or business_now()
+    if not events:
+        return ""
+    lines = ["📢 活动动态 %d 项" % len(events), ""]
+    for event in events[:MAX_LIST_ITEMS]:
+        lines += _watch_event_lines(event, now)
+    if len(events) > MAX_LIST_ITEMS:
+        lines.append("……另有 %d 项" % (len(events) - MAX_LIST_ITEMS))
+    lines.append("只提供公开活动信息；报名请在活动详情页自行完成。")
+    return trim(lines)
+
+
+def send_watch_events(events: list, now: datetime = None):
+    """把一轮增量事件发到公共群（卡片优先，纯文本兜底）。
+
+    返回语义与 notify 保持一致：只有 True 才算发出去，False / None 都表示
+    没发成功，调用方据此保留待推送事件。
+
+    这里**不写** announced：动态监测的去重基线是它自己那份状态文件。
+    混写会把固定日报的「新增」标记搞乱——增量轮询每 3 分钟就会把
+    一大批活动记成「已推送」，日报里的 🆕 从此再也不出现。
+    """
+    now = now or business_now()
+    if not events:
+        return True
+    text = build_watch_message(events, now)
+
+    payload = None
+    try:
+        payload = card.public_event_card(events, now)
+    except Exception as exc:
+        print("[!] 活动动态卡片构造失败，改用纯文本：%s" % exc)
+
+    from notify import send as send_text
+    from notify import send_card
+    return send_card(payload, text) if payload else send_text(text)
+
+
 def main() -> int:
     dry = "--dry" in sys.argv
     force = "--force" in sys.argv      # 手动触发时忽略防重复窗口
@@ -179,7 +263,7 @@ def main() -> int:
                          if it.get("kind") == "open")
         rest_open = max(0, int(summary.get("open_count") or 0) - shown_open)
         if rest_open:
-            msg += ("\n\n另有 %d 项还能报名（名额可能已满），"
+            msg += ("\n\n另有 %d 项报名已开放，"
                     "@元小元 说「报名中」可看。" % rest_open)
     if late_checkin:
         msg += LATE_CHECKIN_NOTE

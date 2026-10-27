@@ -11,6 +11,11 @@
  * - 假 WSClient.start 只计数，不建立任何连接；
  * - 启动是异步 IIFE，必须等它跑完再断言，不能用 setImmediate 猜。
  *
+ * 角色：bot.js 一个进程只扮演一种角色，由 BOT_ROLE 显式声明。默认用
+ * private_owner（覆盖 owner 私聊那套用例），群查询用例显式传
+ * role: 'group_query'。两个角色各自拒绝对方的会话，是这组测试的重点：
+ * 群入口不能有个人动作，owner 入口不能回应群消息。
+ *
  * @author LiXinwen
  */
 const assert = require('node:assert/strict');
@@ -32,6 +37,9 @@ const TEXT_FIXTURE = '▸ 10-21 19:00 开放\n　测试活动\n　其他';
 
 const OWNER = 'ou_owner_fixture';
 const BOT = 'ou_bot_fixture';
+const OWNER_CHAT = 'oc_fixture';
+const GROUP_CHAT = 'oc_group_fixture';
+const STRANGER = 'ou_stranger_fixture';
 
 /** 临时根：优先用计划指定的 D:/@Temp 目录，非 Windows 或不可写时退回系统临时目录。 */
 function resolveRoot() {
@@ -60,8 +68,10 @@ function makeDir(label) {
 function createHarness(options = {}) {
   // options.dir 用于模拟「同一个部署目录里的下一个进程」
   const dir = options.dir || makeDir(options.label || 'case');
+  const role = options.role || 'private_owner';
   const state = {
     dir,
+    role,
     logs: [],
     replies: [],
     cards: [],
@@ -78,6 +88,7 @@ function createHarness(options = {}) {
 
   const fakeProcess = {
     env: Object.assign({
+      BOT_ROLE: role,
       FEISHU_APP_ID: 'cli_fixture',
       FEISHU_APP_SECRET: 'secret_fixture',
       BOT_OPEN_ID: BOT,
@@ -243,6 +254,36 @@ function messagePayload(overrides = {}) {
   return { sender, message };
 }
 
+/** 群消息：默认已 @ 机器人、内容是一次公开查询，发送者是群里的普通同学。 */
+function groupPayload(overrides = {}) {
+  return messagePayload({
+    message: Object.assign({
+      chat_id: GROUP_CHAT,
+      chat_type: 'group',
+      message_id: 'om_group_1',
+      mentions: [{ id: { open_id: BOT } }],
+      content: JSON.stringify({ text: '待报名' }),
+    }, overrides.message || {}),
+    sender: Object.assign({
+      sender_type: 'user',
+      sender_id: { open_id: STRANGER },
+    }, overrides.sender || {}),
+  });
+}
+
+/** 预报名按钮的 value：与 card._btn_value 同一套 base64url 编码（去掉 padding）。 */
+function grabValue(id = 'evt_fixture') {
+  const raw = JSON.stringify({ i: id, n: '测试活动', t: '2026-10-21 19:00:00', l: 100 });
+  return 'g:' + Buffer.from(raw, 'utf8').toString('base64').replace(/=+$/, '');
+}
+
+async function cardAction(state, payload) {
+  assert.ok(state.handlers, 'bot.js 没有注册 dispatcher');
+  const handler = state.handlers['card.action.trigger'];
+  assert.equal(typeof handler, 'function', 'card.action.trigger 未注册');
+  return handler(payload);
+}
+
 async function deliver(state, payload) {
   assert.ok(state.handlers, 'bot.js 没有注册 dispatcher');
   const handler = state.handlers['im.message.receive_v1'];
@@ -252,6 +293,11 @@ async function deliver(state, payload) {
 
 function replyTexts(state) {
   return state.replies.map((r) => JSON.parse(r.text).text);
+}
+
+function allReplyContent(state) {
+  const cardContent = state.cards.map((item) => item.card || '');
+  return replyTexts(state).concat(cardContent);
 }
 
 function mineCalls(state) {
@@ -301,7 +347,7 @@ test('陌生人私聊被拒绝且不查 mine', async () => {
     await deliver(state, messagePayload({ sender: { sender_id: { open_id: 'ou_stranger_fixture' } } }));
     assert.equal(mineCalls(state).length, 0, '陌生人不能触发 mine 查询');
     assert.equal(state.execCalls.length, 0, '被拒绝时不应跑任何查询');
-    const texts = replyTexts(state);
+    const texts = allReplyContent(state);
     assert.equal(texts.length, 1, '应该回复一条拒绝文案');
     assert.match(texts[0], /只对账号主人/, '拒绝文案必须是固定说明');
     assert.doesNotMatch(texts[0], /ou_|oc_|open_id/, '拒绝文案不能泄露任何 ID');
@@ -312,19 +358,22 @@ test('发送者 open_id 缺失时拒绝', async () => {
   await withHarness({}, async (state) => {
     await deliver(state, messagePayload({ sender: { sender_id: {} } }));
     assert.equal(mineCalls(state).length, 0);
-    assert.equal(replyTexts(state).length, 1);
+    assert.equal(allReplyContent(state).length, 1);
   });
 });
 
-test('未配置 owner 时私人查询关闭，公开查询仍可用', async () => {
+test('owner 角色缺少 PRIVATE_OWNER_OPEN_ID 时拒绝启动', async () => {
   await withHarness({ env: { PRIVATE_OWNER_OPEN_ID: '' } }, async (state) => {
-    await deliver(state, messagePayload());
-    assert.equal(mineCalls(state).length, 0, '没有 owner 配置时必须关闭 mine');
-    assert.equal(replyTexts(state).length, 1);
+    assert.deepEqual(state.exits, [1], '没有 owner 身份就不该起来');
+    assert.equal(state.startCalls, 0, '不能建立长连接');
+    assert.ok(state.logs.some((line) => line.includes('PRIVATE_OWNER_OPEN_ID')));
+  });
+});
 
-    // 公开查询不受影响
-    await deliver(state, messagePayload({
-      message: { message_id: 'om_fixture_public', content: JSON.stringify({ text: '报名中' }) },
+test('群查询角色在没有 owner 配置时公开查询仍可用', async () => {
+  await withHarness({ role: 'group_query', env: { PRIVATE_OWNER_OPEN_ID: '' } }, async (state) => {
+    await deliver(state, groupPayload({
+      message: { message_id: 'om_group_public', content: JSON.stringify({ text: '报名中' }) },
     }));
     assert.equal(state.execCalls.length, 1, '公开查询应当照常执行一次');
     assert.equal(state.execCalls[0].args[1], 'open', '公开查询应走 open 视图');
@@ -332,16 +381,157 @@ test('未配置 owner 时私人查询关闭，公开查询仍可用', async () =
   });
 });
 
-test('群聊里的「我的」不查 mine，也不引导私聊', async () => {
+test('缺少 BOT_ROLE 时拒绝启动', async () => {
+  await withHarness({ env: { BOT_ROLE: '' } }, async (state) => {
+    assert.deepEqual(state.exits, [1], '没有角色就必须退出');
+    assert.equal(state.startCalls, 0, '不能带着未声明的权限上线');
+    assert.ok(state.logs.some((line) => line.includes('BOT_ROLE')));
+  });
+});
+
+test('BOT_ROLE 非法时拒绝启动', async () => {
+  await withHarness({ env: { BOT_ROLE: 'both' } }, async (state) => {
+    assert.deepEqual(state.exits, [1]);
+    assert.equal(state.startCalls, 0);
+    assert.ok(state.logs.some((line) => line.includes('BOT_ROLE')));
+  });
+});
+
+test('群查询角色不回应私聊消息', async () => {
+  await withHarness({ role: 'group_query' }, async (state) => {
+    await deliver(state, messagePayload({ message: { message_id: 'om_p2p_in_group_bot' } }));
+    assert.equal(state.execCalls.length, 0, '群查询进程不该处理私聊');
+    assert.equal(state.replies.length + state.cards.length, 0, '也不该回复');
+    assert.ok(state.logs.some((line) => line.includes('chat type not allowed for role')));
+  });
+});
+
+test('owner 角色不回应群消息（即使 @ 了它）', async () => {
+  await withHarness({}, async (state) => {
+    await deliver(state, groupPayload({ message: { message_id: 'om_group_in_owner_bot' } }));
+    assert.equal(state.execCalls.length, 0, 'owner 进程不该读群消息');
+    assert.equal(state.replies.length + state.cards.length, 0);
+  });
+});
+
+test('群查询角色的查询按钮只返回公开卡片', async () => {
+  await withHarness({ role: 'group_query' }, async (state) => {
+    const res = await cardAction(state, {
+      action: { value: 'v:open' },
+      context: { open_chat_id: GROUP_CHAT },
+      operator: { open_id: STRANGER },
+    });
+    assert.ok(res.card && res.card.data, '群里的查询按钮应当刷新卡片');
+    assert.equal(state.execCalls.length, 1);
+    assert.equal(state.execCalls[0].args[1], 'open');
+  });
+});
+
+test('群查询角色没有 mine 视图', async () => {
+  await withHarness({ role: 'group_query' }, async (state) => {
+    const res = await cardAction(state, {
+      action: { value: 'v:mine' },
+      context: { open_chat_id: GROUP_CHAT },
+      operator: { open_id: STRANGER },
+    });
+    assert.equal(res.toast.type, 'info', 'mine 在群入口不是可用视图');
+    assert.equal(state.execCalls.length, 0, '群里不能查 mine');
+  });
+});
+
+test('群查询角色拒绝预报名按钮，且不跑子进程', async () => {
+  await withHarness({ role: 'group_query' }, async (state) => {
+    const res = await cardAction(state, {
+      action: { value: grabValue() },
+      context: { open_chat_id: GROUP_CHAT },
+      operator: { open_id: STRANGER },
+    });
+    assert.equal(res.toast.type, 'error', '群里点预报名必须被拒绝');
+    assert.match(res.toast.content, /私聊/, '拒绝文案要说清动作只在私聊开放');
+    assert.equal(state.execCalls.length, 0, '不能执行 watchlist add');
+  });
+});
+
+test('owner 角色允许 owner 私聊点预报名', async () => {
+  await withHarness({}, async (state) => {
+    // 先让 owner 私聊一次，把 chat_id 记下来（真实链路也是这么学的）
+    await deliver(state, messagePayload({
+      message: { message_id: 'om_owner_hello', content: JSON.stringify({ text: '帮助' }) },
+    }));
+    const res = await cardAction(state, {
+      action: { value: grabValue('evt_grab') },
+      context: { open_chat_id: OWNER_CHAT },
+      operator: { open_id: OWNER },
+    });
+    assert.equal(res.toast.type, 'success', '本人私聊点预报名应当成功');
+    const adds = state.execCalls.filter(
+      (c) => c.args[0] === 'scripts/watchlist.py' && c.args[1] === 'add');
+    assert.equal(adds.length, 1, '应当调用一次 watchlist add');
+    assert.ok(adds[0].args.includes('evt_grab'));
+  });
+});
+
+test('owner 角色拒绝非 owner 点预报名按钮', async () => {
   await withHarness({}, async (state) => {
     await deliver(state, messagePayload({
-      message: {
-        chat_type: 'group',
-        mentions: [{ id: { open_id: BOT } }],
-      },
+      message: { message_id: 'om_owner_hello', content: JSON.stringify({ text: '帮助' }) },
+    }));
+    const before = state.execCalls.length;
+    const res = await cardAction(state, {
+      action: { value: grabValue() },
+      context: { open_chat_id: OWNER_CHAT },
+      operator: { open_id: STRANGER },
+    });
+    assert.equal(res.toast.type, 'error');
+    assert.equal(state.execCalls.length, before, '被拒绝时不能执行任何子进程');
+  });
+});
+
+test('owner 角色拒绝在别的会话里点卡片', async () => {
+  await withHarness({}, async (state) => {
+    await deliver(state, messagePayload({
+      message: { message_id: 'om_owner_hello', content: JSON.stringify({ text: '帮助' }) },
+    }));
+    const before = state.execCalls.length;
+    const res = await cardAction(state, {
+      action: { value: 'v:open' },
+      context: { open_chat_id: 'oc_forwarded' },
+      operator: { open_id: OWNER },
+    });
+    assert.equal(res.toast.type, 'error', '卡片被转发到别的会话后不能放行');
+    assert.equal(state.execCalls.length, before);
+  });
+});
+
+test('owner 私聊记录不会被群查询进程覆盖', async () => {
+  const dir = makeDir('role-split');
+  try {
+    const owner = createHarness({ dir, role: 'private_owner' });
+    await waitForStartup(owner);
+    await deliver(owner, messagePayload());
+    const before = readUsers(owner);
+    assert.equal(before[OWNER].chat_type, 'p2p', '私聊后应记录 p2p');
+    assert.equal(before[OWNER].open_id, OWNER);
+
+    // 同一个部署目录里的另一个进程：群查询角色，不该动私聊收件人表
+    const group = createHarness({ dir, role: 'group_query' });
+    await waitForStartup(group);
+    await deliver(group, groupPayload({
+      message: { message_id: 'om_group_owner_check', content: JSON.stringify({ text: '待报名' }) },
+    }));
+    assert.deepEqual(readUsers(group), before, '群查询进程不应该写 users.json');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('群聊里的「我的」不查 mine，也不引导私聊', async () => {
+  await withHarness({ role: 'group_query' }, async (state) => {
+    await deliver(state, groupPayload({
+      message: { content: JSON.stringify({ text: '我的' }) },
     }));
     assert.equal(mineCalls(state).length, 0);
-    const texts = replyTexts(state);
+    const texts = allReplyContent(state);
     assert.equal(texts.length, 1);
     assert.match(texts[0], /不在群里展示/);
     assert.doesNotMatch(texts[0], /私聊/, '群聊拒绝文案不能引导私聊');
@@ -349,10 +539,8 @@ test('群聊里的「我的」不查 mine，也不引导私聊', async () => {
 });
 
 test('群里没 @ 机器人时不响应', async () => {
-  await withHarness({}, async (state) => {
-    await deliver(state, messagePayload({
-      message: { chat_type: 'group', mentions: [] },
-    }));
+  await withHarness({ role: 'group_query' }, async (state) => {
+    await deliver(state, groupPayload({ message: { mentions: [] } }));
     assert.equal(state.execCalls.length, 0, '未 @ 时不查');
     assert.equal(state.replies.length + state.cards.length, 0, '未 @ 时不回');
   });
@@ -364,27 +552,6 @@ test('非真人消息直接跳过', async () => {
     assert.equal(state.execCalls.length, 0);
     assert.equal(state.replies.length + state.cards.length, 0);
     assert.ok(state.logs.some((line) => line.includes('skip non-user message')));
-  });
-});
-
-test('owner 私聊记录不会被后续群消息覆盖', async () => {
-  await withHarness({}, async (state) => {
-    await deliver(state, messagePayload());
-    const before = readUsers(state);
-    assert.equal(before[OWNER].chat_type, 'p2p', '私聊后应记录 p2p');
-    assert.equal(before[OWNER].open_id, OWNER);
-
-    await deliver(state, messagePayload({
-      message: {
-        chat_type: 'group',
-        message_id: 'om_fixture_group',
-        mentions: [{ id: { open_id: BOT } }],
-        content: JSON.stringify({ text: '待报名' }),
-      },
-    }));
-    const after = readUsers(state);
-    assert.equal(after[OWNER].chat_type, 'p2p', '群消息不能把 p2p 记录覆盖成 group');
-    assert.equal(after[OWNER].chat_id, before[OWNER].chat_id);
   });
 });
 
@@ -411,8 +578,9 @@ test('类型查询走纯文本通道', async () => {
     }));
     assert.equal(state.execCalls.length, 1);
     assert.equal(state.execCalls[0].args[1], 'types');
-    assert.equal(state.cards.length, 0, 'types 视图只发文本');
-    assert.deepEqual(replyTexts(state), [TEXT_FIXTURE]);
+    assert.equal(state.cards.length, 1, '统一回复卡片承载 types 文本');
+    assert.equal(replyTexts(state).length, 0);
+    assert.match(state.cards[0].card, /测试活动|fixture|类型|实践/, '卡片应包含查询文本');
     assert.equal(typeof readStore(state)['om_fixture_1'], 'number', '文本发成功才落盘');
   });
 });
@@ -420,15 +588,15 @@ test('类型查询走纯文本通道', async () => {
 test('查询超时回复固定文案且不落盘，重投可以重试', async () => {
   await withHarness({ execMode: 'timeout' }, async (state) => {
     await deliver(state, messagePayload());
-    assert.equal(state.cards.length, 0, '超时不能发卡片');
-    assert.deepEqual(replyTexts(state), [QUERY_FAILED_TEXT], '只回固定失败文案');
+    assert.equal(allReplyContent(state).length, 1, '超时只应回复一条失败卡片');
+    assert.match(allReplyContent(state)[0], new RegExp(QUERY_FAILED_TEXT), '只回固定失败文案');
     assert.deepEqual(readStore(state), {}, '失败不能记为已处理');
     assert.ok(state.logs.some((line) => line.includes('query failed (card)')));
 
     // 飞书重投时状态已恢复，应当正常回答
     state.execMode = 'ok';
     await deliver(state, messagePayload());
-    assert.equal(state.cards.length, 1);
+    assert.equal(state.cards.length, 2, '失败提示和重投成功各有一张卡片');
     assert.equal(typeof readStore(state)['om_fixture_1'], 'number');
   });
 });
@@ -437,8 +605,8 @@ test('非零退出与空输出都算失败', async () => {
   for (const mode of ['nonzero', 'empty']) {
     await withHarness({ execMode: mode }, async (state) => {
       await deliver(state, messagePayload({ message: { message_id: 'om_' + mode } }));
-      assert.deepEqual(replyTexts(state), [QUERY_FAILED_TEXT], mode + ' 应当回失败文案');
-      assert.equal(state.cards.length, 0);
+      assert.equal(allReplyContent(state).length, 1, mode + ' 应当回失败文案');
+      assert.match(allReplyContent(state)[0], new RegExp(QUERY_FAILED_TEXT));
       assert.deepEqual(readStore(state), {}, mode + ' 不应落盘');
     });
   }
@@ -462,8 +630,8 @@ test('卡片 JSON 解析失败时退回文本查询', async () => {
       message: { content: JSON.stringify({ text: '待报名' }) },
     }));
     assert.equal(state.execCalls.length, 2, '卡片失败后应再跑一次文本查询');
-    assert.equal(state.cards.length, 0);
-    assert.deepEqual(replyTexts(state), [TEXT_FIXTURE]);
+    assert.equal(state.cards.length, 1, '文本兜底也统一套成回复卡片');
+    assert.match(state.cards[0].card, /测试活动|fixture/);
     assert.ok(state.logs.some((line) => line.includes('card json invalid')));
   });
 });

@@ -1,4 +1,4 @@
-# 飞书机器人：从零创建到能收消息
+# 飞书机器人：三个角色，三条权限边界
 
 这份文档解决服务器版**唯一一个不看文档就绝对跑不通**的环节：飞书这边要建什么、开什么权限、订阅什么事件、配置从哪抄。
 
@@ -6,36 +6,43 @@
 
 ---
 
-## 0. 先选路线：你只需要推送，还是要能对话？
+## 0. 先分清三个角色（这一步错了，后面全白配）
 
-系统用到两个完全不同的东西，很多人在这里就配错了：
+系统里有**三个**机器人，权限从「只能发消息」到「能替你报名」，必须分开建、分开跑：
 
-| | A. 群自定义机器人（webhook） | B. 企业自建应用（长连接） |
-|---|---|---|
-| 建在哪 | 群设置 → 群机器人 → 添加 | [开发者后台](https://open.feishu.cn/app) → 创建应用 |
-| 拿到什么 | 一个 `webhook_url` | `app_id` + `app_secret` |
-| 能做什么 | 只推送 | 推送 + 收消息 + 卡片按钮回调 + 私聊 |
-| 用在哪 | `config.notify.webhook_url`（群日报、冲刺提醒） | `config.notify.feishu_app`（私聊、@ 查询、预报名） |
-| 配置耗时 | 2 分钟 | 15-30 分钟（含管理员审核） |
+| | A. 自动推送 | B. 群查询 | C. owner 私聊 |
+|---|---|---|---|
+| 建在哪 | 群设置 → 群机器人 → 自定义机器人 | [开发者后台](https://open.feishu.cn/app) 创建自建应用 | 另一个自建应用（推荐）或同一个 |
+| 拿到什么 | 一个 `webhook_url` | `app_id` + `app_secret` | `app_id` + `app_secret` |
+| 进程角色 | 无进程（Webhook 直发） | `BOT_ROLE=group_query` | `BOT_ROLE=private_owner` |
+| 能做什么 | 只推送群消息 | 群里被 @ 后**只读查询** | 只服务本人：预报名、取消、到点报名 |
+| 不能做什么 | 收不到任何消息 | 任何报名动作、任何个人数据 | 回应群消息（群消息进来就被丢掉） |
+| 配置位置 | `config.notify.webhook_url` | systemd 环境变量 | `config.notify.feishu_app` + systemd 环境变量 |
+| 配置耗时 | 2 分钟 | 15-30 分钟（含管理员审核） | 15-30 分钟 |
 
-**只想要每天定时推送** → 走 A 就够，做完第 1 节即可。
-**想要 @ 查询、私聊提醒、预报名按钮** → A + B 都要做，B 是重点。
+三条边界是硬性的，不是建议：
+
+1. **公共群只读**：群里 @ 一下只能拿到「待开放报名 / 报名已开放 / 全部」三种查询结果，按钮也只有这三个视图。群里点「预报名」会被拒绝，文案是「群里只提供查询；报名动作只对本人私聊开放」。
+2. **私聊只认一个主人**：`PRIVATE_OWNER_OPEN_ID` 那一个人的私聊才可能触发预报名、取消、报名。别人私聊机器人问「我的报名」，得到的是固定拒绝——不透露任何个人数据，也不引导去别的通道。
+3. **角色必须显式声明**：`BOT_ROLE` 缺失或写错，进程**直接拒绝启动**。宁可少一个机器人在线，也不要出现「一个进程同时拥有两种权限」的隐式入口。
+
+> 一个飞书应用能不能同时跑两个角色？技术上可以，但建议拆成两个：同一个应用双开会互相抢事件（同一件事被两个进程各答一次），而且一旦有人把群机器人拉进新群，群入口就会继承应用的全部权限。
 
 ---
 
-## 1. 路线 A：群自定义机器人（只推送）
+## 1. 角色 A：群自定义机器人（只推送）
 
 1. 打开要接收推送的飞书群 → 右上角 `···` → **设置** → **群机器人** → **添加机器人**
 2. 搜索 **自定义机器人** → 添加
 3. 起个名字（如「校园活动推送」）→ 复制 **Webhook 地址**
 4. 若开启「签名校验」，把签名密钥也记下
-5. 填进配置：
+5. 填进 `server/config.json`：
 
 ```json
 {
   "notify": {
-    "channel": "飞书群",
-    "platform": "webhook",
+    "channel": "webhook",
+    "platform": "feishu",
     "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx",
     "secret": "开启了签名校验才填，否则留空"
   }
@@ -45,62 +52,74 @@
 6. 验证（在 `server/` 目录下）：
 
 ```bash
-python3 scripts/notify.py --test-text "机器人连通测试"
+python3 scripts/notify.py "机器人连通测试"
 ```
 
 群消息到了就说明 A 完成。**注意：自定义机器人收不到任何消息**，所以它做不了 @ 查询，也发不了私聊。
 
+> 动态监测（`scripts/activity_watch.py`）产生的「活动动态」卡片也走这条 Webhook，和日报、临近提醒同一条通道。
+
 ---
 
-## 2. 路线 B：企业自建应用（@ 查询 + 私聊 + 卡片按钮）
+## 2. 角色 B / C：两个自建应用
 
 ### 2.1 创建应用，拿凭据
 
 1. 打开 <https://open.feishu.cn/app> → **创建企业自建应用**
-2. 填名称（如「校园活动助手」）、描述、图标 → 创建
+2. 填名称（如「校园活动查询」「校园活动助手」）、描述、图标 → 创建
 3. 进入应用 → **凭证与基础信息** → 复制 **App ID**（`cli_` 开头）和 **App Secret**
 
-这两个值就是配置里的：
+两个应用分别填到不同位置——这是最容易混的地方：
 
-```json
-"feishu_app": { "app_id": "cli_xxxxxxxx", "app_secret": "xxxxxxxx" }
-```
+| 应用 | 凭据填到哪 | 谁用 |
+|---|---|---|
+| 群查询应用 | `tjise-bot-group.service` 的 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | `bot.js`（`BOT_ROLE=group_query`） |
+| owner 私聊应用 | `server/config.json` 的 `notify.feishu_app`，以及 `tjise-bot-owner.service` 的 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | `notify.py`（私聊卡片）+ `bot.js`（`BOT_ROLE=private_owner`） |
+
+为什么 owner 应用要额外写进 `config.json`：Python 侧只发**私聊**（预报名卡片、结果回报、卡片原地更新），它必须用「能和 owner 私聊的那个应用」的凭据，否则消息发出去对方收不到。
 
 > App Secret 等同密码。它只出现在 `server/config.json` 与 systemd 环境变量里，`config.json` 已在 `.gitignore` 中，**永远不要提交**。
 
 ### 2.2 开启机器人能力
 
-应用详情 → **添加应用能力** → 找到 **机器人** → 添加。
+两个应用都要：应用详情 → **添加应用能力** → 找到 **机器人** → 添加。
 
 不开这一步，应用发不出任何消息（`im.message.create` 会返回权限错误）。
 
-### 2.3 申请权限
+### 2.3 申请权限（按角色分开开）
 
-应用详情 → **权限管理**，搜索下面的权限码逐个开通：
+**群查询应用**（只读，权限最小）：
 
 | 权限码 | 控制台里的名字（大意） | 干什么用 | 不开会怎样 |
 |---|---|---|---|
-| `im:message:send_as_bot` | 以应用的身份发消息 | 推送日报、回卡片、发私聊 | 一条消息都发不出去 |
-| `im:message.p2p_msg:readonly` | 读取用户发给机器人的单聊消息 | 私聊里问「我的报名」 | 私聊发过去毫无反应 |
+| `im:message:send_as_bot` | 以应用的身份发消息 | 回查询卡片 | 一条消息都发不出去 |
 | `im:message.group_at_msg:readonly` | 接收群聊中 @ 机器人消息 | 群里 @ 查询 | 群里 @ 了也不理 |
-| `im:chat:readonly` | 获取群组信息 | 群聊会话信息（可选） | 一般不影响主流程 |
+
+**owner 私聊应用**（有个人动作）：
+
+| 权限码 | 控制台里的名字（大意） | 干什么用 | 不开会怎样 |
+|---|---|---|---|
+| `im:message:send_as_bot` | 以应用的身份发消息 | 私聊卡片、结果回报 | 一条消息都发不出去 |
+| `im:message.p2p_msg:readonly` | 读取用户发给机器人的单聊消息 | 私聊里问「我的报名」、点预报名 | 私聊发过去毫无反应 |
 
 补充说明：
 
 - **卡片按钮回调不需要单独开权限**，它是「回调配置」里的事件（见 2.4）。
 - **不需要**通讯录权限：机器人的 `open_id`、用户的 `open_id`、群的 `chat_id` 都能直接从消息事件里拿到，本项目不用通讯录接口。
+- 群查询应用**不要**开 `im:message.p2p_msg:readonly`：它没有私聊入口，开了只是多一份权限。
 
 ### 2.4 事件订阅：必须选「长连接」
 
 这是最容易踩错的一步。
 
-应用详情 → **事件与回调** → **事件配置**：
+两个应用都要：应用详情 → **事件与回调** → **事件配置**：
 
 1. 订阅方式选 **使用长连接接收事件**（不要选「将事件发送至开发者服务器」，那需要公网地址和验签）
 2. 添加事件：
-   - `im.message.receive_v1`（接收消息，@ 查询和私聊都靠它）
-3. 同一页面的 **回调配置** 里添加：
-   - `card.action.trigger`（卡片按钮点击，预报名按钮靠它）
+   - 群查询应用：`im.message.receive_v1`
+   - owner 私聊应用：`im.message.receive_v1`
+3. 同一页面的 **回调配置** 里添加（两个应用都加，群查询应用加了也只会收到查询按钮的回调）：
+   - `card.action.trigger`（卡片按钮点击）
 
 **为什么是长连接**：机器人进程在自己机器/服务器上主动连飞书，不需要公网 IP、不需要开 80/443、不需要 HTTPS 证书。代价是**机器人进程必须一直活着**——进程停了，消息就积压在那里，等进程起来才补投。
 
@@ -117,18 +136,17 @@ python3 scripts/notify.py --test-text "机器人连通测试"
 
 ### 2.6 把机器人拉进群、和它私聊
 
-1. 群里 → 设置 → 群机器人 → 添加 → 选择你的应用
-2. 私聊：在飞书搜索应用名，直接发一条消息（如 `帮助`）
+1. 群查询应用：群里 → 设置 → 群机器人 → 添加 → 选择它
+2. owner 私聊应用：在飞书搜索应用名，直接发一条消息（如 `帮助`）
 
-> 私聊必须先由**你本人**给机器人发过一条消息，机器人才能记住你的 `chat_id`（飞书的限制：应用不能凭空给陌生人发私聊）。
+> 私聊必须先由**你本人**给机器人发过一条消息，机器人才能记住你的 `chat_id`（飞书的限制：应用不能凭空给陌生人发私聊）。这也是 `PRIVATE_OWNER_OPEN_ID` 那套「先学后用」的原因。
 
 ### 2.7 收集 chat_id 与 open_id
 
-这一步不用调接口，机器人自己会记。**先让机器人跑起来**，然后：
+这一步不用调接口，机器人自己会记。**先让 owner 私聊实例跑起来**，然后：
 
-1. **私聊** 给机器人发任意一句话（例如 `帮助`）
-2. 群里 **@机器人** 发一句话（例如 `@校园活动助手 帮助`）
-3. 看文件 `server/bot/data/users.json`：
+1. **私聊** 给 owner 应用发任意一句话（例如 `帮助`）
+2. 看文件 `server/bot/data/users.json`：
 
 ```json
 {
@@ -143,48 +161,67 @@ python3 scripts/notify.py --test-text "机器人连通测试"
 
 | 要的值 | 从哪拿 | 填到哪 |
 |---|---|---|
-| 你的 `open_id`（`ou_` 开头） | `users.json` 的键 | systemd 的 `PRIVATE_OWNER_OPEN_ID` |
-| 你的私聊 `chat_id`（`oc_` 开头） | 同一条记录的 `chat_id` | `config.notify.private_chat_id` |
-| 群 `chat_id` | 机器人日志里 `query: ... | group | ...` 那行，或 `im/v1/chats` 接口 | 一般不用填，群推送走 webhook |
+| 你的 `open_id`（`ou_` 开头） | `users.json` 的键 | 两个 unit 的 `PRIVATE_OWNER_OPEN_ID` |
+| 你的私聊 `chat_id`（`oc_` 开头） | 同一条记录的 `chat_id` | `config.notify.private_chat_id`（可留空） |
+| 群 `chat_id` | 机器人日志里 `query: ... | group | ...` 那行 | 一般不用填，群推送走 webhook |
 
-> `users.json` 只记**私聊**记录（群消息会把同一个人覆盖成 `group`，导致私聊收件人丢失——这是代码里刻意做的保护）。所以群里 @ 完不会覆盖你的 p2p 记录。
+> `users.json` 只记**私聊**记录。现在群消息根本进不到 owner 实例（`BOT_ROLE` 门禁先挡掉），所以「群消息把 p2p 记录覆盖成 group」这条老问题从结构上消失了。
 
-### 2.8 填配置
+### 2.8 填配置与环境变量
 
 `server/config.json`：
 
 ```json
 {
   "notify": {
-    "channel": "飞书群",
+    "channel": "webhook",
     "platform": "feishu",
-    "webhook_url": "路线 A 的地址，没有就留空",
+    "webhook_url": "角色 A 的地址",
     "feishu_app": {
-      "app_id": "cli_xxxxxxxx",
+      "app_id": "cli_owner_xxxxxxxx",
       "app_secret": "xxxxxxxx"
     },
     "users_file": "bot/data/users.json",
     "private_chat_id": "oc_xxxxxxxx"
+  },
+  "watch": {
+    "enabled": true,
+    "day_seconds": 180,
+    "night_seconds": 600
   }
 }
 ```
 
-`tjise-bot.service` 的环境变量：
+`tjise-bot-group.service`：
 
 ```ini
-Environment=FEISHU_APP_ID=cli_xxxxxxxx
+Environment=BOT_ROLE=group_query
+Environment=FEISHU_APP_ID=cli_group_xxxxxxxx
+Environment=FEISHU_APP_SECRET=xxxxxxxx
+Environment=APP_DIR=/root/tjise-activity-watch
+```
+
+`tjise-bot-owner.service`：
+
+```ini
+Environment=BOT_ROLE=private_owner
+Environment=FEISHU_APP_ID=cli_owner_xxxxxxxx
 Environment=FEISHU_APP_SECRET=xxxxxxxx
 Environment=PRIVATE_OWNER_OPEN_ID=ou_xxxxxxxx
+Environment=APP_DIR=/root/tjise-activity-watch
 ```
 
 三项必须一致：`PRIVATE_OWNER_OPEN_ID` = `users.json` 的键 = 私聊记录里的 `open_id`；`private_chat_id` = 那条记录的 `chat_id`。
 
+> `BOT_ROLE` 缺少或写成别的值，进程会打印 `BOT_ROLE 缺失或非法` 并退出；`private_owner` 角色缺 `PRIVATE_OWNER_OPEN_ID` 同样拒绝启动——没有主人的私聊机器人等于「谁都能用的报名机器人」。
+
 ### 2.9 验证顺序（别跳步）
 
 ```bash
-# 1) 机器人进程起来了吗
-systemctl status tjise-bot --no-pager
-journalctl -u tjise-bot -n 20 --no-pager    # 应看到「长连接已启动 / ws client ready」
+# 1) 两个角色分别起来了吗
+systemctl status tjise-bot-group tjise-bot-owner --no-pager
+journalctl -u tjise-bot-owner -n 20 --no-pager   # 应看到「长连接已启动｜角色 private_owner」
+journalctl -u tjise-bot-group -n 20 --no-pager   # 应看到「长连接已启动｜角色 group_query」
 
 # 2) 应用凭据对吗
 cd /root/tjise-activity-watch && python3 scripts/selfcheck.py
@@ -194,8 +231,12 @@ PRIVATE_OWNER_OPEN_ID=ou_xxx python3 -c "
 import sys; sys.path.insert(0,'scripts'); import notify
 print(notify.send_private('私聊通道测试'))"
 
-# 4) 群里 @ 一下，看日志有没有 'query: help'
-journalctl -u tjise-bot -f
+# 4) 群里 @ 一下，看日志有没有 'role: group_query'
+journalctl -u tjise-bot-group -f
+
+# 5) 角色门禁自检（不建立长连接、不发消息）
+BOT_ROLE=group_query node bot.js --selftest
+BOT_ROLE=private_owner PRIVATE_OWNER_OPEN_ID=ou_xxx node bot.js --selftest
 ```
 
 ---
@@ -204,6 +245,10 @@ journalctl -u tjise-bot -f
 
 | 现象 | 错误码/日志 | 原因 | 处理 |
 |---|---|---|---|
+| 进程起来就退出 | `BOT_ROLE 缺失或非法` | systemd 单元没有 `BOT_ROLE`（多半是沿用了旧单实例单元） | 换成 `tjise-bot-group` / `tjise-bot-owner` 两个单元 |
+| 进程起来就退出 | `private_owner 角色缺少 PRIVATE_OWNER_OPEN_ID` | owner 实例没注入主人 open_id | 补环境变量，或改 drop-in |
+| 群里 @ 没反应 | 日志 `chat type not allowed for role private_owner group` | 群消息发到了 owner 实例 | 检查群机器人绑的是哪个应用；群查询要单独的实例 |
+| 群里点按钮提示「群里只提供查询」 | — | 群入口只读，这是设计 | 正常保护，不是 bug |
 | 私聊发不出去 | `99992351` | `open_id` 不是这个应用可见的用户，或填错 | 用 `users.json` 里的键，别手抄 |
 | 发消息报错 | `230002` / 机器人不在群 | 应用没被拉进群，或群 ID 错 | 群里重新添加机器人 |
 | 卡片发不出去 | `200671` | 卡片 JSON 不合法（如按钮 value 用了 dict） | 用 `card.py` 里的构造器，别手写 |
@@ -211,7 +256,7 @@ journalctl -u tjise-bot -f
 | 群里 @ 没反应 | 日志无 `query:` 行 | 没订阅 `im.message.receive_v1`，或订阅方式不是长连接 | 回 2.4 |
 | 群里 @ 没反应 | 日志有 `no-openid` | `/open-apis/bot/v3/info` 没取到 `BOT_OPEN_ID` | 检查应用是否已发布 |
 | 点了按钮没反应 | 无任何日志 | 没订阅 `card.action.trigger` | 回 2.4 的回调配置 |
-| 按钮点了提示「只对私聊里的本人有效」 | — | 点击人不是 `PRIVATE_OWNER_OPEN_ID`，或不在私聊 | 正常保护，不是 bug |
+| 按钮点了提示「只对私聊里的本人有效」 | — | 点击人不是 `PRIVATE_OWNER_OPEN_ID`，或卡片被转发到别的会话 | 正常保护，不是 bug |
 | 一切正常但私聊静默 | `[i] 未配置 PRIVATE_OWNER_OPEN_ID，私人提醒已关闭` | cron/systemd 没注入环境变量 | 见 CONFIG.md 环境变量表 |
 | token 类错误 | `19001` / `99991663` | 应用凭据错，或 tenant token 过期 | 检查 `app_secret`，换掉后重启服务 |
 
@@ -220,10 +265,15 @@ journalctl -u tjise-bot -f
 ## 4. 安全边界
 
 - **App Secret 不入库**：只在 `server/config.json` 与 systemd 环境变量里；`config.json` 必须 600。
-- **权限最小化**：只开第 2.3 节那 3-4 个权限，不要为了省事开通讯录、云文档等无关权限。
-- **机器人只服务本人**：私聊查询要靠 `PRIVATE_OWNER_OPEN_ID` 与点击人双重校验；别人私聊机器人问「我的报名」，会得到「只能本人查」。
+- **权限最小化**：群查询应用只开「发消息 + 群 @ 消息」两项；它没有私聊权限，也没有回调以外的任何写权限。
+- **机器人只服务本人**：预报名/报名动作要 `PRIVATE_OWNER_OPEN_ID` + 点击人 + 会话三重一致；别人私聊机器人问「我的报名」，会得到「只能本人查」。
+- **公共群不承诺任何动作**：群卡片只写活动状态与时间，不写「抢名额」「提交次数」「已报名」这类个人执行结论。
 - **应用不要对外发布到应用广场**：这是自用工具，公开发布会带来审核与合规负担。
 
 ---
+
+## 5. 一句话记住分工
+
+**自动推送只发消息，群查询只回答问题，owner 私聊才动手。** 三者共用的只有同一份学校公开活动数据。
 
 想在自己电脑上抢一两场、不想碰这些：用本机版 `local/`，它不需要创建应用，登录一次就能用。

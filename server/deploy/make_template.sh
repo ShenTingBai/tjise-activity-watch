@@ -45,32 +45,62 @@ cat > "$STAGE/config.json" <<'JSON'
   "notify": {
     "channel": "webhook",
     "platform": "feishu",
-    "webhook_url": "<你的飞书群机器人 Webhook 地址>",
+    "webhook_url": "<你的飞书群自定义机器人 Webhook 地址>",
     "secret": "",
     "feishu_app": {
-      "app_id": "<你的应用 App ID>",
-      "app_secret": "<你的应用 App Secret>"
+      "app_id": "<owner 私聊应用的 App ID>",
+      "app_secret": "<owner 私聊应用的 App Secret>"
     },
     "users_file": "/root/tjise-bot/data/users.json",
     "private_chat_id": ""
+  },
+  "watch": {
+    "enabled": true,
+    "day_seconds": 180,
+    "night_seconds": 600
   }
 }
 JSON
 
-cat > "$STAGE/deploy/tjise-bot.service" <<'UNIT'
+# 三个机器人，三个角色单元。**不再提供**没有 BOT_ROLE 的单服务模板：
+# 新版 bot.js 缺角色会直接拒绝启动，留一个「看起来能跑」的旧单元只会浪费时间。
+cat > "$STAGE/deploy/tjise-bot-group.service" <<'UNIT'
 [Unit]
-Description=Campus activity Feishu bot
+Description=Campus activity Feishu bot (group query, read-only)
 After=network.target
 
 [Service]
 Type=simple
 WorkingDirectory=/root/tjise-bot
-Environment=FEISHU_APP_ID=<你的 App ID>
-Environment=FEISHU_APP_SECRET=<你的 App Secret>
+# 群查询角色：只回答被 @ 的群消息，任何预报名/报名动作一律拒绝
+Environment=BOT_ROLE=group_query
+Environment=FEISHU_APP_ID=<群查询应用的 App ID>
+Environment=FEISHU_APP_SECRET=<群查询应用的 App Secret>
 Environment=APP_DIR=/root/tjise-activity-watch
+ExecStart=/usr/bin/node bot.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > "$STAGE/deploy/tjise-bot-owner.service" <<'UNIT'
+[Unit]
+Description=Campus activity Feishu bot (owner private chat)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/tjise-bot
+# owner 私聊角色：只处理 PRIVATE_OWNER_OPEN_ID 本人的私聊，才有预报名/报名动作
+Environment=BOT_ROLE=private_owner
+Environment=FEISHU_APP_ID=<owner 私聊应用的 App ID>
+Environment=FEISHU_APP_SECRET=<owner 私聊应用的 App Secret>
 # 私人查询的主人（飞书 open_id）。它和 BOT_OPEN_ID 是两个不同的值；
-# 不填 = 私人查询整体关闭。07:05 的私人提醒 cron 也要注入同一个值。
+# 不填 = 该实例直接拒绝启动（不会退化成「谁都能报名」）。
 Environment=PRIVATE_OWNER_OPEN_ID=<你的 open_id>
+Environment=APP_DIR=/root/tjise-activity-watch
 ExecStart=/usr/bin/node bot.js
 Restart=always
 RestartSec=5
@@ -99,8 +129,15 @@ cat > "$STAGE/README.md" <<'MD'
 ## 关键约定
 
 - 所有 `<占位符>` 都必须换成你自己的
-- 机器人服务要设 `PRIVATE_OWNER_OPEN_ID`（私人查询唯一的主人，和 `BOT_OPEN_ID` 不是一回事）；
+- **三个机器人，三条权限边界**：群自定义机器人（Webhook）只推送；
+  `tjise-bot-group`（`BOT_ROLE=group_query`）只读群查询；
+  `tjise-bot-owner`（`BOT_ROLE=private_owner`）只服务 owner 私聊。
+  旧版单实例 `tjise-bot.service` 没有 `BOT_ROLE`，新版会直接拒绝启动，别再沿用。
+- `PRIVATE_OWNER_OPEN_ID` 是「唯一的主人」，和 `BOT_OPEN_ID`（机器人自己）不是一回事；
   07:05 的私人提醒 cron 也要注入同一个值，否则会出现「群里不回答但每天照样私发」的半开状态
+- 动态监测 `scripts/activity_watch.py` 由 cron 每分钟唤醒，自己按
+  `data/activity_watch.json` 里的 `next_poll_at` 控频（白天 3 分钟 / 夜间 10 分钟，
+  不做临近开放加密）；它只读公开活动，不参与预报名与报名
 - 学校接口字段在本项目里是 `hdmc/bmkssj/hdjssj` 等，**换学校必须重新核对**；
   只换域名时设 `SCHOOL_ORIGIN` 即可，但 Python 与 Node 两边默认值要同时改
 - `config.json` 含密钥，权限设 600，不要提交到公开仓库
