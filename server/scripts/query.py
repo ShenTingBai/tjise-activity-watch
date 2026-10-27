@@ -2,7 +2,7 @@
 
 用法：
     python3 scripts/query.py                # 待开放报名（默认）
-    python3 scripts/query.py open           # 已开放报名（可以碰运气）
+    python3 scripts/query.py open           # 报名已开放
     python3 scripts/query.py all            # 两种都列
     python3 scripts/query.py types          # 有哪些活动类型
     python3 scripts/query.py pending --type 实践学习
@@ -37,12 +37,18 @@ def render_pending(items, now, type_filter=""):
 
 
 def render_open(items, now, type_filter=""):
-    title = "🎯 还能报名 %d 项" % len(items)
+    """公共查询的「报名已开放」列表（纯文本兜底）。
+
+    只陈述学校事实：报名已经开放、可以自己去学校页面看。不承诺名额、
+    不暗示机器人替你报名——名额与能否提交都由活动详情页说了算，
+    这条文案唯一该做的是把开放与截止时间摊开。
+    """
+    title = "📋 报名已开放 %d 项" % len(items)
     if type_filter:
         title += "（%s）" % type_filter
     if not items:
-        return title + "\n\n现在没有还能报名的活动。"
-    lines = [title, "", "名额可能已满，值得碰碰运气：", ""]
+        return title + "\n\n现在没有报名已开放的活动。"
+    lines = [title, "", "报名已开放，可前往学校页面查看并报名：", ""]
     lines += open_lines(items, now, MAX_ITEMS)
     return trim(lines)
 
