@@ -51,6 +51,8 @@
 | 六步可重播功能引导 | implemented（mock 截图见 [current-ui/](current-ui/)，真机验收待用户） | [009](decisions/009-replayable-product-tour.md) |
 | 独立可用单EXE | implemented（离线实包通过，用户真机待验收） | [010](decisions/010-standalone-exe-and-settings.md) |
 | 统一帮助、主题对齐与手动检查更新 | confirmed（代码已落地，技术与用户验收分列） | [011](decisions/011-unified-help-and-manual-update.md) · [规范](specs/assistance-panels.md) |
+| 真实报名结果回写与已报名冲突基线 | implemented（2026-10-27；见 [004](decisions/004-multi-activity-and-conflict.md)、`docs/UI_SPEC.md` §5.4） | [004](decisions/004-multi-activity-and-conflict.md) |
+| 详情签到/签退时间段与「同步中/待确认/无需」文案 | implemented（2026-10-27 真实字段契约） | [005](decisions/005-attendance-filters.md) |
 
 状态口径见 [decisions/README.md](decisions/README.md)：confirmed 只表示规则已敲定，
 implemented 另要求代码落地并有证据，proposed 一律放 [proposals/](proposals/)。

@@ -19,6 +19,23 @@
 
 `scripts/` 下的东西跑在 `/root/tjise-activity-watch/`，只负责「取数据、排版、推送」；`deploy/` 下的东西跑在 `/root/tjise-login/`，负责「维持登录态、到点报名」。两边目录不同、依赖不同（后者要 Chromium 和 Tesseract），混在一起容易装错机器。
 
+## 地址、权限与交付证据
+
+- **学校地址不再写死**：`auto_login.py` 从 `/root/tjise-activity-watch/scripts/common.py` 读取
+  `SCHOOL_ORIGIN` / `API_BASE` / `REFERER`，登录页、验证码接口、活动接口与 `Origin` 头都由它派生。
+  部署时必须同时铺 `server/scripts/`（`common.py` 缺失会直接报错退出，不会回退旧域名）。
+  换学校只改 `SCHOOL_ORIGIN` 环境变量或 common 默认值。
+- **重试次数以代码为准**：`MAX_ATTEMPTS = 5`、两次之间 `RETRY_DELAY_SEC = 30` 秒；
+  文档若写「3 次」是旧口径，按代码执行。
+- **凭证权限**：`credentials.json` 与 `storage_state.json` 必须 0600，只属于 root；
+  `session.json` / `state.json` 由 `atomic_write_text` 统一写 0600，并在替换前 fsync。
+- **依赖锁定**：`server/requirements.txt` 只是下限。只有在服务器上能读到
+  `pip freeze` 的真实版本时才生成 `requirements.lock` 并随 ZIP 分发；取不到就明确标
+  blocked，禁止用 `>=` 冒充锁定版本。
+- **发布包可核验**：`tools/release.py` 生成的 `tjise-server-<tag>.zip` 附带
+  `tjise-server-<tag>.manifest.json`（版本、完整 HEAD、来源是否干净、每个成员 SHA-256）。
+  上线前在本地跑 `verify_server_zip(tag)`，成员或哈希不符直接拒绝。
+
 ## 同步方式
 
 ```bash

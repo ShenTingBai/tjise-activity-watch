@@ -42,11 +42,13 @@ COMMON_PROBE = (
 )
 
 # 这些文件里出现学校域名就说明还有一处没跟着 SCHOOL_ORIGIN 走
-# （登录入口在 scripts/，一次性排查脚本挪到了 scripts/dev/）
+# （登录入口在 scripts/，一次性排查脚本挪到了 scripts/dev/，
+#  部署侧的 auto_login.py 曾经是唯一漏网者——P2-2 已纳入扫描）
 NO_HARDCODE_FILES = [
-    SCRIPTS / "login.py",
-    DEV_SCRIPTS / "explore.py",
-    DEV_SCRIPTS / "probe_login.py",
+    (SCRIPTS / "login.py", "HOME_URL"),
+    (DEV_SCRIPTS / "explore.py", "HOME_URL"),
+    (DEV_SCRIPTS / "probe_login.py", "HOME_URL"),
+    (ROOT / "deploy" / "auto_login.py", "SCHOOL_ORIGIN"),
 ]
 
 # (说明, 子进程里的 SCHOOL_ORIGIN, 期望的 origin)
@@ -101,11 +103,11 @@ def dynamic_checks() -> None:
 
 def static_checks() -> None:
     print("静态检查：入口脚本里不该再硬编码学校域名")
-    for path in NO_HARDCODE_FILES:
+    for path, marker in NO_HARDCODE_FILES:
         name = str(path.relative_to(ROOT)).replace("\\", "/")
         src = path.read_text(encoding="utf-8")
         check(f"{name} 无硬编码域名", DEFAULT_ORIGIN in src, False)
-        check(f"{name} 引用 HOME_URL", "HOME_URL" in src, True)
+        check(f"{name} 引用 {marker}", marker in src, True)
 
     refresh = (ROOT / "deploy" / "server_refresh.js").read_text(encoding="utf-8")
     # 只有默认值那一处允许出现学院域名，其余都应从 SCHOOL_ORIGIN 派生

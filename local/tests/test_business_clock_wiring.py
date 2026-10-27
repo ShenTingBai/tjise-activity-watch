@@ -335,7 +335,7 @@ class CliListWithoutClockTests(unittest.TestCase):
         for name in ("check_token", "fetch_activities", "log"):
             self._patched[name] = getattr(grab, name)
         grab.check_token = lambda budget=None: (True, "ok")
-        grab.fetch_activities = lambda budget=None: rows
+        grab.fetch_activities = lambda budget=None, with_details=False: rows
         grab.log = lambda msg: None
 
     def tearDown(self):

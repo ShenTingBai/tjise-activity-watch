@@ -124,9 +124,10 @@ class TriStateContractTests(unittest.TestCase):
                       "matchesFlag 必须在需要/无需分支排除 null（未知不得误判）")
         self.assertIn('if (filter === "all") return true;', js,
                       "matchesFilter 的「全部」必须保留未知项")
-        # 行内未知文案
-        self.assertIn("签到待说明", js, "行内必须显示「签到待说明」而不是留空")
-        self.assertIn("签退待说明", js, "行内必须显示「签退待说明」而不是留空")
+        # 行内未知文案：详情未回/已回但没数据分开说，绝不写成「无需」
+        self.assertIn("签到时间待确认", js, "行内必须显示「签到时间待确认」而不是留空")
+        self.assertIn("签退时间待确认", js, "行内必须显示「签退时间待确认」而不是留空")
+        self.assertIn("签到信息同步中", js, "详情未返回时必须显示「签到信息同步中」")
 
     def test_app_js_tri_state_normalize(self):
         js = read("ui/app.js")
@@ -884,12 +885,13 @@ class TourAndLifecycleContractTests(unittest.TestCase):
                       "help 载荷要带最新版本入口信息")
 
     def test_unknown_attendance_copy_stays(self):
-        """未知签到/签退仍显示「待说明」并被需要/无需筛选排除（回归防线）。"""
+        """未知签到/签退必须说清「同步中/待确认」，且仍被需要/无需筛选排除。"""
         js = read("ui/app.js")
         html = read("ui/index.html")
-        self.assertIn("签到待说明", js)
-        self.assertIn("签退待说明", js)
-        self.assertIn("签到/签退待说明", js)
+        self.assertIn("签到信息同步中", js)
+        self.assertIn("签到时间待确认", js)
+        self.assertIn("无需签到", js, "明确无需必须有独立文案，不能与未知混用")
+        self.assertNotIn("签到待说明", js, "旧「待说明」口径已细分，不得回退")
         for key in ("checkin", "checkout"):
             self.assertIn('id="%s"' % key, html)
 
@@ -3376,6 +3378,129 @@ checkUpdate(); timeout(); setTimeout = original;
 out.push({state:S.update.state,disabled:document.querySelector("#btn-update-check").disabled});
 """)
         self.assertEqual(res[0], {"state": "error", "disabled": False})
+
+
+class AttendanceDetailUiTests(unittest.TestCase):
+    """真实详情字段：时间段、无需、同步中、待确认四种展示与三态筛选。"""
+
+    def _row(self, **extra):
+        row = {"id": "a1", "name": "活动", "sign_start": "2026-10-26 09:00:00",
+               "sign_end": "2026-10-26 23:00:00", "act_start": "2026-10-27 19:00:00",
+               "act_end": "2026-10-27 21:00:00", "signed": False}
+        row.update(extra)
+        return row
+
+    def test_required_checkin_shows_real_time_range(self):
+        res = run_js(r"""
+window.onBackend.activities({ ok: true, items: [{
+  id: "a1", name: "活动", sign_start: "2026-10-26 09:00:00",
+  sign_end: "2026-10-26 23:00:00", act_start: "2026-10-27 19:00:00",
+  act_end: "2026-10-27 21:00:00", signed: false,
+  checkin_required: true, checkin_start: "2026-10-27 19:00:00",
+  checkin_end: "2026-10-27 19:40:00", checkout_required: false,
+  checkout_start: "", checkout_end: "", attendance_state: "ready" }] });
+out.push({ html: rowHtml(findItem("a1")) });
+""")
+        html = res[0]["html"]
+        self.assertIn("签到 19:00–19:40", html)
+        self.assertIn("无需签退", html)
+
+    def test_pending_detail_is_not_unknown_no_need(self):
+        res = run_js(r"""
+window.onBackend.activities({ ok: true, items: [{
+  id: "a1", name: "活动", sign_start: "2026-10-26 09:00:00",
+  sign_end: "2026-10-26 23:00:00", act_start: "2026-10-27 19:00:00",
+  act_end: "2026-10-27 21:00:00", signed: false,
+  checkin_required: null, checkout_required: null, attendance_state: "pending" }] });
+const pending = rowHtml(findItem("a1"));
+window.onBackend.activities({ ok: true, items: [{
+  id: "a1", name: "活动", sign_start: "2026-10-26 09:00:00",
+  sign_end: "2026-10-26 23:00:00", act_start: "2026-10-27 19:00:00",
+  act_end: "2026-10-27 21:00:00", signed: false,
+  checkin_required: null, checkout_required: null, attendance_state: "unknown" }] });
+const unknown = rowHtml(findItem("a1"));
+out.push({ pending: pending, unknown: unknown });
+""")
+        self.assertIn("签到信息同步中", res[0]["pending"])
+        self.assertNotIn("无需", res[0]["pending"])
+        self.assertIn("签到时间待确认", res[0]["unknown"])
+
+    def test_precise_filters_exclude_unknown_and_all_keeps_it(self):
+        res = run_js(r"""
+const rows = [
+  { id: "yes", name: "需要签到", sign_start: "2026-10-26 09:00:00",
+    sign_end: "2026-10-26 23:00:00", act_start: "2026-10-27 19:00:00",
+    act_end: "2026-10-27 21:00:00", signed: false, checkin_required: true,
+    checkout_required: true, attendance_state: "ready" },
+  { id: "no", name: "无需签到", sign_start: "2026-10-26 09:00:00",
+    sign_end: "2026-10-26 23:00:00", act_start: "2026-10-27 19:00:00",
+    act_end: "2026-10-27 21:00:00", signed: false, checkin_required: false,
+    checkout_required: false, attendance_state: "ready" },
+  { id: "unknown", name: "待确认", sign_start: "2026-10-26 09:00:00",
+    sign_end: "2026-10-26 23:00:00", act_start: "2026-10-27 19:00:00",
+    act_end: "2026-10-27 21:00:00", signed: false, checkin_required: null,
+    checkout_required: null, attendance_state: "pending" }
+];
+S.items = rows.map(normalize);
+S.byId = new Map(S.items.map((item) => [item.id, item]));
+const ids = (f) => { S.filter.checkin = f; return filtered().map((item) => item.id); };
+out.push({ yes: ids("yes"), no: ids("no"), all: ids("all") });
+""")
+        data = res[0]
+        self.assertEqual(data["yes"], ["yes"])
+        self.assertEqual(data["no"], ["no"])
+        self.assertEqual(sorted(data["all"]), ["no", "unknown", "yes"])
+
+
+class AriaAndPlaceTests(unittest.TestCase):
+    """D-10/D-11：chips 用 aria-pressed；地点可聚焦、Enter/Space 展开且不改选择。"""
+
+    def test_chips_use_aria_pressed_not_selected(self):
+        html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
+        app = (LOCAL / "ui" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('aria-pressed="true"', html)
+        self.assertNotIn('aria-selected="false">可报名', html,
+                         "button 上的 aria-selected 非法，必须用 aria-pressed")
+        self.assertIn('chip.setAttribute("aria-pressed"', app)
+        self.assertNotIn('chip.setAttribute("aria-selected"', app)
+
+    def test_place_has_role_and_expanded_state(self):
+        res = run_js(r"""
+window.onBackend.activities({ ok: true, items: [{
+  id: "a1", name: "活动", place: "实训楼 C305 三楼最里面那间",
+  sign_start: "2026-10-26 09:00:00", sign_end: "2026-10-26 23:00:00",
+  act_start: "2026-10-27 09:00:00", act_end: "2026-10-27 11:00:00",
+  signed: false }] });
+out.push({ html: rowHtml(findItem("a1")) });
+""")
+        html = res[0]["html"]
+        self.assertIn('role="button"', html)
+        self.assertIn('aria-expanded="false"', html)
+        self.assertIn('tabindex="0"', html)
+
+    def test_enter_expands_place_without_selection(self):
+        res = run_js(r"""
+const place = document.createElement("div");
+const handler = document.querySelector("#rows").listeners.keydown[0];
+const event = { target: { closest: (sel) => (sel === ".c-place" ? place : null) },
+                key: "Enter", defaultPrevented: false,
+                preventDefault() { this.defaultPrevented = true; } };
+handler(event);
+const opened = place.getAttribute("aria-expanded");
+handler(event);
+const closed = place.getAttribute("aria-expanded");
+const keyA = { target: { closest: (sel) => (sel === ".c-place" ? place : null) },
+               key: "a", preventDefault() { this.defaultPrevented = true; } };
+handler(keyA);
+out.push({ opened: opened, closed: closed, prevented: event.defaultPrevented,
+           selected: S.selected.size, afterA: place.getAttribute("aria-expanded") });
+""")
+        data = res[0]
+        self.assertEqual(data["opened"], "true")
+        self.assertEqual(data["closed"], "false")
+        self.assertTrue(data["prevented"], "Enter 必须阻止默认滚动/提交")
+        self.assertEqual(data["selected"], 0, "展开地点不得勾选活动")
+        self.assertEqual(data["afterA"], "false", "其他按键不改变展开状态")
 
 
 if __name__ == "__main__":

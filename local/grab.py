@@ -27,9 +27,12 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -208,6 +211,27 @@ def _post(path, payload=None, tok=None, timeout=None, budget=None):
         return {"code": -1, "message": type(exc).__name__}
 
 
+def _get(path, tok=None, timeout=None):
+    """只读 GET：详情接口没有任何写语义，失败返回 code=-1 由调用方降级。
+
+    不打印 URL 之外的任何请求头；token 只在内存里使用，绝不进日志。
+    """
+    req = urllib.request.Request(API + path, method="GET")
+    req.add_header("Accept", "application/json, text/plain, */*")
+    req.add_header("token", tok if tok is not None else token())
+    req.add_header("Referer", REFERER)
+    req.add_header("User-Agent", UA)
+    try:
+        resp = urllib.request.urlopen(req, timeout=15 if timeout is None else float(timeout))
+        try:
+            raw = resp.read().decode("utf-8", "replace")
+        finally:
+            resp.close()
+        return json.loads(raw)
+    except Exception as exc:
+        return {"code": -1, "message": type(exc).__name__}
+
+
 def clock_sample(timeout_s=6.0):
     """用 HTTP Date 做一次粗校时，返回结构化结论（不调整任何本地时间）。
 
@@ -309,9 +333,145 @@ CHECKOUT_FLAG_NAMES = (
     "isCheckOutRequired", "sfqt", "sfqtd", "qiantui", "签退",
 )
 
+# 时间字段别名：列表接口目前全为 null，详情接口才给出真实时间段。
+# 名字按「内部字段 → 学校字段」排列，列表若已有同等信息则优先使用。
+CHECKIN_START_NAMES = ("checkin_start", "qdkssj", "checkinStart")
+CHECKIN_END_NAMES = ("checkin_end", "qdjssj", "checkinEnd")
+CHECKOUT_START_NAMES = ("checkout_start", "qtkssj", "checkoutStart")
+CHECKOUT_END_NAMES = ("checkout_end", "qtjssj", "checkoutEnd")
 
-def fetch_activities(budget=None):
-    """分页拉活动列表；返回本地字段结构（字段名已换成好读的名字）。"""
+# 详情按活动 id 去重缓存：一次列表刷新只查一次，重复刷新直接复用；
+# 并发上限 4，避免把学校接口和本机连接数打满。
+DETAIL_CACHE: dict[str, dict] = {}
+DETAIL_CACHE_LOCK = threading.Lock()
+DETAIL_CONCURRENCY = 4
+DETAIL_TIMEOUT_S = 12.0
+
+
+def _activity_time(raw, names):
+    """读取学校时间文本；非法或缺失返回空串（不猜、不补当前时间）。"""
+    for name in names:
+        if name in raw and raw.get(name) not in (None, ""):
+            text = str(raw.get(name)).strip()
+            return text if school_epoch(text) is not None else ""
+    return ""
+
+
+def _detail_fields(raw):
+    """详情响应可能直接是 data，也可能包一层 {code,data}；两种都接受。"""
+    if not isinstance(raw, dict):
+        return {}
+    data = raw.get("data")
+    return data if isinstance(data, dict) else raw
+
+
+def parse_attendance_detail(raw):
+    """把 getInfo 的签到/签退字段归一化；未知保持 None，绝不猜成无需。
+
+    真实字段：sfxyqd/qdkssj/qdjssj（签到）、sfxyqt/qtkssj/qtjssj（签退）。
+    标记明确时优先；标记缺失但时间段存在才推导 true；两者都缺失 → None。
+    """
+    data = _detail_fields(raw)
+    flag_in = _tri_state(data.get("sfxyqd")) if "sfxyqd" in data else None
+    flag_out = _tri_state(data.get("sfxyqt")) if "sfxyqt" in data else None
+    in_start = _activity_time(data, CHECKIN_START_NAMES)
+    in_end = _activity_time(data, CHECKIN_END_NAMES)
+    out_start = _activity_time(data, CHECKOUT_START_NAMES)
+    out_end = _activity_time(data, CHECKOUT_END_NAMES)
+    if flag_in is None and (in_start or in_end):
+        flag_in = True
+    if flag_out is None and (out_start or out_end):
+        flag_out = True
+    if flag_in is False:
+        # 明确无需签到：时间段一并清空，避免界面出现「无需签到 19:00」
+        in_start = in_end = ""
+    if flag_out is False:
+        out_start = out_end = ""
+    return {
+        "checkin_required": flag_in,
+        "checkin_start": in_start,
+        "checkin_end": in_end,
+        "checkout_required": flag_out,
+        "checkout_start": out_start,
+        "checkout_end": out_end,
+    }
+
+
+def fetch_activity_detail(activity_id, timeout=DETAIL_TIMEOUT_S):
+    """只读详情；失败返回 None（调用方显示「同步中」，不把失败当成无需）。"""
+    aid = str(activity_id or "").strip()
+    if not aid:
+        return None
+    with DETAIL_CACHE_LOCK:
+        cached = DETAIL_CACHE.get(aid)
+    if cached is not None:
+        return dict(cached)
+    data = _get("/rjyHd/getInfo/" + urllib.parse.quote(aid, safe=""), timeout=timeout)
+    if not isinstance(data, dict) or str(data.get("code")) not in {"1", "1.0"}:
+        return None
+    parsed = parse_attendance_detail(data)
+    with DETAIL_CACHE_LOCK:
+        DETAIL_CACHE[aid] = parsed
+    return dict(parsed)
+
+
+def _apply_attendance(item, detail):
+    """列表字段优先、详情补充；详情失败保留 pending 状态供下次刷新重试。"""
+    list_has = any(item.get(key) not in (None, "")
+                   for key in ("checkin_required", "checkout_required",
+                               "checkin_start", "checkout_start"))
+    if detail is None:
+        item.setdefault("checkin_start", "")
+        item.setdefault("checkin_end", "")
+        item.setdefault("checkout_start", "")
+        item.setdefault("checkout_end", "")
+        item["attendance_source"] = "list" if list_has else "none"
+        item["attendance_state"] = "pending"
+        item["attendance_error"] = "detail_unavailable"
+        return item
+    for key, value in detail.items():
+        if key in ("checkin_required", "checkout_required"):
+            if item.get(key) is None:
+                item[key] = value
+        elif not item.get(key):
+            item[key] = value
+    item["attendance_source"] = "list" if list_has else "detail"
+    item["attendance_state"] = "ready"
+    item.pop("attendance_error", None)
+    return item
+
+
+def enrich_attendance_items(items, max_workers=DETAIL_CONCURRENCY):
+    """按活动 id 去重并发补详情；单场失败不影响整张列表。"""
+    rows = list(items or [])
+    ids = []
+    seen = set()
+    for item in rows:
+        aid = str(item.get("id") or "")
+        if aid and aid not in seen:
+            seen.add(aid)
+            ids.append(aid)
+    if not ids:
+        return rows
+    results: dict[str, dict | None] = {}
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as pool:
+            for aid, detail in zip(ids, pool.map(fetch_activity_detail, ids)):
+                results[aid] = detail
+    except Exception:
+        # 线程池不可用：全部按「同步中」处理，列表本身仍然可用
+        results = {}
+    for item in rows:
+        _apply_attendance(item, results.get(str(item.get("id") or "")))
+    return rows
+
+
+def fetch_activities(budget=None, with_details=False):
+    """分页拉活动列表；返回本地字段结构（字段名已换成好读的名字）。
+
+    with_details=True 时按活动 id 去重并发补 getInfo 的签到/签退时间段：
+    列表接口这三个字段当前全为 null，无法据此判断「无需」。
+    """
     out, page, total = [], 1, None
     while page <= 30:
         data = _post("/rjyHd/listActivity",
@@ -339,10 +499,19 @@ def fetch_activities(budget=None):
                 "signed": raw.get("bmzt") == 1,
                 "checkin_required": _activity_flag(raw, CHECKIN_FLAG_NAMES),
                 "checkout_required": _activity_flag(raw, CHECKOUT_FLAG_NAMES),
+                # 列表若已带回时间段就直接用；没有则留空，等详情补充
+                "checkin_start": _activity_time(raw, CHECKIN_START_NAMES),
+                "checkin_end": _activity_time(raw, CHECKIN_END_NAMES),
+                "checkout_start": _activity_time(raw, CHECKOUT_START_NAMES),
+                "checkout_end": _activity_time(raw, CHECKOUT_END_NAMES),
+                "attendance_source": "list",
+                "attendance_state": "unknown",
             })
         if not chunk or len(out) >= total:
             break
         page += 1
+    if with_details and out:
+        return enrich_attendance_items(out)
     return out
 
 
@@ -541,7 +710,9 @@ def cmd_list(args):
         print("    请先运行：python grab.py login（或点界面上的「登录」）")
         return 2
     try:
-        acts = fetch_activities()
+        # 图形界面（--json）需要签到/签退时间段：详情按 id 去重补全，失败单场降级；
+        # 纯文本列表只给人看活动名与状态，不为每场多发一次详情请求。
+        acts = fetch_activities(with_details=bool(getattr(args, "json", False)))
     except PermissionError as exc:
         print("[X] 登录态已失效（%s），请先运行 python grab.py login" % exc)
         return 2
@@ -597,6 +768,13 @@ def cmd_list(args):
                 "signed": bool(act["signed"]),
                 "checkin_required": act.get("checkin_required"),
                 "checkout_required": act.get("checkout_required"),
+                # 真实时间段与来源：界面据此显示「签到 19:00–19:40」或「同步中」
+                "checkin_start": act.get("checkin_start") or "",
+                "checkin_end": act.get("checkin_end") or "",
+                "checkout_start": act.get("checkout_start") or "",
+                "checkout_end": act.get("checkout_end") or "",
+                "attendance_source": act.get("attendance_source") or "none",
+                "attendance_state": act.get("attendance_state") or "unknown",
                 "state": "已报名" if act["signed"]
                          else ("待确认" if now is None else sign_state(act, now)),
             })
@@ -834,6 +1012,35 @@ def compute_retry_window(at_ts, sign_end_ts, retry_for_s, now=None):
 def attempts_allowed(attempts: int, max_attempts: int) -> bool:
     """max_attempts=0 表示不限；否则已发起的 signUp 次数必须小于上限才能再点。"""
     return max_attempts <= 0 or attempts < max_attempts
+
+
+# 提交失败后的下一轮节奏（RC-05）：学校回「人数已满」时，固定 2 秒连打
+# 只会在几秒内把次数烧光。2 秒起、1.5 倍退避、8 秒封顶，既给名额释放留时间，
+# 又不至于整段窗口只试一两次。等待仍受 RetryBudget（含 sign_end）钳制。
+SUBMIT_BACKOFF_START_S = 2.0
+SUBMIT_BACKOFF_MAX_S = 8.0
+SUBMIT_BACKOFF_FACTOR = 1.5
+
+
+def next_submit_gap(current: float) -> float:
+    """返回下一次提交前的等待秒数；输入非法时从起点重新起算。"""
+    try:
+        value = float(current)
+    except (TypeError, ValueError):
+        value = SUBMIT_BACKOFF_START_S
+    if value < SUBMIT_BACKOFF_START_S:
+        value = SUBMIT_BACKOFF_START_S
+    return min(SUBMIT_BACKOFF_MAX_S, value * SUBMIT_BACKOFF_FACTOR)
+
+
+def wait_before_next_submit(budget, gap: float) -> float:
+    """按剩余预算截断等待，返回下一轮间隔（不越过 sign_end / 时长上限）。"""
+    try:
+        remain = budget.remaining_s()
+    except ClockUnavailable:
+        raise
+    budget.sleep(min(max(0.0, float(gap)), max(0.0, remain)))
+    return next_submit_gap(gap)
 
 
 def _ts_text(ts) -> str:
@@ -1125,10 +1332,13 @@ def cmd_grab(args):
     start = entry_epoch if args.dry_run else at_ts - max(0.0, float(args.lead or 0.0))
     print("[i] 目标：%s" % display)
     original_at = target.get("original_at") or ""
-    if original_at and original_at != target["at"]:
-        print("[i] 原定开放：%s（已开放，本次按立即报名/抢名额执行）" % original_at)
-        print("[i] 本次执行：%s；提前 %.0f 秒打开页面；失败重试窗口 %.0f 秒"
-              % (target["at"], args.lead, args.window))
+    instant_mode = bool(original_at and original_at != target["at"])
+    if instant_mode:
+        # 已开放场次没有「提前打开」这一步：执行起点就是 worker 入口时刻，
+        # 不能说成「提前 100 秒打开页面」（RC-04）。
+        print("[i] 活动已开放，本次立即报名/抢名额（原定开放 %s）" % original_at)
+        print("[i] 本次执行：%s；失败重试窗口 %.0f 秒"
+              % (target["at"], args.window))
     else:
         print("[i] 报名开始：%s；提前 %.0f 秒打开页面；失败重试窗口 %.0f 秒"
               % (target["at"], args.lead, args.window))
@@ -1177,11 +1387,21 @@ def cmd_grab(args):
                     print("[i] 后台等待中，到点自动提交；想看着它点就加 --headed。")
                 wait_until(start, budget)
 
-                log("[i] 开始等待开放")
-                if business_now() < at_ts - POLL_LEAD:
-                    wait_until(at_ts - POLL_LEAD, budget)
+                # 只有真正还没到开放时刻才说「等待开放」；已开放场次（含原定
+                # 时刻已过的立即模式）直接进入盯按钮，文案与真实行为一致（RC-04）。
+                try:
+                    now_entry = business_now()
+                except ClockUnavailable:
+                    return _clock_stop()
+                if now_entry >= at_ts:
+                    log("[i] 活动已开放，立即报名/抢名额")
+                else:
+                    log("[i] 开始等待开放")
+                    if now_entry < at_ts - POLL_LEAD:
+                        wait_until(at_ts - POLL_LEAD, budget)
 
                 reload_gap = 2.0
+                submit_gap = SUBMIT_BACKOFF_START_S
                 last_reload = 0.0
                 stop_reason = ""
                 # 受控提交窗口：只承认「我方点击/确认期间」发出的 signUp 请求。
@@ -1350,6 +1570,12 @@ def cmd_grab(args):
                             break
                     if state["resp_ok"]:
                         break
+                    if budget.expired():
+                        break
+                    # 提交失败后的下一轮节奏：2 秒起、1.5 倍退避、8 秒封顶。
+                    # 等待受 RetryBudget 与 sign_end 共同钳制：窗口剩 1 秒就只等 1 秒。
+                    # 名额已满时不在这段等待里再点，避免 33 次高频连打（RC-05）。
+                    submit_gap = wait_before_next_submit(budget, submit_gap)
                     if budget.expired():
                         break
                     try:

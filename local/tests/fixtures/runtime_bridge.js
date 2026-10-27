@@ -161,7 +161,11 @@
     return [
       item("a-future", "人工智能前沿讲座", 5400, 9000, "学术报告厅 A101"),
       item("a-open", "校园歌手大赛决赛", -120, 7200, LONG_PLACE, { checkin_required: false }),
-      item("a-signed", "志愿服务分享会", -3600, 7200, "青年之家", { signed: true }),
+      /* 已报名活动占用的举办时段是真实冲突基线：它的举办时间必须在过去，
+       * 不能和待选活动重叠，否则每个「选一场」场景都会被正确的冲突门禁拦住。 */
+      item("a-signed", "志愿服务分享会", -3600, 7200, "青年之家",
+           { signed: true, act_start: schoolText(-2 * 86400),
+             act_end: schoolText(-2 * 86400 + 7200) }),
       item("a-closed", "已截止的历史活动", -86400, -7200, "老图书馆"),
       /* 学校确实没给开放时间：与「本机暂时没有可信现在」是两种不同情况 */
       { id: "a-nosign", name: "开放时间未公布", sign_start: "", sign_end: "",

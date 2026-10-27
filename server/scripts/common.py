@@ -2,6 +2,9 @@
 import contextlib
 import json
 import os
+import tempfile
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +17,11 @@ STATE_FILE = DATA / "state.json"
 SESSION_FILE = DATA / "session.json"
 CONFIG_FILE = ROOT / "config.json"
 LOCK_FILE = DATA / ".state.lock"
+
+# 进程内互斥：Windows 的 msvcrt 文件锁只到进程级，挡不住同进程多线程；
+# 这把锁 + 每路径重入深度让 file_lock 在两端都真正串行（见 file_lock）。
+_PROCESS_LOCK = threading.RLock()
+_HELD: dict[str, int] = {}
 
 # 学校站点 origin（含 scheme）。换学校时只改这一处，或在运行环境里设 SCHOOL_ORIGIN。
 # 默认值就是当前学校，所以不配置时行为和以前完全一致。
@@ -84,14 +92,106 @@ def load_session() -> dict:
     return _read_json(SESSION_FILE, {})
 
 
+def atomic_write_text(path: Path, text: str, mode: int = 0o600) -> None:
+    """同目录临时文件 + fsync + 原子替换，权限固定由调用方指定。
+
+    续期脚本/抓取脚本/人工 CLI 会并发读写同一份文件：先写临时文件再 replace，
+    读方永远看不到半截 JSON；fsync 保证进程被 kill 后不会留下 0 字节文件。
+    Windows 没有目录 fsync，跳过；临时文件权限在 replace 前设置，避免短暂 0644。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
+                                    dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.chmod(str(tmp), mode)
+        except OSError:
+            pass          # 某些文件系统不支持 POSIX 权限，不阻断写入
+        os.replace(str(tmp), str(path))
+        if os.name != "nt":
+            try:
+                dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            except OSError:
+                dir_fd = None
+            if dir_fd is not None:
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+@contextlib.contextmanager
+def file_lock(path=None):
+    """跨进程互斥（POSIX flock / Windows msvcrt），锁内只做本地读改写。
+
+    原来只有 state_lock 用 fcntl，Windows 静默降级为不加锁；watchlist 的
+    add/remove/mark 与 runner 并发时会互相覆盖（P2-3）。这里给出一个
+    两端都真正加锁的可复用实现，锁文件由调用方指定。
+
+    Windows 的 msvcrt 锁是**进程级**的：同进程两个线程各开一个句柄不会互相
+    阻塞。因此在 OS 锁外层再加一把进程内 RLock，并按路径记重入深度——同一
+    线程嵌套取同一把锁不再重复申请（POSIX 上会自我阻塞）。
+    """
+    lock_path = Path(path or LOCK_FILE)
+    key = str(lock_path.resolve())
+    with _PROCESS_LOCK:
+        depth = _HELD.get(key, 0)
+        _HELD[key] = depth + 1
+        handle = None
+        locked = False
+        try:
+            if depth == 0:
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                handle = open(str(lock_path), "a+b")
+                if os.name == "nt":
+                    import msvcrt
+                    while not locked:
+                        try:
+                            handle.seek(0)
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                            locked = True
+                        except OSError:
+                            # LK_LOCK 内部重试 10 次后抛错：继续等，直到拿到锁
+                            time.sleep(0.05)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    locked = True
+            yield
+        finally:
+            _HELD[key] = max(0, _HELD.get(key, 1) - 1)
+            if handle is not None:
+                try:
+                    if locked:
+                        if os.name == "nt":
+                            import msvcrt
+                            handle.seek(0)
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                        else:
+                            import fcntl
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    handle.close()
+
+
 def save_session(session: dict) -> None:
-    """原子写。续期脚本每 2 小时覆盖一次，抓取脚本随时可能在读，
+    """原子写（0600）。续期脚本每 2 小时覆盖一次，抓取脚本随时可能在读，
     直接 write_text 会让对方读到半截 JSON。"""
-    DATA.mkdir(parents=True, exist_ok=True)
-    tmp = SESSION_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(session, ensure_ascii=False, indent=2),
-                   encoding="utf-8")
-    os.replace(str(tmp), str(SESSION_FILE))
+    atomic_write_text(SESSION_FILE,
+                      json.dumps(session, ensure_ascii=False, indent=2),
+                      mode=0o600)
 
 
 def load_state() -> dict:
@@ -113,31 +213,16 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     """先写临时文件再原子替换，避免写一半被读到、留下损坏的 JSON。"""
-    DATA.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(str(tmp), str(STATE_FILE))
+    atomic_write_text(STATE_FILE,
+                      json.dumps(state, ensure_ascii=False, indent=2),
+                      mode=0o600)
 
 
 @contextlib.contextmanager
 def state_lock():
-    """跨进程互斥，防止 21:30 的清单和扫描同时读改写 state.json 互相覆盖。
-
-    Windows 上没有 fcntl，降级为不加锁（本地只在手动调试时跑，风险可接受）。
-    """
-    DATA.mkdir(parents=True, exist_ok=True)
-    try:
-        import fcntl
-    except ImportError:
+    """跨进程互斥，防止 21:30 的清单和扫描同时读改写 state.json 互相覆盖。"""
+    with file_lock(LOCK_FILE):
         yield
-        return
-
-    with open(str(LOCK_FILE), "w") as fh:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 def update_state(mutator):

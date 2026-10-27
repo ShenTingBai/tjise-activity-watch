@@ -276,11 +276,15 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .c-main .name { overflow: hidden; color: var(--ink); font-size: 14px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .c-main .sub { display: flex; column-gap: 12px; color: var(--ink-2); font-size: 12px; white-space: nowrap; overflow: hidden; }
 .c-main .sub .is-unknown { color: var(--warn); }
+/* 报名已确认但学校列表还在同步：用状态色而不是警告色，避免看起来像失败 */
+.c-main .sub .sync-note { color: var(--ok); }
 .c-place { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
   overflow: hidden; color: var(--ink-2); font-size: 13px; line-height: 1.35;
   white-space: normal; overflow-wrap: anywhere; }
 /* 键盘可到、聚焦即展开：完整地点不只能靠鼠标 title（R19） */
 .c-place:focus { -webkit-line-clamp: unset; overflow: visible; outline: 2px solid var(--amber); outline-offset: 1px; }
+/* Enter/Space 固定展开：失焦后仍保持，再按一次收起 */
+.c-place.is-open { -webkit-line-clamp: unset; overflow: visible; }
 .c-state { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; text-align: right; }
 .c-state .left { color: var(--blue); font-family: var(--font-num); font-size: 15px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .c-state .left.is-soon { color: var(--warn); font-weight: 700; }
@@ -365,14 +369,14 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
   .help-section-head .btn { max-width: 190px; height: auto; min-height: 30px; white-space: normal; }
 }
 
-/* 时钟/时间详情浮层 */
-.pop { position: fixed; z-index: 40; width: 340px; max-width: calc(100vw - 24px); max-height: calc(100vh - 96px); overflow: auto; padding: 16px 16px 12px; border-radius: 10px; background: var(--paper); color: var(--ink); box-shadow: 0 0 0 1px var(--line-2), 0 12px 28px rgba(18,21,19,.2); }
+/* 时钟/时间详情浮层：先给当前状态，再按需展开诊断信息。 */
+.pop { position: fixed; z-index: 40; width: 360px; max-width: calc(100vw - 24px); max-height: min(450px, calc(100vh - 76px)); overflow: auto; padding: 14px 15px 10px; border-radius: 10px; background: var(--paper); color: var(--ink); box-shadow: 0 0 0 1px var(--line-2), 0 12px 28px rgba(18,21,19,.2); }
 .pop-head { display: flex; align-items: center; justify-content: space-between; }
 .pop-head h2 { margin: 0; color: var(--ink-3); font-size: 13px; font-weight: 600; }
 .pop-head button { width: 26px; height: 26px; border: 0; border-radius: 4px; background: transparent; color: var(--ink-2); font-size: 18px; }
 .pop-head button:hover { background: var(--paper-2); }
-.pop-time { margin: 8px 0 0; font: 32px var(--font-num); font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
-.pop-date { margin: 1px 0 12px; color: var(--ink-3); font-size: 11px; }
+.pop-time { margin: 6px 0 0; font: 30px var(--font-num); font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.pop-date { margin: 1px 0 9px; color: var(--ink-3); font-size: 11px; }
 .status-line { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600; }
 .status-line .state-icon { width: 14px; height: 14px; display: inline-flex; color: var(--ok); }
 .status-line .state-icon svg { width: 14px; height: 14px; }
@@ -381,21 +385,24 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 #clock-pop[data-state="syncing"] .state-icon,
 #clock-pop[data-state="unavailable"] .state-icon { color: var(--warn); }
 #clock-pop[data-state="demo"] .state-icon { color: var(--ink-3); }
-.pop-explain { margin: 6px 0 12px; color: var(--ink-2); font-size: 12px; line-height: 1.7; }
+.pop-explain { margin: 5px 0 9px; color: var(--ink-2); font-size: 12px; line-height: 1.5; }
 .facts { margin: 0; padding-top: 10px; border-top: 1px solid var(--line); }
 .facts div { display: flex; justify-content: space-between; gap: 14px; padding: 4px 0; font-size: 12px; }
 .facts dt { color: var(--ink-3); }
 .facts dd { margin: 0; text-align: right; }
-.records { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
-.records summary { padding: 4px 0; color: var(--ink-3); font-size: 11px; cursor: pointer; }
+.pop-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; padding-top: 8px; }
+.pop-facts div { display: block; min-width: 0; padding: 5px 0; }
+.pop-facts dd { margin-top: 2px; overflow: hidden; color: var(--ink); text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.records { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line); }
+.records summary { padding: 3px 0; color: var(--ink-2); font-size: 12px; font-weight: 600; cursor: pointer; }
 .records p { margin: 4px 0; color: var(--ink-3); font-size: 11px; }
-.pop-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; }
+.pop-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line); }
 .pop-note { color: var(--ink-3); font-size: 10px; }
 .sync-btn { border: 1px solid var(--line-2); border-radius: 6px; background: var(--paper-2); padding: 6px 12px; color: var(--ink); font-size: 12px; }
 .sync-btn:hover:not(:disabled) { border-color: var(--ink-3); }
 .sync-btn:disabled { cursor: wait; opacity: .65; }
 .sync-btn:focus-visible { outline: 2px solid #4A6FBF; outline-offset: 2px; }
-.pop-feedback { margin: 8px 0 0; min-height: 16px; color: var(--warn); font-size: 11px; }
+.pop-feedback { margin: 6px 0 0; min-height: 0; color: var(--warn); font-size: 11px; }
 
 /* 六步可重播引导：中性遮罩 + 琥珀高亮框 + 说明卡片（Chrome 登录窗口等系统窗口只能文字说明，不能高亮） */
 .tour { position: fixed; inset: 0; z-index: 60; }

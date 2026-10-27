@@ -45,7 +45,7 @@
 |---|---|
 | 第一次打开、没登录过 | 明确引导点「登录」，不要显示一堆接口异常 |
 | 登录态还有 3 小时 | 胶囊显示剩余时间；剩不到 2 小时给橙色提醒 |
-| 列表几百条、能报的只有几条 | 默认筛「未报名」，支持关键词 + 状态 + 时间组合 |
+| 列表几百条、能报的只有几条 | 默认「全部」，支持关键词 + 状态 + 时间组合（默认不筛掉已报名，避免用户以为活动消失） |
 | 活动还没开放 | 「距开放」每秒走字，让人知道程序在等 |
 | 开放那一刻 | 忙碌态清晰（按钮禁用 + 进度感），别让人以为卡死 |
 | 抢成功 | 强反馈（绿）+ 提示去活动页确认一眼 |
@@ -153,6 +153,11 @@
 | `act_start` / `act_end` | string | 活动举办起止时间；完整本地日期时间，任一缺失或非法都不能通过计划校验 |
 | `signed` | bool | 是否已报名 |
 | `checkin_required` / `checkout_required` | bool \| null | 活动是否要求签到/签退；接口字段未识别或无法归一化时为 `null`，不得当作无需 |
+| `checkin_start` / `checkin_end` | string | 签到时间段（`YYYY-MM-DD HH:MM:SS`），来自详情接口 `qdkssj` / `qdjssj`；明确无需或未知时为空 |
+| `checkout_start` / `checkout_end` | string | 签退时间段（`qtkssj` / `qtjssj`）；明确无需或未知时为空 |
+| `attendance_source` | string | `list`（列表已带同等信息）/ `detail`（详情补充）/ `none`（都没有） |
+| `attendance_state` | string | `ready`（详情已返回）/ `pending`（详情请求失败，下次刷新重试）/ `unknown`（未查询） |
+| `sync_pending` | bool | 报名已确认但学校列表尚未同步；行内显示「报名已确认，学校列表正在同步」，该场不可再次选择 |
 | `state` | string | 后端给的中文状态：`未开放` / `开放中` / `已报名` |
 | `seconds_to_open` | int \| null | 距报名开放秒数；正数=未开放，≤0=已开放，null=时间未知 |
 
@@ -167,6 +172,16 @@
 活动可以同时满足“报名开放批次相同”和“举办时段不重叠”；前者允许并发，后者决定是否允许共存。
 二者不能互相替代。
 
+**报名结果的回写（2026-10-27 真实证据）**：任务终态为 `success` 或 `already_signed` 时，
+活动列表的 `signed`、已报名计数、分组、行状态、复选框与冲突基线必须同时更新；成功场次从
+下一次可执行选择集合移除，但任务卡、运行记录和计划结果保留。`unconfirmed`、`auth_unavailable`、
+`failed`、`canceled` 一律不写 `signed`。学校列表返回 `signed=false` 时，本地已确认的成功在
+120 秒同步窗口内保留并显示「报名已确认，学校列表正在同步」；超过窗口以学校列表为最终权威。
+
+**已报名活动是冲突基线**：`signed=true` 的全量活动与本次选择按 `act_start`/`act_end`
+半开区间比较，重叠阻止开始并提示「与已报名活动的举办时间重叠」；已报名活动缺少举办时段时
+保守阻止（`signed_activity_time_unknown`），不静默放行。报名开放时间 `sign_start` 不参与冲突。
+
 ### 5.5 本地偏好（`data/ui.json`）
 
 | 键 | 含义 |
@@ -175,7 +190,6 @@
 | `filter` | `{q, status:"all"\|"free"\|"signed", time:"all"\|"today"\|"week", sort:"open"\|"name", checkin:"all"\|"yes"\|"no", checkout:"all"\|"yes"\|"no"}` |
 | `log_open` | 日志是否展开 |
 | `headed` | 计划内任务是否显示浏览器窗口 |
-| `sound` | 计划结束时是否播放提示音 |
 | `retry_policy` | `{retry_for_s, max_attempts}`（§5.8） |
 | `tour_version` | 已完成/跳过的引导内容版本（§5.11） |
 | `tour_completed_at` / `tour_skipped_at` | 引导完成/跳过时刻（ISO 文本，立即落盘） |
@@ -186,9 +200,11 @@
 签到/签退是**活动要求字段**，不是「本人是否已签到/签退」；字段语义按下列条款验收，字段名与代码一致（`checkin_required` / `checkout_required`，取 `true` / `false` / `null`）：
 
 1. **归一化只认明确别名**：`grab.py` 的 `CHECKIN_FLAG_NAMES` / `CHECKOUT_FLAG_NAMES` 命中且可解析才归一化；字段缺失、空值、未知字符串、未确认别名一律 `null`。`null` 表示「接口还没说」，不得降级为无需。
+1a. **详情补充（2026-10-27 真实契约）**：列表接口的签到/签退字段全部为 `null`；`GET /rjyHd/getInfo/{activity_id}` 才返回 `sfxyqd` / `qdkssj` / `qdjssj` / `sfxyqt` / `qtkssj` / `qtjssj`。`grab.py` 在**单次列表加载内**按活动 id 去重、并发上限 4 读取详情（每次刷新是一次新的 list 进程，进程内缓存只保证同一场不重复请求）；列表原始字段若已含同等信息优先使用；单场详情失败只标 `attendance_state=pending`，不影响整张列表。`sfxyqd`/`sfxyqt` 明确为 0/1 时优先；标记缺失但时间段存在才推导 `true`；两者都缺失保持 `null`，不推导 `false`。明确无需时清空对应时间段，避免出现「无需签到 19:00」。
+1b. **缓存边界**：详情只读、不写学校，缓存按 `activity_id` 去重，不保存 token / cookie / storage_state；请求失败不缓存，下次刷新可重试。
 2. **三态透传**：`list --json`、`demo_items`、`activities` 事件载荷原样携带两项 tri-state 字段；报名请求参数不因此改变。
 3. **筛选语义**：`全部` 保留 `null`；`需要` 只显示 `true`；`无需` 只显示 `false`。`null` 在需要/无需两个筛选里都不可见，防止未知被误判。
-4. **行内文案**：`null` 显示「签到待说明」「签退待说明」（两项都未知时可合并为「签到/签退待说明」），有文字不只靠颜色。
+4. **行内文案**：需要签到/签退且有真实时间段时显示「签到 19:00–19:40」「签退 21:00–21:20」；明确无需显示「无需签到」「无需签退」；详情尚未返回显示「签到信息同步中」/「签退信息同步中」；详情已返回但确实没有数据才显示「签到时间待确认」/「签退时间待确认」。`null` 不得显示成「无需」，有文字不只靠颜色。
 5. **偏好保存**：`filter.checkin` / `filter.checkout` 随其他筛选一起保存到 `data/ui.json` 并在下次启动恢复。
 6. **筛选隔离**：筛选只影响时刻表可见行。全局「下一场开放」、已选计划集合、冲突校验（含跨开放批次）、任务执行与结果全部基于全量数据计算，不得被筛选结果污染。
 7. **静态回归**：`local/tests/test_ui_contract.py` 用 UTF-8 直读 `index.html` / `app.js` / `grab.py` / `app.py` 核对控件、字段名、unknown 保留规则、保存键与桥接方法名；改丢任何一条测试必须失败并指出缺口。
@@ -215,7 +231,7 @@
 2. **有效截止**：`effective_deadline = min(起算点 + retry_for_s, sign_end)`；未来活动从 `sign_start` 起算，已开放活动从启动计划起算；`retry_for_s=0`（直到截止）但 `sign_end` 缺失时回退 120 秒，绝不无限运行。
 3. **载荷链路**：`start_plan(items, headed, retry_policy)` → `TaskSpec(sign_end, retry_for_s, max_attempts)`（计划快照携带，重载不丢）→ worker `--sign-end / --retry-for / --max-attempts`；脏策略值在后端回落默认（120 / 0）。
 4. **attempts 计数**（验收条款）：只有真正发起 `signUp` 请求的点击计数（worker 输出「第 N 次提交：原因」行）；页面刷新、等待与 `is_joined` 查询一律不计，也不得把刷新/查询次数显示成提交次数。界面显示「第 N 次提交 / 最近原因 / 重试截止 / 报名截止」，不显示虚构的 N/N 总数。
-5. **可重试原因**：报名人数已满、未开放、无响应、网络错误按可重试处理，沿用 2→8 秒低频轮询继续，直到策略或截止；「登录失效」「已报名」「成功」是立即终态，不因重试策略继续刷新。
+5. **可重试原因**：报名人数已满、未开放、无响应、网络错误按可重试处理；**提交失败后的下一轮提交间隔从 2 秒起按 1.5 倍退避、8 秒封顶**（页面刷新同样 2→8 秒），每次等待受重试时长与 `sign_end` 共同钳制。「登录失效」「已报名」「成功」「结果未确认」是立即终态，不因重试策略继续点击。
 6. **终态与停止原因**：任务终态携带 `stop_reason ∈ {success, already_signed, login_invalid, max_attempts, retry_duration, sign_end, user_stopped, process_error}`；失败终态保留最后一个学校原话并追加到达的停止条件（达到最大提交次数 / 重试时长到了 / 报名已截止）。worker 结构化行 `[retry] attempts=N stop_reason=X retry_deadline=<epoch> sign_end=<epoch> last_reason=<原文>` 是 telemetry 唯一来源。
 7. **路线图**：时间线同时保留学校原定开放时间和本次实际执行时间：`本次启动`、`活动页已打开`、`盯按钮` 使用 worker 真实事件时间，`原定开放` 使用活动的 `sign_start`（已过去的时间显示完整日期），最后一站使用 telemetry 的真实重试截止（策略时长或报名截止截断后的值），不再用 `sign_start + 120` 冒充。
 
@@ -241,7 +257,7 @@
 7. **页面重载恢复**（验收条款）：`bootstrap()` 的 plan 快照 = 静态 TaskSpec + 动态 timeline detail；前端 `handlePlan`/`handleTask`/`ingestBootstrapPlan` 必须经 `mergeTask` 合并，快照缺运行时字段时不得用空值抹掉已收到的 checkpoint。恢复只回放显示，不重新提交。
 8. **统一有效截止**（验收条款）：路线图、任务卡、LED、终态文案共用 `effectiveRetryDeadline(task)`——telemetry 的 `retry_deadline` 优先；否则按 §5.14.8 的**稳定锚点**推导（有启动参考点时固定为 `max(原定开放, 启动参考点)`，跨过开放时刻不换锚；未知时显示待定），按任务 `retry_for_s`（0=直到 `sign_end`，缺 `sign_end` 回退 120 秒）推导，`sign_end` 永远截断。worker 侧重试起算点在打开页面前固定（`retry_anchor`）：已开放场次从 worker 启动时刻起算，**慢页面不得把用户配置的重试窗口整体后移**。登录到期检查同口径：未来场次比较「原定开放 + 重试窗口」，已开放场次比较「本次执行窗口」。
 9. **路线图只显示真实 checkpoint**（验收条款）：五个站点（本次启动 / 活动页已打开 / 盯按钮 / 原定开放 / 本次重试到）各自按真实 checkpoint 与时间判断 done/now/todo；前三个站点的站点时间只来自真实事件，未发生时显示「待启动 / 待打开 / 待发生」，**不得**用 `armedAt`、`open-100`、`open-5` 生成估算时间冒充事件时间；历史「原定开放」是参考节点（照常标 done），不得抢占当前执行节点；历史时间显示完整日期。
-10. **命令行双时间**：`grab.py grab` 对已开放场次同时输出「原定开放」（学校原定 `sign_start`）与「本次执行」（替换后的 `at`），并标明按立即报名/抢名额执行；重试逻辑、`sign_end` 硬截止与退出码契约（0/2/3/130）不变。
+10. **命令行双时间**：`grab.py grab` 对已开放场次同时输出「原定开放」（学校原定 `sign_start`）与「本次执行」（替换后的 `at`），并标明按立即报名/抢名额执行；**已开放场次不得再输出「提前 N 秒打开页面」或「开始等待开放」**，执行起点就是 worker 入口时刻。重试逻辑、`sign_end` 硬截止与退出码契约（0/2/3/130）不变。
 
 ### 5.11 应用生命周期提示与六步可重播引导（验收条款）
 
@@ -468,7 +484,9 @@
    「本批 1 场 · 每场独立结果」；任务卡只承载次数/最近原因，大屏承载当前阶段。
 6. **地点全文可达**（R19）：大屏 `#selected-meta` 的地点默认最多两行，可聚焦按钮
    原生支持 Enter/Space 展开与收起（`aria-expanded`），展开后行高随内容增长、
-   不覆盖下一条；表格 `.c-place` 同样两行 + 聚焦展开；不使用只靠 hover/title 的方式。
+   不覆盖下一条；表格 `.c-place` 同为 `role="button"` + `tabindex="0"` + `aria-expanded`，
+   聚焦或 Enter/Space 都能展开全文，且展开/点击地点**不得改变勾选或开始计划**；
+   不使用只靠 hover/title 的方式。
 7. **可复用的离线 QA 证据**：`tools/qa_runtime_reliability.py` 只绑定 `127.0.0.1`，
    原样读取 `local/ui` 四文件，只在 `app.js` 之前注入
    `local/tests/fixtures/runtime_bridge.js`；桥的未实现方法直接抛错，结果类方法必须
@@ -486,8 +504,10 @@
    要么落在视口可见带内、要么整页可纵向滚动；每行要能滚到定位后由真实指针点中
    （命中目标必须是本行复选框，不是表头或分组标题），点完选择确实改变。
    禁止靠截断大屏结论、线路/停止、重试策略或帮助入口来换空间。
+9. **筛选胶囊的选中语义**：`#chips` 的按钮用 `aria-pressed`（`true`/`false`）表达当前筛选，
+   不得使用 `aria-selected`（对 button 非法）；`paintChips` 每帧同步 `aria-pressed` 与计数。
 
-9. **完成态先提交、再发布；F5 恢复完整呈现**：`plan_done` 发出之前，必须在同一临界区
+10. **完成态先提交、再发布；F5 恢复完整呈现**：`plan_done` 发出之前，必须在同一临界区
    提交 `_plan` 清空、`_last_plan` 终态快照与 request_id 对账记录，再释放锁调用外部
    `_emit`——同步回调里读到的完成状态必须是已提交的（`Api._lock` 非可重入，回调里再取锁
    会当场死锁）。旧计划迟到的 `plan_done` 不得清空/覆盖后来计划与它的终态快照。
@@ -495,11 +515,11 @@
    `ingestBootstrapPlan` 对终态必须走与 `plan_done` 相同的呈现入口，恢复结果框、卡片
    次数与原因、LED、整屏边框、停止后动作与选择签名；恢复不置 busy、不重发
    `start_plan`、不重复写失败日志。同一 plan_id 已在屏上时也要推进状态，不能直接 return。
-10. **跨轮次幂等只约束副作用**：请求身份与刷新轮次分成两层。`markRoundApplied` 的键含
+11. **跨轮次幂等只约束副作用**：请求身份与刷新轮次分成两层。`markRoundApplied` 的键含
    「消费代次」，同一代次内同一终态只生效一次；新一轮刷新允许用同一个 owner 的既有结果
    收口（否则页面会干等 100/130 秒）。日志/提示等一次性副作用按 `branch:request:tag`
    幂等，重放不再刷屏；旧轮的 ack/catch 不得收口新一轮的 pending。
-11. **计划事件与终态快照按接纳代次归属**（P1，2026-10-26 归属轮）：Api 在最终接纳的同一
+12. **计划事件与终态快照按接纳代次归属**（P1，2026-10-26 归属轮）：Api 在最终接纳的同一
    临界区内维护单调递增 `plan_generation` 与「最近接纳计划」，**槽为空（`_plan=None`）
    不等同于「迟到回调属于最新计划」**——较新的计划可能已经结束；归属以代次判定，不随
    `_plan` 清空遗失。内部桥接事件与 bootstrap 快照携带 `plan_id`、`plan_generation` 与

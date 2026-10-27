@@ -310,6 +310,10 @@ class ApiBusyLockTests(unittest.TestCase):
             def snapshot(self):
                 return {"status": self._status}
 
+            def published_status(self):
+                # 生产 Api 的 busy 判定只读这个不可变状态，不取协调器锁
+                return self._status
+
         api._plan = FakePlan("running")
         self.assertTrue(api._is_busy_locked())
         login_res = api.login()
@@ -1309,6 +1313,323 @@ class StartAdmissionConcurrencyTests(unittest.TestCase):
         self.assertIsNone(api._plan)
         record = api.start_request_state("rid-g")
         self.assertEqual(record["state"], "rejected")
+
+
+class SignedBaselineValidationTests(unittest.TestCase):
+    """真实证据：学校列表 signed=true 的活动必须参与冲突基线。
+
+    冲突只看举办时段 act_start/act_end；报名开放时间不参与。
+    """
+
+    NOW = TestWallClock().now()
+
+    def test_selected_overlapping_signed_activity_is_rejected(self):
+        rows = [activity("new", "2026-10-23 10:00:00",
+                         "2099-01-03 19:00:00", "2099-01-03 20:00:00")]
+        signed = [dict(activity("old", "2026-10-20 10:00:00",
+                                "2099-01-03 18:30:00", "2099-01-03 19:30:00"),
+                       signed=True)]
+        result = validate_plan(rows, now=self.NOW, signed_activities=signed)
+        self.assertFalse(result["ok"])
+        kinds = [error["kind"] for error in result["errors"]]
+        self.assertIn("signed_activity_overlap", kinds)
+        overlap = next(item for item in result["errors"]
+                       if item["kind"] == "signed_activity_overlap")
+        self.assertEqual(overlap["activity_id"], "new")
+        self.assertEqual(overlap["signed"]["activity_id"], "old")
+        self.assertEqual(result["signed_overlaps"][0]["activity_id"], "new")
+
+    def test_signed_activity_without_window_blocks_plan(self):
+        rows = [activity("new", "2026-10-23 10:00:00",
+                         "2099-01-03 19:00:00", "2099-01-03 20:00:00")]
+        signed = [dict(activity("old", "2026-10-20 10:00:00", "", ""), signed=True)]
+        result = validate_plan(rows, now=self.NOW, signed_activities=signed)
+        self.assertFalse(result["ok"])
+        kinds = [error["kind"] for error in result["errors"]]
+        self.assertIn("signed_activity_time_unknown", kinds)
+        hit = next(item for item in result["errors"]
+                   if item["kind"] == "signed_activity_time_unknown")
+        self.assertEqual(hit["activity_id"], "old")
+
+    def test_signed_non_overlapping_keeps_plan_ok(self):
+        rows = [activity("new", "2026-10-23 10:00:00",
+                         "2099-01-03 19:00:00", "2099-01-03 20:00:00")]
+        signed = [dict(activity("old", "2026-10-20 10:00:00",
+                                "2099-01-03 17:00:00", "2099-01-03 18:00:00"),
+                       signed=True)]
+        result = validate_plan(rows, now=self.NOW, signed_activities=signed)
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["signed_overlaps"], [])
+
+    def test_touching_boundaries_are_not_overlap(self):
+        rows = [activity("new", "2026-10-23 10:00:00",
+                         "2099-01-03 19:00:00", "2099-01-03 20:00:00")]
+        signed = [dict(activity("old", "2026-10-20 10:00:00",
+                                "2099-01-03 18:00:00", "2099-01-03 19:00:00"),
+                       signed=True)]
+        result = validate_plan(rows, now=self.NOW, signed_activities=signed)
+        self.assertTrue(result["ok"], "首尾相接不是冲突")
+
+
+class SignedResultReconciliationTests(unittest.TestCase):
+    """报名成功必须在生产路径上回写缓存，并进入下一次开始的冲突基线。"""
+
+    def _api(self):
+        sys.path.insert(0, str(LOCAL))
+        try:
+            import app as local_app
+        except Exception as exc:
+            self.skipTest("无法导入 local/app.py：%s" % exc)
+        finally:
+            sys.path.pop(0)
+        self._app = local_app
+        return local_app.Api(clock=TestWallClock())
+
+    def _seed(self, api, aid="a1", start="2099-01-03 19:00:00",
+              end="2099-01-03 20:00:00", **override):
+        item = {"id": aid, "name": "活动" + aid,
+                "sign_start": "2026-10-23 10:00:00", "sign_end": "2099-01-02 09:00:00",
+                "act_start": start, "act_end": end, "signed": False}
+        item.update(override)
+        api._activities[aid] = dict(item)
+        api._last_check = {"result": "valid", "checked_at": 0.0}
+        return item
+
+    class _FakePlan:
+        """按生产顺序发事件的最小协调器：plan → task(终态) → plan_done。"""
+
+        def __init__(self, app, plan_id, specs, status, emit, on_start=None):
+            self.app = app
+            self.plan_id = plan_id
+            self.specs = list(specs)
+            self.emit = emit
+            self.status = status
+            self.started = False
+            self.on_start = on_start
+
+        def start(self):
+            self.started = True
+            if self.on_start:
+                self.on_start(self)
+            self.emit("plan", {"plan_id": self.plan_id, "status": "ready",
+                               "tasks": [spec.as_dict() for spec in self.specs]})
+            for index, spec in enumerate(self.specs):
+                self.emit("task", {"plan_id": self.plan_id,
+                                   "task_id": spec.task_id,
+                                   "activity_id": spec.activity_id,
+                                   "name": spec.name,
+                                   "status": self.status,
+                                   "attempts": index + 1})
+            self.emit("plan_done", {"plan_id": self.plan_id, "status": "completed",
+                                    "ok": True, "summary": {}})
+
+        def snapshot(self):
+            return {"plan_id": self.plan_id, "status": "completed", "tasks": [],
+                    "summary": {}}
+
+        def published_status(self):
+            return "completed" if self.started else "ready"
+
+        def stop(self):
+            return True
+
+        def cancel_task(self, task_id):
+            return True
+
+    def _run_plan(self, api, status="success"):
+        app = self._app
+        specs = [TaskSpec.from_activity(dict(item), "task-01-%s" % item["id"])
+                 for item in api._activities.values()]
+        holder = {}
+
+        def factory(plan_id, specs_arg, runner, emit, now=None):
+            holder["plan"] = self._FakePlan(app, plan_id, specs_arg, status, emit)
+            return holder["plan"]
+
+        with mock.patch.object(app, "PlanCoordinator", side_effect=factory):
+            res = api.start_plan([{"id": item["id"]} for item in api._activities.values()])
+        self.assertTrue(res["ok"], res)
+        return holder["plan"]
+
+    def test_success_marks_cache_signed_and_blocks_second_start(self):
+        api = self._api()
+        self._seed(api)
+        self._run_plan(api, "success")
+        cached = api._activities["a1"]
+        self.assertTrue(cached["signed"], "success 必须回写列表缓存")
+        self.assertEqual(cached["signed_source"], "plan_success")
+        with mock.patch.object(self._app, "PlanCoordinator") as coordinator:
+            res = api.start_plan([{"id": "a1", "signed": False}])
+        self.assertFalse(res["ok"], "已确认成功不得被前端旧快照重新接纳")
+        coordinator.assert_not_called()
+
+    def test_already_signed_marks_cache_signed(self):
+        api = self._api()
+        self._seed(api)
+        self._run_plan(api, "already_signed")
+        self.assertTrue(api._activities["a1"]["signed"])
+        self.assertEqual(api._activities["a1"]["signed_source"], "plan_already_signed")
+
+    def test_unconfirmed_and_failed_do_not_mark_signed(self):
+        for status in ("failed", "canceled"):
+            with self.subTest(status=status):
+                api = self._api()
+                self._seed(api)
+                self._run_plan(api, status)
+                self.assertFalse(api._activities["a1"]["signed"],
+                                 "%s 不得被猜成已报名" % status)
+
+    def test_list_refresh_keeps_confirmed_success_within_sync_window(self):
+        api = self._api()
+        self._seed(api)
+        self._run_plan(api, "success")
+        school = [dict(api._activities["a1"], signed=False)]
+        merged = api._merge_list_activities(school)
+        self.assertTrue(merged[0]["signed"], "同步窗口内不得撤销已确认成功")
+        self.assertTrue(merged[0].get("sync_pending"))
+        self.assertEqual(merged[0]["signed_source"], "plan_success")
+        api._activities["a1"]["signed_confirmed_at"] -= 10_000
+        stale = api._merge_list_activities([dict(school[0])])
+        self.assertFalse(stale[0]["signed"], "超过同步窗口以学校列表为最终权威")
+
+    def test_list_refresh_true_clears_sync_pending(self):
+        api = self._api()
+        self._seed(api)
+        self._run_plan(api, "success")
+        merged = api._merge_list_activities([dict(api._activities["a1"], signed=True)])
+        self.assertTrue(merged[0]["signed"])
+        self.assertFalse(merged[0].get("sync_pending"))
+
+    def test_start_plan_rejects_signed_baseline_overlap(self):
+        api = self._api()
+        self._seed(api, aid="old", start="2099-01-03 18:30:00",
+                   end="2099-01-03 19:30:00", signed=True)
+        self._seed(api, aid="new", start="2099-01-03 19:00:00",
+                   end="2099-01-03 20:00:00")
+        with mock.patch.object(self._app, "PlanCoordinator") as coordinator:
+            res = api.start_plan([{"id": "new"}])
+        self.assertFalse(res["ok"])
+        self.assertIn("signed_activity_overlap",
+                      [error.get("kind") for error in res["errors"]])
+        coordinator.assert_not_called()
+
+    def test_start_plan_rejects_signed_without_activity_window(self):
+        api = self._api()
+        self._seed(api, aid="old", start="", end="", signed=True)
+        self._seed(api, aid="new")
+        with mock.patch.object(self._app, "PlanCoordinator") as coordinator:
+            res = api.start_plan([{"id": "new"}])
+        self.assertFalse(res["ok"])
+        self.assertIn("signed_activity_time_unknown",
+                      [error.get("kind") for error in res["errors"]])
+        coordinator.assert_not_called()
+
+
+class CoordinatorLockOrderTests(unittest.TestCase):
+    """P2-1：Api 锁与协调器锁不得构成 AB-BA；emit 异常不得杀死任务线程。"""
+
+    def _api(self):
+        sys.path.insert(0, str(LOCAL))
+        try:
+            import app as local_app
+        except Exception as exc:
+            self.skipTest("无法导入 local/app.py：%s" % exc)
+        finally:
+            sys.path.pop(0)
+        self._app = local_app
+        return local_app.Api(clock=TestWallClock())
+
+    def _start_real_plan(self, api):
+        app = self._app
+        api._activities = {"a1": {
+            "id": "a1", "name": "活动", "sign_start": "2026-10-23 10:00:00",
+            "sign_end": "2099-01-02 09:00:00",
+            "act_start": "2099-01-03 09:00:00", "act_end": "2099-01-03 11:00:00",
+            "signed": False}}
+        api._last_check = {"result": "valid", "checked_at": 0.0}
+        holder = {}
+
+        def runner(spec, cancel_event, status):
+            # 先发一条进度事件，再返回成功：覆盖「任务事件与 bootstrap 并发」
+            status("submitting", {"attempts": 1})
+            return {"status": "success", "reason": "ok"}
+
+        def factory(plan_id, specs, runner_fn, emit, now=None):
+            coord = PlanCoordinator(plan_id, specs, runner_fn, emit, now=now)
+            holder["coord"] = coord
+            return coord
+
+        with mock.patch.object(app, "PlanCoordinator", side_effect=factory):
+            res = api.start_plan([{"id": "a1"}])
+        self.assertTrue(res["ok"], res)
+        return holder["coord"]
+
+    def test_bootstrap_and_task_events_close_within_one_second(self):
+        api = self._api()
+        coord = self._start_real_plan(api)
+        original = coord.snapshot
+        entered = threading.Event()
+        proceed = threading.Event()
+
+        def slow_snapshot():
+            # 旧实现：bootstrap 已持 Api 锁，正等协调器锁；
+            # 新实现：调用方不持 Api 锁，任务事件仍能发布。
+            entered.set()
+            proceed.wait(2.0)
+            return original()
+
+        coord.snapshot = slow_snapshot
+        boot_done = threading.Event()
+        boot_error = []
+
+        def boot():
+            try:
+                api.bootstrap()
+            except Exception as exc:      # noqa: BLE001 - 测试只关心是否收口
+                boot_error.append(exc)
+            finally:
+                boot_done.set()
+
+        thread = threading.Thread(target=boot, daemon=True)
+        thread.start()
+        self.assertTrue(entered.wait(1.0), "bootstrap 必须进入快照读取")
+        # 另一条路径：协调器持锁发 task 事件（会反向请求 Api 锁）
+        emitter = threading.Thread(
+            target=lambda: coord._set_state("task-01-a1", "submitting", {"attempts": 2}),
+            daemon=True)
+        emitter.start()
+        time.sleep(0.1)
+        proceed.set()
+        self.assertTrue(boot_done.wait(1.0),
+                        "bootstrap 与任务事件并发时必须在 1 秒内收口（P2-1）")
+        emitter.join(1.0)
+        self.assertFalse(emitter.is_alive(), "任务事件发布不得被 bootstrap 卡死")
+        self.assertFalse(boot_error)
+
+    def test_emit_exception_is_isolated_and_plan_done_still_sent(self):
+        events = []
+        errors = []
+
+        def emit(kind, payload):
+            if kind == "task" and not errors:
+                errors.append(kind)
+                raise RuntimeError("bridge down")
+            events.append(kind)
+
+        spec = TaskSpec.from_activity({
+            "id": "a1", "name": "活动", "sign_start": "2026-10-23 10:00:00",
+            "sign_end": "2099-01-02 09:00:00",
+            "act_start": "2099-01-03 09:00:00", "act_end": "2099-01-03 11:00:00"},
+            "task-01-a1", now=TestWallClock().now())
+        coord = PlanCoordinator("p1", [spec],
+                                lambda s, e, status: {"status": "success"},
+                                emit)
+        coord.start()
+        coord._thread.join(2.0)
+        self.assertFalse(coord._thread.is_alive(), "emit 异常不能卡住协调线程")
+        self.assertEqual(events.count("plan_done"), 1, "恰好一次 plan_done")
+        self.assertEqual(coord.published_status(), "completed")
+        self.assertTrue(coord._emit_errors, "回调异常必须留下可审阅记录")
 
 
 if __name__ == "__main__":

@@ -578,6 +578,75 @@ def _(s: Session):
     s.shot("running")
 
 
+@scenario("conflict-selection", "冲突选择端到端（G-01）", (1120, 800), "valid")
+def _(s: Session):
+    """真实指针勾选：时段重叠的第二场被拒绝，原选择保留，提示说的是举办时间。"""
+    s.wait("S.listState === 'ready'")
+    s.emit("activities", {"ok": True, "items": [
+        {"id": "qa-a", "name": "冲突活动甲", "place": "实训楼 A301",
+         "sign_start": "2026-10-26 09:00:00", "sign_end": "2026-10-28 23:00:00",
+         "act_start": "2026-10-28 19:00:00", "act_end": "2026-10-28 20:00:00",
+         "signed": False, "checkin_required": True,
+         "checkin_start": "2026-10-28 19:00:00", "checkin_end": "2026-10-28 19:20:00",
+         "checkout_required": False, "attendance_state": "ready"},
+        {"id": "qa-b", "name": "冲突活动乙", "place": "实训楼 A302",
+         "sign_start": "2026-10-26 09:00:00", "sign_end": "2026-10-28 23:00:00",
+         "act_start": "2026-10-28 19:30:00", "act_end": "2026-10-28 21:00:00",
+         "signed": False, "checkin_required": None, "checkout_required": None,
+         "attendance_state": "pending"},
+        {"id": "qa-c", "name": "不冲突活动", "place": "实训楼 B204",
+         "sign_start": "2026-10-26 09:00:00", "sign_end": "2026-10-28 23:00:00",
+         "act_start": "2026-10-29 09:00:00", "act_end": "2026-10-29 11:00:00",
+         "signed": False, "checkin_required": False, "checkout_required": False,
+         "attendance_state": "ready"},
+    ]})
+    s.wait("S.items.length === 3")
+    s.pointer_pick("qa-a")
+    s.check("首场可开始", not s.page.locator("#btn-plan").is_disabled())
+    s.pointer("input.row-check[data-id=\"qa-b\"]", "pick:qa-b")
+    s.check("冲突场次未被选中", not s.js("S.selected.has('qa-b')"))
+    s.check("原选择保留", s.js("S.selected.has('qa-a')"))
+    s.check_contains("#plan-conflicts", "活动时间重叠")
+    s.check_contains("#plan-conflicts", "已保留原选择")
+    s.check_not_contains("#plan-conflicts", "报名开放")
+    s.shot("conflict-rejected")
+    s.pointer_pick("qa-c")
+    s.check("不冲突场次可选", s.js("S.selected.has('qa-c')"))
+    s.check("两场都在计划里", s.js("S.selected.size === 2"))
+    s.check("不冲突时开始可用", not s.page.locator("#btn-plan").is_disabled())
+    s.shot("conflict-resolved")
+
+
+@scenario("update-five-states", "更新检查五态端到端（G-02）", (1120, 800), "valid")
+def _(s: Session):
+    """检查更新走真实按钮与真实事件：current/available/preview/unavailable/error。"""
+    s.click("#btn-help")
+    s.wait("document.querySelector('#help').open")
+    s.click("#btn-update-check")
+    s.wait("S.update.state === 'current'")
+    s.check_contains("#update-status", "当前为最新正式版")
+    s.check("检查后按钮回到可点", not s.page.locator("#btn-update-check").is_disabled())
+    request_id = s.js("S.update.requestId")
+    s.shot("update-current")
+    cases = [
+        ("available", "发现新版本 1.1.2", "1.1.2", "检查更新"),
+        ("preview", "当前为预览版本，最新正式版 1.1.2", "1.1.2", "检查更新"),
+        ("unavailable", "暂无正式发布", "", "检查更新"),
+        ("error", "暂时无法检查更新", "", "重试检查"),
+    ]
+    for state, needle, latest, button in cases:
+        s.emit("update", {"request_id": request_id, "state": state,
+                          "latest_version": latest, "url": "",
+                          "text": "网络没通" if state == "error" else "",
+                          "checked_at": "2026-10-27T09:00:00+08:00"})
+        s.wait("S.update.state === %s" % json.dumps(state))
+        s.check_contains("#update-status", needle)
+        s.check("五态按钮文案 %s" % state, s.text("#btn-update-check").strip() == button)
+        s.check("#检查时间五态可见 %s" % state,
+                not s.page.locator("#update-checked-at").is_hidden())
+        s.shot("update-" + state)
+
+
 @scenario("mixed-success-waiting", "单场成功不抢整屏结论", (1280, 900), "valid")
 def _(s: Session):
     s.wait("document.querySelectorAll('#rows .row').length >= 5")

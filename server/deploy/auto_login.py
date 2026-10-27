@@ -52,11 +52,24 @@ from PIL import Image
 from playwright.sync_api import sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-LOGIN_URL = "https://xg.tjise.edu.cn/stu/#/mainPages/login?userType=2"
-API_BASE = "https://xg.tjise.edu.cn/dr/api"
-ACTIVITY_API = API_BASE + "/rjyHd/listActivity"
+LOGIN_DIR = "/root/tjise-login"
+APP_DIR = "/root/tjise-activity-watch"
+# 学校地址唯一真源在 server/scripts/common.py：部署侧不再各写一份域名，
+# 换学校只改 SCHOOL_ORIGIN（环境变量或 common 默认值）。缺失时明确失败，
+# 不静默回退到写死的旧域名。
+SCRIPTS_DIR = os.path.join(APP_DIR, "scripts")
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
+try:
+    from common import (ACTIVITY_API, API_BASE, HOME_URL,  # noqa: E402
+                        REFERER, SCHOOL_ORIGIN)
+except ImportError as exc:  # pragma: no cover - 只在部署缺件时触发
+    raise SystemExit(
+        "[x] 找不到 %s/common.py（%s）：学校地址只允许有一个真源，"
+        "请先部署 server/scripts/" % (APP_DIR, exc))
+
+LOGIN_URL = SCHOOL_ORIGIN + "/stu/#/mainPages/login?userType=2"
 CAPTCHA_API = API_BASE + "/auth/captcha"
-REFERER = "https://xg.tjise.edu.cn/stu/"
 
 # 登录页 bundle 里的固定服务编码（VITE_APP_CLIENT）；接口用它区分终端类型
 CLIENT = (
@@ -64,8 +77,6 @@ CLIENT = (
     "N2FkOTI4YTliMGNjMTFlZGExNGQ4MmUxNDExNWM2OWY="
 )
 
-LOGIN_DIR = "/root/tjise-login"
-APP_DIR = "/root/tjise-activity-watch"
 CREDENTIALS_FILE = os.path.join(LOGIN_DIR, "credentials.json")
 STATE_FILE = os.path.join(LOGIN_DIR, "storage_state.json")
 SESSION_FILE = os.path.join(APP_DIR, "data", "session.json")
@@ -588,7 +599,7 @@ def dry_run(count, verbose=False):
         req = urllib.request.Request(CAPTCHA_API, data=body, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("Referer", REFERER)
-        req.add_header("Origin", "https://xg.tjise.edu.cn")
+        req.add_header("Origin", SCHOOL_ORIGIN)
         req.add_header("User-Agent", UA)
         try:
             resp = urllib.request.urlopen(req, timeout=20)

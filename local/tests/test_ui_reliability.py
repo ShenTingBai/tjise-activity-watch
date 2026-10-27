@@ -56,6 +56,35 @@ out.push({ warn, ok, unknown, popText });
         self.assertNotIn("可能偏", data["popText"],
                          "时间详情不得把上一轮粗测当成当前结论")
 
+
+class LoginActionTests(unittest.TestCase):
+    """登录窗口未完成前不得把旧会话状态画成登录成功。"""
+
+    def test_relogin_pending_and_cancel_preserve_expired_state(self):
+        res = run_js(r'''
+S.login.present = true;
+S.login.result = "expired";
+S.login.ok = false;
+window.pywebview = {api: {login: () => Promise.resolve({ok: true, queued: true})}};
+doLogin();
+const pending = {pending: S.login.loginPending,
+  text: document.querySelector("#pill-text").textContent,
+  state: document.querySelector("#pill").dataset.state};
+window.onBackend.done({kind: "login", ok: false, reason: "窗口被关掉了"});
+out.push(pending, {pending: S.login.loginPending,
+  text: document.querySelector("#pill-text").textContent,
+  state: document.querySelector("#pill").dataset.state,
+  result: document.querySelector("#result").innerHTML});
+''')
+        pending, after = res
+        self.assertTrue(pending["pending"])
+        self.assertEqual(pending["text"], "登录中…")
+        self.assertEqual(pending["state"], "pending")
+        self.assertFalse(after["pending"])
+        self.assertEqual(after["text"], "登录已失效")
+        self.assertEqual(after["state"], "bad")
+        self.assertIn("登录窗口被关掉了", after["result"])
+
     def test_unknown_payload_clears_stale_warn(self):
         res = run_js(r"""
 window.onBackend.check({ ok: true, result: "valid",
@@ -1188,6 +1217,158 @@ out.push({ before: before, after: { busy: S.busy, status: S.plan.status,
 def json_str(value):
     import json
     return json.dumps(value, ensure_ascii=False)
+
+
+class SignedResultUiTests(unittest.TestCase):
+    """真实数据 P0-1/P0-2：报名成功后列表、计数、门禁与冲突基线立即一致。"""
+
+    LIST = r"""
+const rows = [
+  { id: "a1", name: "已确认活动", sign_start: "2026-10-26 09:00:00",
+    sign_end: "2026-10-26 23:00:00", act_start: "2026-10-27 09:00:00",
+    act_end: "2026-10-27 11:00:00", signed: false, checkin_required: null,
+    checkout_required: null },
+  { id: "a2", name: "重叠活动", sign_start: "2026-10-26 09:00:00",
+    sign_end: "2026-10-26 23:00:00", act_start: "2026-10-27 10:00:00",
+    act_end: "2026-10-27 12:00:00", signed: false, checkin_required: null,
+    checkout_required: null },
+  { id: "a3", name: "已报名活动", sign_start: "2026-10-20 09:00:00",
+    sign_end: "2026-10-26 23:00:00", act_start: "2026-10-27 11:00:00",
+    act_end: "2026-10-27 12:30:00", signed: true, checkin_required: null,
+    checkout_required: null }
+];
+setBusinessNow(toTs("2026-10-26 20:00:00") * 1000);
+window.onBackend.activities({ ok: true, items: rows });
+"""
+
+    def test_success_updates_rows_counts_and_removes_from_selection(self):
+        res = run_js(self.LIST + r"""
+S.selected.add("a1");
+const before = { signed: S.items.filter((i) => i.signed).length,
+                 eligible: isEligibleForPlan(findItem("a1")),
+                 selected: S.selected.has("a1") };
+window.onBackend.plan({ plan_id: "p1", status: "running", plan_generation: 1, tasks: [] });
+window.onBackend.task({ plan_id: "p1", task_id: "t1", activity_id: "a1",
+  name: "已确认活动", status: "success", attempts: 1, plan_generation: 1 });
+window.onBackend.plan_done({ plan_id: "p1", status: "completed",
+  plan_generation: 1, summary: {} });
+const item = findItem("a1");
+out.push({ before: before,
+  after: { signed: S.items.filter((i) => i.signed).length,
+           itemSigned: !!item.signed, source: item.signed_source,
+           eligible: isEligibleForPlan(item), selected: S.selected.has("a1"),
+           conflicts: conflictIds().has("a1"),
+           taskStatus: (S.plan.tasks.get("t1") || {}).status },
+  html: rowHtml(item) });
+""")
+        data = res[0]
+        self.assertEqual(data["before"]["signed"], 1)
+        self.assertTrue(data["before"]["eligible"])
+        self.assertTrue(data["before"]["selected"])
+        self.assertEqual(data["after"]["signed"], 2,
+                         "success 是已确认事实：已报名计数必须立即 +1")
+        self.assertTrue(data["after"]["itemSigned"])
+        self.assertEqual(data["after"]["source"], "plan_success")
+        self.assertFalse(data["after"]["eligible"])
+        self.assertFalse(data["after"]["selected"], "成功场次从下一次选择集合移除")
+        self.assertFalse(data["after"]["conflicts"])
+        self.assertEqual(data["after"]["taskStatus"], "success", "任务卡保留")
+        self.assertIn("已报名", data["html"])
+
+    def test_success_blocks_overlapping_second_activity(self):
+        res = run_js(self.LIST + r"""
+window.onBackend.plan({ plan_id: "p1", status: "running", plan_generation: 1, tasks: [] });
+window.onBackend.task({ plan_id: "p1", task_id: "t1", activity_id: "a1",
+  name: "已确认活动", status: "success", attempts: 1, plan_generation: 1 });
+window.onBackend.plan_done({ plan_id: "p1", status: "completed",
+  plan_generation: 1, summary: {} });
+toggleSelection("a2", true);
+const validation = validateSelection();
+out.push({ notice: S.selectionNotice, selected: Array.from(S.selected),
+           errors: validation.errors.map((e) => e.title) });
+""")
+        data = res[0]
+        self.assertIn("与已报名活动", data["notice"])
+        self.assertIn("举办时间重叠", data["notice"])
+        self.assertNotIn("a2", data["selected"])
+        self.assertEqual(data["errors"], [])
+
+    def test_validation_rejects_selection_conflicting_with_signed_item(self):
+        res = run_js(self.LIST + r"""
+S.selected.add("a2");
+const check = validateSelection();
+out.push({ errors: check.errors.map((e) => e.title) });
+""")
+        data = res[0]
+        self.assertIn("与已报名活动重叠", data["errors"])
+
+    def test_list_refresh_false_keeps_confirmed_success_with_sync_note(self):
+        res = run_js(self.LIST + r"""
+window.onBackend.plan({ plan_id: "p1", status: "running", plan_generation: 1, tasks: [] });
+window.onBackend.task({ plan_id: "p1", task_id: "t1", activity_id: "a1",
+  name: "已确认活动", status: "success", attempts: 1, plan_generation: 1 });
+window.onBackend.plan_done({ plan_id: "p1", status: "completed",
+  plan_generation: 1, summary: {} });
+/* 学校列表还没同步：同一条 a1 仍是 signed=false */
+const stale = [{ id: "a1", name: "已确认活动", sign_start: "2026-10-26 09:00:00",
+  sign_end: "2026-10-26 23:00:00", act_start: "2026-10-27 09:00:00",
+  act_end: "2026-10-27 11:00:00", signed: false, checkin_required: null,
+  checkout_required: null }];
+window.onBackend.activities({ ok: true, items: stale });
+const item = findItem("a1");
+out.push({ signed: !!item.signed, pending: !!item.sync_pending,
+           state: stateOf(item), html: rowHtml(item),
+           count: S.items.filter((i) => i.signed).length });
+""")
+        data = res[0]
+        self.assertTrue(data["signed"], "同步窗口内不得撤销已确认成功")
+        self.assertTrue(data["pending"])
+        self.assertEqual(data["state"], "signed")
+        self.assertIn("学校列表正在同步", data["html"])
+        self.assertEqual(data["count"], 1)
+
+
+class InstantModeCopyTests(unittest.TestCase):
+    """RC-04/RC-06：立即模式不显示等待开放，成功结论只留一条。"""
+
+    def test_instant_task_card_never_says_waiting_open(self):
+        res = run_js(r"""
+setBusinessNow(toTs("2026-10-26 20:00:00") * 1000);
+const past = { task_id: "t1", activity_id: "a1", name: "活动",
+  signup_mode: "instant_signup", status: "submitting", attempts: 0,
+  sign_start: "2026-10-26 09:00:00" };
+const unknownTime = Object.assign({}, past, { sign_start: "" });
+out.push({ pastLabel: taskDisplayLabel(past),
+           pastDetail: taskDisplayDetail(past),
+           unknownLabel: taskDisplayLabel(unknownTime),
+           unknownDetail: taskDisplayDetail(unknownTime) });
+""")
+        data = res[0]
+        self.assertEqual(data["pastLabel"], "准备报名")
+        self.assertEqual(data["pastDetail"], "已开放，正在准备提交")
+        self.assertEqual(data["unknownLabel"], "准备报名",
+                         "立即模式时间不可读也不能说成等待开放")
+        self.assertNotIn("等待开放", data["unknownDetail"])
+
+    def test_worker_success_is_logged_once(self):
+        res = run_js(r"""
+window.onBackend.log("[活动甲] 2026-10-26 20:00:00 [OK] 报名成功（尝试 1 次）");
+window.onBackend.plan({ plan_id: "p1", status: "running", plan_generation: 1, tasks: [] });
+window.onBackend.task({ plan_id: "p1", task_id: "t1", activity_id: "a1",
+  name: "活动甲", status: "success", attempts: 1, plan_generation: 1 });
+window.onBackend.plan_done({ plan_id: "p1", status: "completed",
+  plan_generation: 1, summary: {} });
+/* 重复终态：同一条成功不得再写一遍 */
+window.onBackend.task({ plan_id: "p1", task_id: "t1", activity_id: "a1",
+  name: "活动甲", status: "success", attempts: 1, plan_generation: 1 });
+const rows = document.querySelector("#log")._children
+  .map((node) => String(node.textContent || ""))
+  .filter((text) => text.indexOf("报名成功") >= 0);
+out.push({ rows: rows });
+""")
+        rows = res[0]["rows"]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn("活动甲", rows[0])
 
 
 if __name__ == "__main__":

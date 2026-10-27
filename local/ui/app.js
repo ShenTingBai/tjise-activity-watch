@@ -63,7 +63,7 @@ const S = {
   listState: "idle",
   /* 最近一次列表失败的原话：完整失败说明只归列表空态，结果框不再复读 */
   listError: "",
-  login: { hours: null, ok: null, expireAt: null, savedAt: null, present: null, checking: false, result: null },
+  login: { hours: null, ok: null, expireAt: null, savedAt: null, present: null, checking: false, loginPending: false, result: null },
   /* 程序组件自检结论（worker_missing/worker_permission/spawn_failed）：非空时组件
    * 问题优先于登录/网络文案，登录与开始禁用。check/list 两分支按「刷新轮次」
    * 协同恢复：任一分支报组件故障立即挂横幅，另一分支成功/普通 unknown 不得撤；
@@ -85,6 +85,9 @@ const S = {
    * 事件/快照据此判定归属；这里记录已见过的最大代次，旧代次事件不得改写当前计划 */
   maxPlanGen: 0,
   plan: { id: null, gen: 0, status: "idle", tasks: new Map() },
+  /* 本进程已确认的报名成功（activity_id → {source, atMs}）。学校列表短暂滞后时
+   * 仍把这场留在「已报名」并禁止再次选择；超过窗口后以学校列表为最终权威。 */
+  confirmed: new Map(),
   /* 独立北京时间锚点：ingestBusinessClock 维护，businessNowMs 消费（决策 012）。
    * anchorEpochMs 对应 perfAt 那一刻；sampleAgeMs 是快照原地的授时年龄。 */
   businessClock: { anchorEpochMs: 0, perfAt: 0, sampleAgeMs: 0, uncertaintyMs: 0,
@@ -101,6 +104,8 @@ const S = {
   /* 计划级重试策略：时长 0=直到报名截止（缺截止回退 120 秒）；次数 0=不限 */
   retryPolicy: { retry_for_s: 120, max_attempts: 0 },
   logOpen: false,
+  /* 最近 40 条运行记录：成功结论只写一次，重复事件不刷第二遍（RC-06） */
+  recentLogs: [],
   recheckPending: false,
   savePending: {},
   saveTimer: null,
@@ -369,7 +374,7 @@ function ingestBootstrapPlan(info) {
   }
   /* 终态：同一入口恢复结果框、卡片次数/原因、LED/边框、停止后动作与选择签名。
    * 不置 busy、不重发 start_plan、不重复写失败日志、不触发自动刷新。 */
-  presentPlanDone({ plan_id: id, status: status, summary: plan.summary || {} });
+  presentPlanDone({ plan_id: id, status: status, summary: plan.summary || {} }, false);
 }
 
 /* FB4：组件码唯一接收点——只认可知三码；未知 error 字段保持既有业务失败路径 */
@@ -556,9 +561,79 @@ function runtimeErrorCopy() {
   return RUNTIME_ERRORS[S.runtime.error] || RUNTIME_ERRORS.spawn_failed;
 }
 
+/* 报名结果回写（真实证据 P0-1）：success/already_signed 是已确认事实，
+ * 立即映射到活动列表——计数、分组、行状态、复选框与冲突基线同步更新。
+ * unconfirmed/failed/canceled 不写 signed，避免把未知猜成成功。 */
+const SIGNED_SYNC_MS = 120000;
+let confirmedRefreshTimer = null;
+
+function planConfirmedAt() {
+  const ms = businessNowMs();
+  return ms == null ? Date.now() : ms;   // 仅用于界面同步窗口；门禁仍由后端裁决
+}
+
+function noteSignedTasks(tasks) {
+  let changed = false;
+  (tasks || []).forEach((task) => {
+    const status = String((task && task.status) || "");
+    if (status !== "success" && status !== "already_signed") return;
+    const id = String((task && task.activity_id) || "");
+    if (!id) return;
+    const atMs = planConfirmedAt();
+    S.confirmed.set(id, {
+      source: status === "success" ? "plan_success" : "plan_already_signed",
+      atMs: atMs,
+    });
+    const item = findItem(id);
+    if (item) {
+      item.signed = true;
+      item.signed_source = status === "success" ? "plan_success" : "plan_already_signed";
+      item.signed_confirmed_at = atMs / 1000;
+    }
+    /* 已成功的场次从下一次可执行选择集合移除；任务卡与结果卡保留 */
+    S.selected.delete(id);
+    changed = true;
+  });
+  return changed;
+}
+
+/* 列表载荷合并：后端已把窗口内的本地确认合并进来；这里再兜一层，
+ * 覆盖「后端进程重启但界面还在」这类只有前端记得的确认。 */
+function applyConfirmedToItems() {
+  if (!S.confirmed.size) return;
+  const nowMs = planConfirmedAt();
+  S.items.forEach((item) => {
+    const id = String(item.id);
+    if (item.signed) {
+      item.sync_pending = !!item.sync_pending && item.signed_source !== "school";
+      return;
+    }
+    const record = S.confirmed.get(id);
+    if (!record) return;
+    if (nowMs - record.atMs > SIGNED_SYNC_MS) {
+      S.confirmed.delete(id);       // 超过同步窗口：学校列表是最终权威
+      return;
+    }
+    item.signed = true;
+    item.signed_source = record.source;
+    item.signed_confirmed_at = record.atMs / 1000;
+    item.sync_pending = true;
+  });
+}
+
+/* 计划收尾后安排一次有界列表刷新：只补权威列表，不重发、不改结论。
+ * 刷新失败时后端仍保留已确认成功，界面下一轮成功刷新会重新合并。 */
+function scheduleSignedRefresh() {
+  if (confirmedRefreshTimer) clearTimeout(confirmedRefreshTimer);
+  confirmedRefreshTimer = setTimeout(() => {
+    confirmedRefreshTimer = null;
+    if (S.busy || S.starting || S.demo) return;
+    refresh(true);
+  }, 800);
+}
+
 function applyActivities(payload, quiet) {
-  const res = payload || {};
-  /* 旧轮的迟到列表不得覆盖新一轮（无 ID 的旧载荷放行）。确属本 UI 旧轮的
+  const res = payload || {};  /* 旧轮的迟到列表不得覆盖新一轮（无 ID 的旧载荷放行）。确属本 UI 旧轮的
    * 终态先暂存：skipped ack 接续回原 owner 后还要重放。 */
   if (res.request_id && S.round.list && res.request_id !== S.round.list) {
     cacheRoundPayload("list", res.request_id, res);
@@ -587,6 +662,7 @@ function applyActivities(payload, quiet) {
   }
   S.listError = "";
   S.items = (res.items || []).map(normalize);
+  applyConfirmedToItems();
   S.byId = new Map(S.items.map((item) => [String(item.id), item]));
   Array.from(S.selected).forEach((id) => { if (!S.byId.has(String(id))) S.selected.delete(id); });
   S.listState = "ready";
@@ -749,12 +825,17 @@ function rowHtml(item) {
     sub.push('<span class="activity-flags"><span class="activity-flag">' + esc(modeText(modeOf(item))) + "</span></span>");
   }
   sub.push("<span" + (invalid ? ' class="is-unknown"' : "") + ">" + esc(activityTimeText(item)) + "</span>");
+  /* 学校列表还没同步回 signed=true：说清「已确认，只是列表在同步」，
+   * 不把这场重新画成可报名。 */
+  if (item.sync_pending && state === "signed") {
+    sub.push('<span class="sync-note">报名已确认，学校列表正在同步</span>');
+  }
   const flags = requirementFlags(item);
   return "<div class=\"" + classes.join(" ") + "\" data-id=\"" + esc(id) + "\" aria-label=\"" + esc(item.name) + "\">" +
     "<div class=\"c-sel\"><input class=\"row-check\" type=\"checkbox\" data-id=\"" + esc(id) + "\"" + (selected ? " checked" : "") + (checkDisabled ? " disabled" : "") + " aria-label=\"选择" + esc(item.name) + "\"></div>" +
     "<div class=\"c-time\">" + timeHtml + "</div>" +
     "<div class=\"c-main\"><div class=\"name\" title=\"" + esc(item.name) + "\">" + esc(item.name) + "</div><div class=\"sub\">" + sub.join("") + flags + "</div></div>" +
-    "<div class=\"c-place\" tabindex=\"0\" title=\"" + esc(item.place || "地点待定") + "\">" + esc(item.place || "地点待定") + "</div>" +
+    "<div class=\"c-place\" tabindex=\"0\" role=\"button\" aria-expanded=\"false\" aria-label=\"地点：" + esc(item.place || "地点待定") + "，按回车展开全部\" title=\"" + esc(item.place || "地点待定") + "\">" + esc(item.place || "地点待定") + "</div>" +
     "<div class=\"c-state\">" + stateCellHtml(item, state, leftText, armed) + "</div>" +
     "</div>";
 }
@@ -962,9 +1043,11 @@ function taskDisplayPhase(task, now) {
   if (Number.isFinite(attempts) && attempts > 0) return "retrying";
   const at = Number.isFinite(now) ? now : bnowS();
   const open = toTs(task.sign_start);
-  if (at == null) return "preopen";   // 未校准：只能说还在等，不能谎称已开放
+  const mode = String(task.signup_mode || "");
+  /* 立即模式本来就不等开放：时间不可读时也不能说成「等待开放」 */
+  if (at == null) return mode === "instant_signup" ? "preparing" : "preopen";
   /* 开放时间未知时只能「等」：不能因为算不出时间就说已经开放 */
-  if (open === null) return "preopen";
+  if (open === null) return mode === "instant_signup" ? "preparing" : "preopen";
   if (open > at) return "preopen";
   return "preparing";
 }
@@ -1239,6 +1322,15 @@ function boardMetaHtml(item) {
     + '<span><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 10h16M9 3v4M15 3v4"/></svg>' + act + "</span>";
 }
 
+/* 表格地点展开/收起：只改当前控件与 aria-expanded，不重绘整块，
+ * 键盘焦点不会丢，也不会因此触发勾选或开始计划。 */
+function togglePlace(el) {
+  if (!el || !el.getAttribute) return;
+  const open = el.getAttribute("aria-expanded") === "true";
+  el.setAttribute("aria-expanded", open ? "false" : "true");
+  if (el.classList) el.classList.toggle("is-open", !open);
+}
+
 /* 大屏地点展开/收起：按钮原生处理 Enter/Space，这里只翻转 aria-expanded。
  * 只改当前按钮，不重绘整块，键盘焦点不会丢。 */
 function bindPlaceToggle() {
@@ -1276,7 +1368,9 @@ function paintBoardActions() {
   /* 缺组件时不给快捷登录入口（点了只会拿到结构化失败）；「刷新」可复查恢复 */
   const needLogin = S.login.present === false && !S.runtime.error;
   const next = nextOpen().bestId ? findItem(nextOpen().bestId) : null;
-  const showPick = !needLogin && !selectedItems().length && !!next;
+  /* 快捷「选这一场」只在真正空闲时占据操作区：已经结束的计划还要保留
+   * 「清空选择/再看结果」入口，不能因为成功场次已从选择集合移除就把它藏掉。 */
+  const showPick = !needLogin && !selectedItems().length && !S.plan.tasks.size && !!next;
   quickLogin.hidden = !needLogin;
   quickPick.hidden = !showPick;
   if (grow) grow.hidden = needLogin || showPick;
@@ -2126,17 +2220,22 @@ function doStopPlan() {
 
 function doLogin() {
   if (S.busy) return;
+  /* 打开浏览器只是开始登录，不代表登录成功；在 done(login) 到达前保留真实的
+   * 失效/未登录结论，避免「取消登录」期间被忙碌态误画成已登录。 */
+  S.login.loginPending = true;
   setResult(null);
   setBusy(true);
-  addLog("正在打开登录窗口，在弹出的 Chrome 里登完再回来…");
+  addLog("正在打开登录窗口，在弹出的浏览器里登完再回来…");
   api("login").then((res) => {
     if (res && res.demo) {
       /* 演示模式不打开学校登录页：如实说明，不当成登录失败（R20） */
+      S.login.loginPending = false;
       setBusy(false);
       setResult({ ok: "partial", title: "演示模式不登录", text: res.text || "演示模式不联网。" });
       return;
     }
     if (!res || res.ok === false) {
+      S.login.loginPending = false;
       if (res && res.error && RUNTIME_ERRORS[res.error]) {
         /* FB4：登录的同步组件失败只挂横幅与唯一恢复入口，
          * 不再生成「登录没能开始」同义结果框；同时计入本轮刷新故障累计——
@@ -2153,6 +2252,7 @@ function doLogin() {
       setResult({ ok: false, title: "登录没能开始", text: (res && res.text) || "再点一次「登录」试试。" });
     }
   }).catch((err) => {
+    S.login.loginPending = false;
     setBusy(false);
     setResult({ ok: false, title: "登录没能开始", text: msg(err) });
   });
@@ -2162,6 +2262,7 @@ function doLogin() {
 function handleDone(payload) {
   const data = payload || {};
   if (data.kind === "login") {
+    S.login.loginPending = false;
     setBusy(false);
     if (data.ok) {
       /* 登录成功=新会话已保存：旧锚点立即作废（清掉），紧接着的校验事件会带
@@ -2189,9 +2290,9 @@ function handleDone(payload) {
 function loginFailCopy(reason) {
   const raw = String(reason || "");
   if (/窗口被关掉/.test(raw)) return { title: "登录窗口被关掉了", text: "登录还没完成，窗口就关了。点「再试一次」重新打开。" };
-  if (/仍未检测到登录成功/.test(raw)) return { title: "等了 10 分钟还没登录成功", text: "Chrome 窗口里一直没完成登录，超时了。点「再试一次」。" };
+  if (/仍未检测到登录成功/.test(raw)) return { title: "等了 10 分钟还没登录成功", text: "浏览器窗口里一直没完成登录，超时了。点「再试一次」。" };
   if (/打不开登录页/.test(raw)) return { title: "打不开学校的登录页", text: "检查网络、校园网或代理，然后再试一次。" };
-  if (/接口校验失败/.test(raw)) return { title: "登录后学校那边没校验通过", text: "登录状态存下来了，但学校不认。再登录一次试试。" };
+  if (/接口校验失败/.test(raw)) return { title: "登录后学校那边没校验通过", text: "登录状态存下来了，但学校那边没校验通过。再登录一次试试。" };
   if (/没找到可用的浏览器/.test(raw)) return { title: "没找到能用的浏览器", text: "这台电脑上要有 Chrome 或 Edge，装好以后再试。" };
   return { title: "登录没完成", text: cleanReason(raw) || "原因不明。可以再试一次，或者看看运行记录。" };
 }
@@ -2468,9 +2569,7 @@ function paintClockStatus() {
   const title = (ui === "demo" ? "演示时间" : "北京时间") + "，" + copy.label + "，查看时间详情";
   btn.title = title;
   btn.setAttribute("aria-label", title);
-  const pop = $("#clock-pop");
   btn.setAttribute("aria-expanded", clockPopOpenNow() ? "true" : "false");
-  if (clockPopOpenNow()) renderClockPop();
 }
 
 /* 重新校准：只调用本机时钟；反馈留在时间详情，不抢占业务结论。 */
@@ -2485,6 +2584,7 @@ function resyncClock() {
   c.syncFollowRound = c.syncStatus === "syncing" ? c.syncRound : null;
   const startedGen = c.gen;
   paintClockStatus();
+  if (clockPopOpenNow()) renderClockPop();
   paintClockPopFeedback();
   api("sync_clock").then(() => {
     if (c.syncRequest !== request || c.syncState !== "syncing") return;
@@ -2495,6 +2595,7 @@ function resyncClock() {
         S.businessClock.syncState = "idle";
         S.businessClock.syncError = "暂时无法确认本次校准结果，请稍后重试。";
         paintClockStatus();
+        if (clockPopOpenNow()) renderClockPop();
         paintClockPopFeedback();
       }
     }, 12000);
@@ -2504,6 +2605,7 @@ function resyncClock() {
     c.syncState = "idle";
     c.syncError = "重新校准没能开始：" + msg(err);
     paintClockStatus();
+    if (clockPopOpenNow()) renderClockPop();
     paintClockPopFeedback();
   });
 }
@@ -2619,7 +2721,11 @@ function handleTask(payload) {
     task.status = prev.status;
   }
   S.plan.tasks.set(String(data.task_id), task);
-  if (["success", "failed", "already_signed", "canceled"].indexOf(task.status) >= 0) showTaskResult(task);
+  if (["success", "failed", "already_signed", "canceled"].indexOf(task.status) >= 0) {
+    /* 报名成功是已确认事实：任务卡、列表、计数、选择门禁和冲突基线同一时刻更新 */
+    if (noteSignedTasks([task])) scheduleSignedRefresh();
+    showTaskResult(task);
+  }
   render();
 }
 
@@ -2657,7 +2763,7 @@ function unknownLabel(outcome) {
 
 /* 计划终态的唯一呈现入口：plan_done 事件与 F5/bootstrap 恢复共用一份，
  * 这样「实时结束」和「重载后恢复」不会出现两套结论（FR05）。 */
-function presentPlanDone(payload) {
+function presentPlanDone(payload, autoRefresh) {
   const data = payload || {};
   /* 终态载荷也带接纳代次：并入会话记录，旧代次事件此后不得再改写（P1） */
   const doneGen = notePlanGeneration(data.plan_generation);
@@ -2669,6 +2775,9 @@ function presentPlanDone(payload) {
   /* 记下终态时的选择集合：集合不变时结论留在 LED 上，变化后回到预览 */
   S.plan.doneSelection = selectionSignature();
   setBusy(false);
+  /* 已确认成功的场次立即回写列表（计数/分组/门禁/冲突基线），
+   * 再安排一次有界刷新去取学校权威列表；刷新失败不撤销成功事实。 */
+  const signedChanged = noteSignedTasks(Array.from(S.plan.tasks.values()));
   const outcome = planOutcome();
   const successTotal = outcome.success + outcome.already_signed;
   /* 计划级结论也带上失败场次到达的停止条件（次数/时长/截止），去重后一句话说清 */
@@ -2718,6 +2827,7 @@ function presentPlanDone(payload) {
     setResult({ ok: false, title: "报名计划没有成功", text: "报名未成功 " + outcome.failed + " 场" + noteText + "。逐场原因已列在上面任务状态里。", action: { label: "刷新列表", run: () => refresh(false) } });
   }
   render();
+  if (signedChanged && autoRefresh !== false) scheduleSignedRefresh();
 }
 
 function handlePlanDone(payload) {
@@ -2751,16 +2861,23 @@ function restartStoppedPlan() {
   render();
 }
 
+/* worker 已经就同一场写过结论时，不再叠一条同义摘要（RC-06）。
+ * 只认「同一场名称 + 同一结论关键词」，不同场次的成功互不影响。 */
+function loggedConclusion(name, keyword) {
+  const target = String(name || "");
+  return S.recentLogs.some((line) => line.indexOf(target) >= 0 && line.indexOf(keyword) >= 0);
+}
+
 function showTaskResult(task) {
   const name = task.name || "这一场活动";
   /* 计划还在跑时，单场终态只更新任务卡与运行记录：结果框和整屏留给
    * handlePlanDone 的计划级结论（单场成功不得抢写全局成功，UX-05）。 */
   const planLive = !!S.busy;
   if (task.status === "success") {
-    addLog("[OK] 报名成功：" + name);
+    if (!loggedConclusion(name, "报名成功")) addLog("[OK] 报名成功：" + name);
     if (!planLive) setResult({ ok: true, title: "报名成功：" + name, text: "建议去活动页确认一眼。" });
   } else if (task.status === "already_signed") {
-    addLog("[i] 已经报过：" + name);
+    if (!loggedConclusion(name, "已经报过")) addLog("[i] 已经报过：" + name);
     if (!planLive) setResult({ ok: "partial", title: "已经报过：" + name, text: "这场保留为已报名，其他场次继续。" });
   } else if (task.status === "canceled") {
     addLog("[i] 已取消：" + name);
@@ -2853,7 +2970,7 @@ function paintLogin() {
   let sub = "";
   let note = "点右上角「登录」开始使用";
   let state = "none";
-  if (S.busy) {
+  if (S.busy && !S.login.loginPending) {
     cls += " is-busy";
     /* 忙时胶囊只表达登录结论，不拿「正在处理」替换它（计划进度属于报名区域） */
     text = S.login.present === false ? "未登录" : "已登录";
@@ -2868,6 +2985,12 @@ function paintLogin() {
     sub = "内存样例";
     note = "不读取登录信息、不访问学校，只演示界面与流程";
     state = "demo";
+  } else if (S.login.loginPending) {
+    /* 登录窗口仍在等待用户完成；不能把旧的有效/失效结论伪装成成功。 */
+    cls += " is-busy";
+    text = "登录中…";
+    note = "请在弹出的浏览器中完成登录；取消或关闭窗口后会保留原状态";
+    state = "pending";
   } else if (S.login.checking || (ok === null && S.login.present === true && h !== null)) {
     /* 正在真实校验：本机有会话也不提前宣布「已登录」，等学校接口结论 */
     cls += " is-busy";
@@ -2973,6 +3096,11 @@ function setResult(result) {
 function addLog(line) {
   const box = $("#log");
   const text = String(line == null ? "" : line);
+  /* 同一句话（含 worker 已打印的成功结论）只留一条：coordinator 的重复终态
+   * 与 UI 摘要不能给用户两个成功结论（RC-06）。 */
+  if (S.recentLogs.indexOf(text) >= 0) return;
+  S.recentLogs.push(text);
+  if (S.recentLogs.length > 40) S.recentLogs.shift();
   const nowMs = businessNowMs();
   const stamp = nowMs === null ? "待校准" : clockParts(nowMs).time;
   /* worker 已记录事件发生的业务时刻，不能再叠加当前接收时间。 */
@@ -3063,6 +3191,10 @@ function placeClockPop() {
 function renderClockPop() {
   const pop = $("#clock-pop");
   if (!pop) return;
+  /* 校时轮询会更新浮层内容，但不能把用户已经展开的原生 details 收回去。 */
+  const detailsState = Array.from(pop.querySelectorAll("details.records") || [])
+    .map((details) => !!details.open);
+  const scrollTop = Number(pop.scrollTop) || 0;
   const ui = clockUiState();
   /* 浮层状态图形与顶栏同一状态：失败/等待警告色、已校准成功色、演示中性 */
   pop.dataset.state = ui;
@@ -3101,9 +3233,11 @@ function renderClockPop() {
     '<div class="status-line state-icon" id="clock-pop-status"><span class="state-icon">' +
     (CLOCK_ICONS[ui] || CLOCK_ICONS.unavailable) + '</span><span>' + esc(copy.label) + '</span></div>' +
     '<p class="pop-explain">' + esc(copy.explain) + '</p>' +
-    '<dl class="facts">' +
+    '<dl class="facts pop-facts">' +
     '<div><dt>最近校准</dt><dd>' + esc(ui === "demo" ? "离线示例" : clockLastSyncText()) + '</dd></div>' +
     '<div><dt>估计误差</dt><dd>' + esc(ui === "demo" ? "不适用" : clockUncertaintyText(uncNow)) + '</dd></div>' +
+    '<div><dt>上次退出</dt><dd>' + esc(lifeText) + '</dd></div>' +
+    '<div><dt>登录预计剩余</dt>' + loginRow + '</div>' +
     '</dl>' +
     '<details class="records"><summary>使用记录</summary><dl class="facts">' +
     '<div><dt>上次退出至本次启动</dt><dd>' + esc(lifeText) + '</dd></div>' +
@@ -3113,13 +3247,17 @@ function renderClockPop() {
     '<div><dt>校准来源</dt><dd>' + esc(ui === "demo" ? "演示模式"
       : (c.source || "网络时间服务")) + '</dd></div>' +
     '<div><dt>学校 HTTP 时间</dt><dd>' + esc(httpText) + '</dd></div>' +
-    '</dl><p>不会修改电脑时间；差值只用于诊断，报名按北京时间执行。</p></details>' +
+    '</dl><p>差值只用于诊断，报名按北京时间执行。</p></details>' +
     '<div class="pop-foot"><span class="pop-note">不会修改电脑时间</span>' +
     '<button class="sync-btn" id="clock-pop-sync" type="button"' +
     ((syncing || ui === "demo") ? " disabled" : "") + '>' +
     (syncing ? "正在校准…" : (ui === "unavailable" ? "重试校准" : "重新校准时间")) +
     '</button></div>' +
     '<p class="pop-feedback" id="clock-pop-feedback" role="status"></p>';
+  Array.from(pop.querySelectorAll("details.records") || []).forEach((details, index) => {
+    details.open = detailsState[index] === true;
+  });
+  pop.scrollTop = scrollTop;
   const close = pop.querySelector("#clock-pop-close");
   if (close) close.addEventListener("click", () => closeClockPop(true));
   const sync = pop.querySelector("#clock-pop-sync");
@@ -3378,6 +3516,15 @@ function normalize(raw) {
   item.signed = !!item.signed || String(item.state || "") === "已报名" || String(item.state || "") === "signed";
   item.checkin_required = triState(item.checkin_required);
   item.checkout_required = triState(item.checkout_required);
+  /* 详情补充的真实时间段：只认合法时间文本，缺失就是空（不要伪造） */
+  item.checkin_start = String(item.checkin_start || "");
+  item.checkin_end = String(item.checkin_end || "");
+  item.checkout_start = String(item.checkout_start || "");
+  item.checkout_end = String(item.checkout_end || "");
+  const state = String(item.attendance_state || "");
+  item.attendance_state = ["ready", "pending", "unknown"].indexOf(state) >= 0 ? state
+    : (item.checkin_required !== null || item.checkout_required !== null ? "ready" : "unknown");
+  item.attendance_source = String(item.attendance_source || "none");
   return item;
 }
 
@@ -3398,14 +3545,26 @@ function matchesFlag(value, filter) {
 }
 
 function requirementFlags(item) {
+  /* 真实字段来自详情接口：签到/签退要求 + 时间段。
+   * 未知（null）分两种：详情还没回来 →「同步中」；详情已确认没有数据 →「待确认」。
+   * 只有明确 false 才写「无需」，绝不把未知说成无需。 */
+  const pending = item.attendance_state === "pending";
+  const timeRange = (start, end) => {
+    const startTs = toTs(start);
+    if (!startTs) return "";
+    const endTs = toTs(end);
+    return " " + hm(startTs * 1000) + (endTs && endTs > startTs ? "–" + hm(endTs * 1000) : "");
+  };
   const flags = [];
-  if (item.checkin_required === null && item.checkout_required === null) {
-    return '<span class="activity-flags"><span class="activity-flag is-unknown">签到/签退待说明</span></span>';
-  }
-  if (item.checkin_required === true) flags.push('<span class="activity-flag">签到</span>');
-  else if (item.checkin_required === null) flags.push('<span class="activity-flag is-unknown">签到待说明</span>');
-  if (item.checkout_required === true) flags.push('<span class="activity-flag">签退</span>');
-  else if (item.checkout_required === null) flags.push('<span class="activity-flag is-unknown">签退待说明</span>');
+  const add = (text, unknown) => flags.push('<span class="activity-flag' + (unknown ? " is-unknown" : "") + '">' + esc(text) + "</span>");
+  if (item.checkin_required === false) add("无需签到", false);
+  else if (item.checkin_required === true) add("签到" + timeRange(item.checkin_start, item.checkin_end), false);
+  else if (pending) add("签到信息同步中", true);
+  else add("签到时间待确认", true);
+  if (item.checkout_required === false) add("无需签退", false);
+  else if (item.checkout_required === true) add("签退" + timeRange(item.checkout_start, item.checkout_end), false);
+  else if (pending) add("签退信息同步中", true);
+  else add("签退时间待确认", true);
   return flags.length ? '<span class="activity-flags">' + flags.join("") + "</span>" : "";
 }
 
@@ -3497,6 +3656,9 @@ function validateSelection() {
   const errors = [];
   const conflicts = [];
   const items = selectedItems();
+  /* 已报名活动是外部占用：只按举办时段 act_start/act_end 比较，
+   * 报名开放时间不参与（同一时刻开放的活动可以并行）。 */
+  const signedItems = S.items.filter((item) => item.signed);
   items.forEach((item) => {
     if (item.signed) errors.push({ title: "此活动已报名", text: "「" + item.name + "」已报名，请从本次计划中移除。" });
     /* 报名截止是可执行门禁：已截止活动即使被勾上（时序差）也开始不了 */
@@ -3506,7 +3668,29 @@ function validateSelection() {
     const end = toTs(item.act_end);
     if (!start || !end) errors.push({ title: "活动时间待确认", text: "「" + item.name + "」缺少完整的活动起止时间，不能静默加入可执行计划。" });
     else if (end <= start) errors.push({ title: "活动时间无效", text: "「" + item.name + "」的结束时间不晚于开始时间。" });
+    if (!start || !end || end <= start || item.signed) return;
+    const clash = signedItems.find((other) => {
+      if (String(other.id) === String(item.id)) return false;
+      const otherStart = toTs(other.act_start);
+      const otherEnd = toTs(other.act_end);
+      return otherStart && otherEnd && otherEnd > otherStart && start < otherEnd && otherStart < end;
+    });
+    if (clash) {
+      errors.push({ title: "与已报名活动重叠",
+                    text: "「" + item.name + "」与已报名的「" + clash.name + "」举办时间重叠（"
+                      + activityTimeText(clash) + "），同一时段只能去一场。" });
+    }
   });
+  /* 已报名活动缺少举办时段时无法判定冲突：保守阻止，不静默放行 */
+  if (items.length) {
+    const unknown = signedItems.filter((item) => !toTs(item.act_start) || !toTs(item.act_end));
+    if (unknown.length) {
+      const names = unknown.slice(0, 3).map((item) => "「" + item.name + "」").join("、");
+      errors.push({ title: "已报名活动时间待确认",
+                    text: names + (unknown.length > 3 ? " 等 " + unknown.length + " 场" : "")
+                      + "缺少举办时间，无法确认是否与本次选择冲突。" });
+    }
+  }
   for (let i = 0; i < items.length; i += 1) {
     const leftStart = toTs(items[i].act_start);
     const leftEnd = toTs(items[i].act_end);
@@ -3555,6 +3739,20 @@ function toggleSelection(id, checked) {
     const existing = selectedItems();
     const candidateStart = toTs(item.act_start);
     const candidateEnd = toTs(item.act_end);
+    /* 已报名活动先挡：它是学校确认的外部占用，不是本次选择内部冲突 */
+    const signedClash = S.items.find((other) => {
+      if (!other.signed || String(other.id) === String(id)) return false;
+      const start = toTs(other.act_start);
+      const end = toTs(other.act_end);
+      return candidateStart && candidateEnd && start && end
+        && candidateStart < end && start < candidateEnd;
+    });
+    if (signedClash) {
+      S.selectionNotice = "与已报名活动「" + signedClash.name + "」的举办时间重叠（"
+        + activityTimeText(signedClash) + "），不能再加入计划。";
+      render();
+      return;
+    }
     const conflict = existing.find((other) => {
       const start = toTs(other.act_start);
       const end = toTs(other.act_end);
@@ -3595,7 +3793,7 @@ function paintChips() {
   document.querySelectorAll(".chip").forEach((chip) => {
     const on = chip.dataset.status === S.filter.status;
     chip.classList.toggle("is-on", on);
-    chip.setAttribute("aria-selected", on ? "true" : "false");
+    chip.setAttribute("aria-pressed", on ? "true" : "false");
     let count = chip.querySelector(".ct");
     if (!count) {
       count = document.createElement("span");
@@ -4193,10 +4391,21 @@ $("#rows").addEventListener("change", (event) => {
 });
 $("#rows").addEventListener("click", (event) => {
   if (event.target.closest(".row-check")) return;
+  /* 地点是独立可聚焦控件：点它只展开/收起完整文本，不改变选择 */
+  const place = event.target.closest(".c-place");
+  if (place) { togglePlace(place); return; }
   const row = event.target.closest(".row");
   if (!row) return;
   const check = row.querySelector(".row-check");
   if (check && !check.disabled) { check.checked = !check.checked; toggleSelection(check.dataset.id, check.checked); }
+});
+/* 键盘展开地点：Enter / Space 只翻转 aria-expanded，不触发开始计划或勾选 */
+$("#rows").addEventListener("keydown", (event) => {
+  const place = event.target.closest(".c-place");
+  if (!place) return;
+  if (event.key !== "Enter" && event.key !== " " && event.key !== "Spacebar") return;
+  event.preventDefault();
+  togglePlace(place);
 });
 $("#btn-refresh").addEventListener("click", () => refresh(false));
 $("#btn-login").addEventListener("click", doLogin);

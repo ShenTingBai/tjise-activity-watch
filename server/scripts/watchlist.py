@@ -14,6 +14,7 @@ watchlist.json 记的是「人的意愿」。两者的生命周期和回滚方�
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -21,8 +22,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# 跨进程锁与原子写复用 common 的实现（POSIX flock / Windows msvcrt 都真正加锁）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import atomic_write_text, file_lock  # noqa: E402
+
 # 测试时可以指到临时文件，避免污染真实清单
 FILE = Path(os.environ.get("WATCHLIST_FILE") or (ROOT / "data" / "watchlist.json"))
+LOCK = Path(os.environ.get("WATCHLIST_LOCK") or (FILE.parent / "watchlist.lock"))
 FMT = "%Y-%m-%d %H:%M:%S"
 DEFAULT_LEAD = 100.0      # 提前多少秒打开详情页
 DEFAULT_WINDOW = 120.0    # 开放后最多尝试多少秒
@@ -58,12 +64,24 @@ def load() -> list:
 
 
 def save(entries: list) -> None:
-    FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = FILE.with_name(FILE.name + ".tmp")
-    tmp.write_text(json.dumps({"entries": entries}, ensure_ascii=False, indent=2),
-                   encoding="utf-8")
-    os.chmod(str(tmp), 0o600)
-    os.replace(str(tmp), str(FILE))
+    """原子写（0600）：命令行增删与 runner 标记共用同一份文件。"""
+    atomic_write_text(FILE, json.dumps({"entries": entries}, ensure_ascii=False, indent=2),
+                      mode=0o600)
+
+
+@contextlib.contextmanager
+def _transaction():
+    """锁内读改写：并发 add/remove/mark 不丢用户预报名（P2-3）。
+
+    锁内只做本地读改写，不联网、不刷新卡片；解析失败原样抛出，
+    绝不用空清单覆盖已有内容。
+    """
+    with file_lock(LOCK):
+        entries = load()
+        state = {"changed": False}
+        yield entries, state
+        if state["changed"]:
+            save(entries)
 
 
 def find(entries: list, activity_id: str):
@@ -96,41 +114,42 @@ def add(activity_id: str, name: str, open_at: str,
     if datetime.now() > start + timedelta(seconds=float(window)):
         raise RuntimeError(
             "这场报名窗口已经结束（%s 开放），预报名不适用" % open_at)
-    entries = load()
-    entry = find(entries, activity_id)
-    if entry is None:
-        entry = {"id": activity_id, "attempts": 0, "created_at": now_str()}
-        entries.append(entry)
-    entry.update({
-        "name": name or entry.get("name") or "活动",
-        "open_at": open_at,
-        "lead": float(lead),
-        "window": float(window),
-        "status": "queued",
-        "result": "",
-        "started_at": "",
-        "finished_at": "",
-    })
-    save(entries)
+    with _transaction() as (entries, state):
+        entry = find(entries, activity_id)
+        if entry is None:
+            entry = {"id": activity_id, "attempts": 0, "created_at": now_str()}
+            entries.append(entry)
+        entry.update({
+            "name": name or entry.get("name") or "活动",
+            "open_at": open_at,
+            "lead": float(lead),
+            "window": float(window),
+            "status": "queued",
+            "result": "",
+            "started_at": "",
+            "finished_at": "",
+        })
+        state["changed"] = True
     return entry
 
 
 def remove(activity_id: str) -> bool:
-    entries = load()
-    kept = [e for e in entries if e.get("id") != activity_id]
-    if len(kept) == len(entries):
-        return False
-    save(kept)
+    with _transaction() as (entries, state):
+        kept = [e for e in entries if e.get("id") != activity_id]
+        if len(kept) == len(entries):
+            return False
+        entries[:] = kept
+        state["changed"] = True
     return True
 
 
 def mark(activity_id: str, **fields) -> dict:
-    entries = load()
-    entry = find(entries, activity_id)
-    if entry is None:
-        return {}
-    entry.update(fields)
-    save(entries)
+    with _transaction() as (entries, state):
+        entry = find(entries, activity_id)
+        if entry is None:
+            return {}
+        entry.update(fields)
+        state["changed"] = True
     return entry
 
 
@@ -175,7 +194,13 @@ def main(argv=None) -> int:
         return 0
 
     if args.cmd in ("remove", "cancel"):
-        if remove(args.id):
+        try:
+            removed = remove(args.id)
+        except (ValueError, RuntimeError) as exc:
+            # 清单损坏时明确失败，不用空清单覆盖（那是真人点出来的预报名）
+            print("[x] %s" % exc)
+            return 1
+        if removed:
             print("已取消预报名：%s" % args.id)
             return 0
         print("清单里没有这条：%s" % args.id)

@@ -36,6 +36,24 @@ server/
 
 运行时会生成 `data/`（会话、状态、日志）与 `reports/`，两者都不入库。
 
+## 配置真源与交付证据
+
+- **学校地址只有一个来源**：`scripts/common.py` 的 `SCHOOL_ORIGIN`（可用同名环境变量覆盖）。
+  `scripts/`、`deploy/`（含 `auto_login.py`、`grab_signup.py`）一律从它派生 `API_BASE` / `REFERER`，
+  任何脚本里再出现写死的域名都会被 `tests/test_endpoints.py` 的静态扫描判失败。
+- **预报名清单是并发安全的**：`scripts/watchlist.py` 的 `add` / `remove` / `mark` 都走
+  `watchlist.lock` 的读改写事务（POSIX `flock`，Windows `msvcrt`），runner 每分钟对齐时
+  也按同一把锁写状态；清单 JSON 解析失败会明确报错，不会用空清单覆盖。
+- **unit 名不截断 activity_id**：`watchlist_runner` 用「安全编码 + 完整 id 的 SHA-256 前 8 位」
+  生成 systemd unit 与状态文件名，前 8 位相同的两场活动不再串号。
+- **服务器 ZIP 带 provenance**：`tools/release.py` 的 `zip_server()` 会生成
+  `tjise-server-<tag>.manifest.json`（版本、完整 HEAD、来源是否干净、ZIP 与每个成员的 SHA-256/大小），
+  `verify_server_zip()` 可离线重算核验；ZIP 顶层成员只允许
+  `bot/deploy/docs/scripts/tests/README.md/CHANGELOG.md/LICENSE/requirements.txt/config.example.json`，
+  `data/`、`config.json` 混入即拒绝。
+- **依赖锁定**：`requirements.txt` 是安装下限；`requirements.lock` 只有在当前部署能证明
+  实际版本时才生成并随 ZIP 分发。无法证明时本文明确标 blocked，不用 `>=` 冒充锁定。
+
 ## 部署
 
 前置：Ubuntu 22.04 / root / 能出网（学校站点 + `open.feishu.cn`）。

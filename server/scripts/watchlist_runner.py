@@ -15,8 +15,9 @@ runner 是 cron 拉起的、一分钟就退出，如果它直接起子进程，c
 from __future__ import annotations
 
 import argparse
-import fcntl
+import hashlib
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -25,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import watchlist as wl  # noqa: E402
+from common import file_lock  # noqa: E402
 
 ROOT = wl.ROOT
 # 抓取脚本在登录目录（要能用那边的 playwright 环境），可用环境变量覆盖
@@ -32,16 +34,30 @@ GRAB = os.environ.get("GRAB_SCRIPT") or "/root/tjise-login/grab_signup.py"
 STATUS_DIR = Path(os.environ.get("GRAB_STATUS_DIR") or (ROOT / "data"))
 EARLY = 20          # 允许比「开放前 lead 秒」晚多少秒拉起（留给 cron 抖动）
 LATE = 300          # 开放后还允许拉起多久：迟一点也可能挤进名额
-LOCK = ROOT / "data" / "watchlist.lock"
+# runner 自己的「一轮只跑一个」锁：与清单锁分开，避免同进程重入死锁。
+# 清单的并发读改写由 watchlist 的 watchlist.lock 事务负责。
+RUNNER_LOCK = ROOT / "data" / "watchlist-runner.lock"
 PYTHON = sys.executable or "/usr/bin/python3"
 
 
+def unit_token(activity_id) -> str:
+    """完整 id 的稳定安全编码 + 短哈希：同前缀 id 不再串 unit/状态文件（P2-4）。
+
+    只保留可读的安全字符，哈希覆盖完整 id，任何两场不同活动都不会得到同名；
+    长度远低于 systemd unit 255 字符上限。
+    """
+    raw = str(activity_id or "")
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", raw)[:40].strip("._-") or "activity"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return "%s-%s" % (safe, digest)
+
+
 def unit_name(entry: dict) -> str:
-    return "tjise-grab-" + str(entry["id"])[:8]
+    return "tjise-grab-" + unit_token(entry["id"])
 
 
 def status_file(entry: dict) -> Path:
-    return STATUS_DIR / ("grab-%s.status" % str(entry["id"])[:8])
+    return STATUS_DIR / ("grab-%s.status" % unit_token(entry["id"]))
 
 
 def unit_active(unit: str) -> bool:
@@ -109,14 +125,7 @@ def main(argv=None) -> int:
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
-    LOCK.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(LOCK), "w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print("[i] 上一轮还没结束，跳过")
-            return 0
-
+    with file_lock(RUNNER_LOCK):
         now = datetime.now()
         entries = wl.load()
         changed = False          # 有状态变化才刷新卡片，别每分钟 PATCH 一次

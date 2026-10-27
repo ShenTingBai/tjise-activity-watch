@@ -841,5 +841,42 @@ class StopPreservesFactsTests(_WorkerCase):
         self.assertEqual(result["attempts"], 0)
 
 
+class SubmitBackoffTests(unittest.TestCase):
+    """RC-05：人数已满时提交间隔 2 秒起、1.5 倍退避、8 秒封顶且受截止钳制。"""
+
+    def test_backoff_sequence_is_bounded(self):
+        from grab import (SUBMIT_BACKOFF_MAX_S, SUBMIT_BACKOFF_START_S,
+                          next_submit_gap)
+        gaps = []
+        gap = SUBMIT_BACKOFF_START_S
+        for _ in range(8):
+            gaps.append(round(gap, 3))
+            gap = next_submit_gap(gap)
+        self.assertEqual(gaps[:5], [2.0, 3.0, 4.5, 6.75, 8.0])
+        self.assertEqual(set(gaps[4:]), {SUBMIT_BACKOFF_MAX_S},
+                         "退避必须封顶在 8 秒，不能无限放大")
+
+    def test_backoff_never_exceeds_remaining_window(self):
+        from grab import wait_before_next_submit
+        sleeps = []
+
+        class _Budget:
+            def remaining_s(self):
+                return 5.0
+
+            def sleep(self, seconds):
+                sleeps.append(round(seconds, 3))
+
+        next_gap = wait_before_next_submit(_Budget(), 8.0)
+        self.assertEqual(sleeps, [5.0], "窗口只剩 5 秒时最多等 5 秒")
+        self.assertEqual(next_gap, 8.0)
+
+    def test_invalid_gap_restarts_from_two_seconds(self):
+        from grab import next_submit_gap
+        self.assertEqual(next_submit_gap(None), 3.0)
+        self.assertEqual(next_submit_gap(0), 3.0)
+        self.assertEqual(next_submit_gap(-10), 3.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1016,32 +1016,60 @@ class Api:
             # demo 标记：界面据此放行演示计划（真实模式仍要求登录校验 valid）
             "demo": DEMO,
         }
-        # busy 与计划快照必须在同一临界区取：分两次拿锁会出现「busy=true 但
-        # plan 是上一份终态快照」或反过来的错配，F5 恢复就会把已完成的计划
-        # 画成运行中（FR05）。
+        # busy 与计划快照必须在同一「判定点」取：先取协调器快照（锁外），
+        # 再回 Api 锁内确认这份快照仍属于当前计划并重新计算 busy。这样既不会
+        # 出现「busy=true 但 plan 是上一份终态快照」，也不在持 Api 锁时取
+        # 协调器锁（P2-1 锁序）。
+        snapshot, busy = self._bootstrap_plan_snapshot()
         with self._lock:
-            payload["busy"] = self._is_busy_locked()
-            plan = self._plan
-            last_plan = self._last_plan
+            payload["busy"] = busy
             payload["update_check"] = {"checking": self._updating,
                                        "request_id": self._update_request_id,
                                        "result": self._update_result}
-            if plan is not None:
-                # 页面重载会丢掉 plan/task 事件：把计划快照一并交给 bootstrap，
-                # 界面才能恢复任务列表和「停止」按钮；计划本身不会重复提交。
-                payload["plan"] = plan.snapshot()
-            elif last_plan is not None:
-                # 计划已结束：仍要把最后一份终态快照交回去，F5 才能保留结论与次数
-                payload["plan"] = last_plan
-            if isinstance(payload.get("plan"), dict):
-                # F5 权威快照携带接纳代次与请求 ID：界面据此建立归属，后到的
-                # 旧计划事件不得覆盖恢复出来的计划（P1）
-                boot_plan = payload["plan"]
-                boot_plan["plan_generation"] = self._plan_generation
-                boot_plan.setdefault("request_id",
-                                     next((key for key, value in self._start_requests.items()
-                                           if value.get("plan_id") == boot_plan.get("plan_id")), ""))
+            generation = self._plan_generation
+        if snapshot is not None:
+            # 页面重载会丢掉 plan/task 事件：把计划快照一并交给 bootstrap，
+            # 界面才能恢复任务列表和「停止」按钮；计划本身不会重复提交。
+            # 复制一份再补归属字段，不改写共享的 _last_plan。
+            boot_plan = dict(snapshot)
+            boot_plan["plan_generation"] = generation
+            boot_plan.setdefault("request_id",
+                                 self._find_request_id(boot_plan.get("plan_id")))
+            payload["plan"] = boot_plan
         return payload
+
+    def _find_request_id(self, plan_id) -> str:
+        """按 plan_id 反查开始请求 ID（只读，不加锁时调用者需保证一致性）。"""
+        target = str(plan_id or "")
+        if not target:
+            return ""
+        with self._lock:
+            return next((key for key, value in self._start_requests.items()
+                         if value.get("plan_id") == target), "")
+
+    def _bootstrap_plan_snapshot(self) -> tuple["dict | None", bool]:
+        """锁外取计划快照，再锁内确认归属；返回 (快照, busy)。
+
+        取快照期间计划可能被替换或结束：重读最多三次，最终以 Api 锁内的
+        当前计划/终态快照为准，不返回已过期计划。
+        """
+        for _ in range(3):
+            with self._lock:
+                plan = self._plan
+            if plan is None:
+                with self._lock:
+                    return self._last_plan, self._is_busy_locked()
+            try:
+                snapshot = plan.snapshot()
+            except Exception:
+                snapshot = None
+            with self._lock:
+                # 只有「这份快照仍属于当前计划」时才连 busy 一起返回：
+                # 否则重新读，避免把旧计划的运行态配上新计划的忙态
+                if self._plan is plan:
+                    return snapshot, self._is_busy_locked()
+        with self._lock:
+            return self._last_plan, self._is_busy_locked()
 
     def help(self) -> dict:
         return {
@@ -1280,6 +1308,73 @@ class Api:
             with self._lock:
                 self._listing = False
 
+    # ---------- 报名结果回写 ----------
+    # 学校列表短暂滞后是常态：报名成功后立即刷新仍可能拿到 signed=false。
+    # 已确认成功在这段窗口内不被撤销；超过窗口仍为 false 时以学校列表为最终权威
+    # （本地不能长期伪造已报名，否则会挡住用户真正需要重报的场次）。
+    SIGNED_SYNC_WINDOW_S = 120.0
+
+    def _confirm_signed(self, activity_id: str, status: str) -> bool:
+        """worker 终态为 success/already_signed 时原子回写活动缓存。
+
+        unconfirmed/failed/canceled/auth_unavailable 一律不写：未知结果不能被
+        猜成成功，也不能因为本地停止就撤销学校已确认的事实。
+        """
+        aid = str(activity_id or "")
+        if not aid or status not in {"success", "already_signed"}:
+            return False
+        try:
+            confirmed_at = float(self._clock_now())
+        except Exception:
+            # 校时不可用时也保留事实，只是同步窗口改由「无截止」处理（见合并）
+            confirmed_at = 0.0
+        with self._lock:
+            item = self._activities.get(aid)
+            if not item:
+                return False
+            item = dict(item)
+            item["signed"] = True
+            item["signed_source"] = ("plan_success" if status == "success"
+                                     else "plan_already_signed")
+            item["signed_confirmed_at"] = confirmed_at
+            item["sync_pending"] = False
+            self._activities[aid] = item
+            return True
+
+    def _merge_list_activities(self, items: list[dict]) -> list[dict]:
+        """列表刷新结果与本地已确认成功合并，返回可下发界面的新列表。
+
+        学校说已报名 → 权威；本地已确认成功但学校还没同步 → 窗口内保留
+        signed=true 并标 sync_pending，让界面继续把这场留在「已报名」而不可再选。
+        """
+        try:
+            now = float(self._clock_now())
+        except Exception:
+            now = None            # 没有可信现在：保留本地确认，不按系统时间算窗口
+        merged: list[dict] = []
+        for raw in items or []:
+            item = dict(raw)
+            aid = str(item.get("id") or "")
+            prev = self._activities.get(aid) or {}
+            if bool(item.get("signed")):
+                item["signed_source"] = "school"
+                item["sync_pending"] = False
+                merged.append(item)
+                continue
+            source = str(prev.get("signed_source") or "")
+            confirmed_at = float(prev.get("signed_confirmed_at") or 0)
+            local_confirmed = bool(prev.get("signed")) and source in {
+                "plan_success", "plan_already_signed"}
+            within_window = (now is None or not confirmed_at
+                             or now - confirmed_at <= self.SIGNED_SYNC_WINDOW_S)
+            if local_confirmed and within_window:
+                item["signed"] = True
+                item["signed_source"] = source
+                item["signed_confirmed_at"] = confirmed_at
+                item["sync_pending"] = True
+            merged.append(item)
+        return merged
+
     def _do_list_inner(self) -> None:
         if DEMO:
             items = demo_items()
@@ -1302,10 +1397,19 @@ class Api:
             now = self._clock_now()      # 列表「距开放」按业务北京时间
         except Exception:
             now = None                   # 校时不可用：显示未知，不用系统时间补
+        # 报名成功后学校列表可能短暂滞后：合并本地已确认成功，再下发界面和缓存。
+        # 合并只读本地缓存、不联网，也不改写学校返回的其它字段。
+        items = self._merge_list_activities(items)
         for it in items:
             it["seconds_to_open"] = _seconds_until(it.get("sign_start"), now)
-        self._activities = {str(it.get("id")): dict(it) for it in items if it.get("id")}
-        self._emit("activities", {"ok": True, "items": items})
+        with self._lock:
+            self._activities = {str(it.get("id")): dict(it) for it in items if it.get("id")}
+        # 详情补充是逐活动异步完成的：把「还在同步/已失败」如实交给界面，
+        # 不让整张列表因为某一场详情查不到而失败。
+        pending = sum(1 for it in items if it.get("attendance_state") == "pending")
+        failed = sum(1 for it in items if it.get("attendance_state") == "unknown")
+        self._emit("activities", {"ok": True, "items": items,
+                                  "attendance": {"pending": pending, "unknown": failed}})
 
     # ---------- 动作 ----------
     def login(self) -> dict:
@@ -1318,7 +1422,7 @@ class Api:
             if self._closing:
                 # 不带 error 码：前端不得把关闭取消当成组件问题挂横幅
                 return {"ok": False, "text": "程序正在关闭，已取消本次登录"}
-            if self._plan and self._plan.snapshot().get("status") in {"running", "ready"}:
+            if self._plan and self._plan.published_status() in {"running", "ready"}:
                 return {"ok": False, "text": "报名计划正在运行，先停止计划再登录"}
         return self._spawn(worker_command("login"), "登录", kind="login")
 
@@ -1584,7 +1688,14 @@ class Api:
                     "errors": [{"kind": "sign_end_passed", "activity_id": item.get("id"),
                                 "name": item.get("name"), "sign_end": item.get("sign_end")}
                                for item in closed]}
-        checked = validate_plan(normalized, now=accepted_at)
+        # 已报名活动占用的举办时段也是冲突基线：学校列表 signed=true 的全量活动
+        # 与本次选择按 act_start/act_end 比较。缓存读取加锁：worker 线程可能正在
+        # 回写报名结果（dict 迭代中变更会抛 RuntimeError）。
+        with self._lock:
+            signed_baseline = [dict(item) for item in self._activities.values()
+                               if item.get("signed")]
+        checked = validate_plan(normalized, now=accepted_at,
+                                signed_activities=signed_baseline)
         if not checked["ok"]:
             return {"ok": False, "text": "计划里有不能同时报名的活动", "conflicts": checked["conflicts"],
                     "errors": checked["errors"]}
@@ -1612,6 +1723,12 @@ class Api:
             return data
 
         def emit(kind: str, payload: dict) -> None:
+            # 报名结果先回写活动缓存，再转发事件：界面收到 task/plan_done 时，
+            # 后端立场（下一次开始会不会重新接纳这场）已经同步更新。
+            if kind == "task" and isinstance(payload, dict):
+                status = str(payload.get("status") or "")
+                if status in {"success", "already_signed"}:
+                    self._confirm_signed(str(payload.get("activity_id") or ""), status)
             if kind != "plan_done":
                 # 旧计划迟到的进度事件不得广播到当前界面：事件只属于最近
                 # 接纳的计划；历史计划的进度仍可按 request_id 只读对账（P1）
@@ -1624,6 +1741,12 @@ class Api:
             # 完成状态先提交、再发布：收到 plan_done 的同步回调（测试、未完成的
             # bootstrap、开始对账）必须当场就看到 _plan 已清空、终态快照与
             # request_id 记录已可读；先发事件再改状态会留下可观察的中间态（FR05）。
+            # 快照在 Api 锁外取：协调器锁只在它自己内部持有，反向边不再成环（P2-1）。
+            # plan_done 发出时所有任务已终态，这里的快照就是终态快照。
+            try:
+                snapshot = coordinator.snapshot()
+            except Exception:
+                snapshot = None
             with self._lock:
                 owns_slot = self._plan is coordinator
                 if owns_slot:
@@ -1635,10 +1758,6 @@ class Api:
                     # 的迟到完成不得覆盖它的终态快照（P1）
                     owns_slot = True
                 first_done = not self._finished_plan_ids.get(plan_id)
-                try:
-                    snapshot = coordinator.snapshot()
-                except Exception:
-                    snapshot = None
                 if owns_slot and first_done:
                     # 终态快照只写一次：重复终态不得把已定结论改成另一状态；
                     # 旧计划迟到的 plan_done 不得覆盖后来计划或它的终态快照
@@ -1848,11 +1967,12 @@ class Api:
 
     # ---------- 内部 ----------
     def _is_busy_locked(self) -> bool:
+        # 只读协调器已发布的不可变状态：持 Api 锁时绝不取协调器锁（P2-1）。
+        # 反向路径（协调器 → Api）同样已改为锁外发布，两条边不再成环。
         if self._proc and self._proc.poll() is None:
             return True
         if self._plan:
-            status = self._plan.snapshot().get("status")
-            if status in {"ready", "running"}:
+            if self._plan.published_status() in {"ready", "running"}:
                 return True
         return any(proc.poll() is None for proc in self._plan_procs.values())
 
@@ -1910,7 +2030,15 @@ class Api:
             # run_started_at 必须等 [checkpoint] worker_started 到达再写（R10）。
             # 业务时刻读不到就不填，绝不拿系统时间补一个假节点。
             status("submitting", {"worker_spawned_at": business_now})
-        self._emit("log", "▶ [%s] 等待并抢报名" % spec.name)
+        # 任务入口文案按模式说清在等什么：预报名是「等开放」，立即模式是
+        # 「抢名额」——不能让已经开放的活动显示成在等待（RC-04）。
+        mode = str(getattr(spec, "signup_mode", "") or "")
+        if mode == "pre_register":
+            self._emit("log", "▶ [%s] 预报名：等待报名开放" % spec.name)
+        elif mode == "instant_signup":
+            self._emit("log", "▶ [%s] 立即报名：抢名额" % spec.name)
+        else:
+            self._emit("log", "▶ [%s] 等待并抢报名" % spec.name)
 
         # 父层监督：到期后收走本场进程树，不让「不 EOF 的管道」把任务永远挂着。
         # 所有权在进程恢复执行前就已取得（Job Object）：onefile 引导进程先退出时，

@@ -144,6 +144,16 @@ class SyncProgressTailTests(unittest.TestCase):
 
 
 class ClockDisplayTailTests(unittest.TestCase):
+    def test_clock_status_does_not_rebuild_open_details_every_tick(self):
+        """顶栏走字不能重建浮层，否则原生 details 会在一秒内自动收起。"""
+        js = (LOCAL / "ui" / "app.js").read_text(encoding="utf-8")
+        start = js.index("function paintClockStatus()")
+        end = js.index("/* 重新校准", start)
+        body = js[start:end]
+        self.assertNotIn("renderClockPop()", body)
+        self.assertIn('details.records', js)
+        self.assertIn('details.open = detailsState[index] === true', js)
+
     def test_retry_feedback_stops_claiming_old_time_is_usable_after_expiry(self):
         result = run_js(r'''
 const snap={schema:1,owner_id:'harness-clock',generation:20,state:'ready',

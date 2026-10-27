@@ -61,6 +61,12 @@ VERSION_FILE = ROOT / "VERSION"
 SERVER_EXCLUDE = {"config.json", "data", "dist", "reports",
                   "__pycache__", "node_modules"}
 
+# 服务器 ZIP 只允许这些顶层成员：任何 data/、config.json、缓存、日志都进不来。
+# 与 SERVER_EXCLUDE（复制时忽略）是两道独立防线：先排除，再按成员白名单复核。
+SERVER_ALLOWED_TOP = {"bot", "deploy", "docs", "scripts", "tests",
+                      "README.md", "CHANGELOG.md", "LICENSE",
+                      "requirements.txt", "config.example.json"}
+
 # 完整便携 ZIP 的白名单：只放这四样，任何 data/config/log/缓存/外置 worker 都进不来
 # （worker 已作为数据资源内置进主 EXE，单文件独立可用——五成员旧口径已被 2026-10-25 决定取代）
 ZIP_MEMBERS = ("EXE", "README.md", "启动说明.txt", "LICENSE")
@@ -297,8 +303,40 @@ def zip_portable(tag: str) -> Path:
     return out
 
 
+def server_manifest_path(tag: str) -> Path:
+    """服务器 ZIP 的 provenance 边车：与 zip 同目录，解压前就能核验。"""
+    return DIST / ("tjise-server-%s.manifest.json" % tag)
+
+
+def _zip_member_map(zip_path: Path) -> dict:
+    """读出 zip 成员（去掉顶层目录名）→ {sha256, bytes}，越界成员直接拒绝。"""
+    members: dict[str, dict] = {}
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            name = info.filename.replace("\\", "/")
+            rel = name.split("/", 1)[1] if "/" in name else name
+            top = rel.split("/", 1)[0]
+            if top not in SERVER_ALLOWED_TOP:
+                raise SystemExit(
+                    "[server] ZIP 成员越界：%s（只允许 %s）"
+                    % (rel, "、".join(sorted(SERVER_ALLOWED_TOP))))
+            if rel == "config.json" or rel.startswith("data/"):
+                raise SystemExit("[server] ZIP 混入运行时数据：%s" % rel)
+            members[rel] = {
+                "sha256": hashlib.sha256(zf.read(info)).hexdigest(),
+                "bytes": info.file_size,
+            }
+    return members
+
+
 def zip_server(tag: str) -> Path:
-    """兼容发行流程（另行授权）：服务器版源码包。publish 不会隐式调用。"""
+    """兼容发行流程（另行授权）：服务器版源码包 + manifest/SHA 边车。
+
+    publish 不会隐式调用；生成的 manifest 记录版本、完整 HEAD、来源是否干净、
+    ZIP 自身 SHA-256 与每个成员的 SHA-256/大小，可离线重算核验（P2-5）。
+    """
     out = DIST / ("tjise-server-%s.zip" % tag)
     out.unlink(missing_ok=True)
     staging = DIST / ("tjise-server-" + tag)   # 解压后的顶层目录名，别带点（Windows 会当隐藏目录）
@@ -316,7 +354,50 @@ def zip_server(tag: str) -> Path:
     shutil.make_archive(str(out.with_suffix("")), "zip",
                         root_dir=str(DIST), base_dir=staging.name)
     shutil.rmtree(staging, ignore_errors=True)
+
+    members = _zip_member_map(out)
+    state = git_state()
+    manifest = {
+        "schema": 1,
+        "kind": "server",
+        "version": VERSION_FILE.read_text(encoding="utf-8").strip(),
+        "tag": tag,
+        "branch": state["branch"],
+        "commit": state["full"],
+        "commit_short": state["commit"],
+        "source_dirty": bool(state["dirty"]),
+        "created": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "zip": {"name": out.name, "sha256": sha256_of(out),
+                "bytes": out.stat().st_size},
+        "files": members,
+    }
+    path = server_manifest_path(tag)
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    print("[server] %s（%d 个成员，manifest：%s）" % (out.name, len(members), path.name))
     return out
+
+
+def verify_server_zip(tag: str) -> dict:
+    """重算成员哈希与 ZIP 哈希；任何不一致都拒绝，不用最低版本冒充 provenance。"""
+    zip_path = DIST / ("tjise-server-%s.zip" % tag)
+    manifest_path = server_manifest_path(tag)
+    if not zip_path.is_file():
+        raise SystemExit("[server] 找不到 %s" % zip_path)
+    if not manifest_path.is_file():
+        raise SystemExit("[server] 缺 manifest：%s（先运行 zip_server）" % manifest_path)
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit("[server] manifest 读不了：%s" % exc)
+    if manifest.get("zip", {}).get("sha256") != sha256_of(zip_path):
+        raise SystemExit("[server] ZIP 哈希与 manifest 不一致：候选被改动过")
+    members = _zip_member_map(zip_path)
+    if members != manifest.get("files"):
+        raise SystemExit("[server] ZIP 成员与 manifest 不一致：成员被增删或替换")
+    if manifest.get("version") != VERSION_FILE.read_text(encoding="utf-8").strip():
+        raise SystemExit("[server] manifest 版本与 VERSION 不一致")
+    return {"manifest": manifest, "members": len(members)}
 
 
 def verify_release_assets(version: str) -> dict:

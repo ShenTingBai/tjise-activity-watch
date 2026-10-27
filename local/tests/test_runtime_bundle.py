@@ -777,9 +777,10 @@ class ShutdownAcceptTests(unittest.TestCase):
         barrier = threading.Barrier(2)
         real_validate = app.validate_plan
 
-        def gate_validate(normalized, now=None):
+        def gate_validate(normalized, now=None, signed_activities=None):
             barrier.wait(5)          # 两请求都越过开头 busy 检查后才放行
-            return real_validate(normalized, now=now)
+            return real_validate(normalized, now=now,
+                                 signed_activities=signed_activities)
 
         instances = []
 
@@ -789,6 +790,8 @@ class ShutdownAcceptTests(unittest.TestCase):
             # 真实协调器登记后任务全 queued → snapshot 为 running（busy 判据）；
             # 替身必须还原这一语义，否则最终接纳点的 busy 重检判不出
             inst.snapshot = mock.Mock(return_value={"status": "running"})
+            # Api 的 busy 判定改读已发布状态（P2-1），替身必须还原同一语义
+            inst.published_status = mock.Mock(return_value="running")
             instances.append(inst)
             return inst
 
@@ -884,9 +887,11 @@ class ShutdownAcceptTests(unittest.TestCase):
         boom = mock.Mock()
         boom.start.side_effect = RuntimeError("计划已经在运行")
         boom.snapshot = mock.Mock(return_value={"status": "running"})
+        boom.published_status = mock.Mock(return_value="running")
         ok_inst = mock.Mock()
         ok_inst.plan_id = "p2"
         ok_inst.snapshot = mock.Mock(return_value={"status": "running"})
+        ok_inst.published_status = mock.Mock(return_value="running")
         made = []
 
         def factory(plan_id, specs, runner, emit, now=None):
@@ -1386,6 +1391,30 @@ class BuildEmbedsWorkerTests(unittest.TestCase):
         be_src = read("local/build_exe.py")
         self.assertIn('extra_data=[(worker, "."), (VERSION_FILE, ".")]', be_src,
                       "--add-data 落点与 app.py 解析是同一个资源根（dest=\".\" + basename）")
+
+
+class BusyLockOrderContractTests(unittest.TestCase):
+    """P2-1：持 Api 锁时的 busy 判定只读协调器已发布状态，绝不取协调器锁。"""
+
+    def test_busy_check_uses_published_status_only(self):
+        app = _app()
+        api = app.Api(clock=TestWallClock())
+        plan = mock.Mock()
+        plan.published_status.return_value = "running"
+        plan.snapshot.side_effect = AssertionError("持 Api 锁时不得取协调器锁")
+        api._plan = plan
+        with api._lock:
+            self.assertTrue(api._is_busy_locked())
+        plan.snapshot.assert_not_called()
+
+    def test_busy_false_for_terminal_plan(self):
+        app = _app()
+        api = app.Api(clock=TestWallClock())
+        plan = mock.Mock()
+        plan.published_status.return_value = "completed"
+        api._plan = plan
+        self.assertFalse(api._is_busy_locked())
+        plan.snapshot.assert_not_called()
 
 
 if __name__ == "__main__":

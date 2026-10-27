@@ -152,11 +152,39 @@ class TaskSpec:
         }
 
 
-def validate_plan(activities: Iterable[dict], now: float | None = None) -> dict:
+def _signed_occupancy(rows: Iterable[dict], skip_ids: set[str]) -> list[dict]:
+    """把学校已报名活动收敛成冲突基线；只保留判定所需字段，不携带任何凭证。
+
+    已报名活动的举办时段缺失时不能当作「不冲突」放行——那会让用户在同一时间
+    被安排两场；由 validate_plan 单独报 signed_activity_time_unknown 并阻止计划。
+    """
+    occupancy: list[dict] = []
+    seen: set[str] = set()
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        aid = str(row.get("id") or row.get("activity_id") or "")
+        if not aid or aid in seen or aid in skip_ids:
+            continue
+        seen.add(aid)
+        occupancy.append({
+            "activity_id": aid,
+            "name": str(row.get("name") or "活动"),
+            "act_start": str(row.get("act_start") or ""),
+            "act_end": str(row.get("act_end") or ""),
+        })
+    return occupancy
+
+
+def validate_plan(activities: Iterable[dict], now: float | None = None,
+                  signed_activities: Iterable[dict] | None = None) -> dict:
     """校验计划并返回冲突双方；结果可直接序列化给 UI。
 
     报名截止 sign_end 已过的活动报 sign_end_passed：报名资格看报名截止，
     活动举办时间只用于冲突与完整性检查，不因举办时间已开始/结束而拦截。
+    signed_activities 是学校列表里 signed=true 的全量活动（不是本次选择）：
+    它代表已占用的举办时段，必须与本次选择按 act_start/act_end 半开区间比较；
+    缺少举办时段时保守阻止，不静默放行。
     """
     rows = list(activities or [])
     now_ts = default_now() if now is None else now
@@ -216,10 +244,53 @@ def validate_plan(activities: Iterable[dict], now: float | None = None) -> dict:
     if conflicts:
         errors.append({"kind": "activity_overlap", "conflicts": conflicts})
 
+    # 已报名活动占用的举办时段：与本次选择逐场比较。选中活动自身已报名
+    # 仍走 already_signed；这里只算「外部已占用」的时段，避免重复报同一问题。
+    selected_ids = {spec.activity_id for spec in specs}
+    signed_overlaps: list[dict] = []
+    signed_time_unknown: list[dict] = []
+    for row in _signed_occupancy(signed_activities or [], selected_ids):
+        signed_start = parse_timestamp(row["act_start"])
+        signed_end = parse_timestamp(row["act_end"])
+        if signed_start is None or signed_end is None or signed_end <= signed_start:
+            # 同一场只报一次；全量列表里已报名活动很多，去重避免刷屏
+            if not any(item["activity_id"] == row["activity_id"]
+                       for item in signed_time_unknown):
+                signed_time_unknown.append(dict(row, reason="activity_time_unknown"))
+            continue
+        for spec in specs:
+            start = parse_timestamp(spec.act_start)
+            end = parse_timestamp(spec.act_end)
+            if start is None or end is None or end <= start:
+                continue          # 选中活动自身缺时间已由 activity_time_unknown 报过
+            if intervals_overlap(start, end, signed_start, signed_end):
+                signed_overlaps.append({
+                    "activity_id": spec.activity_id,
+                    "name": spec.name,
+                    "act_start": spec.act_start,
+                    "act_end": spec.act_end,
+                    "signed": {"activity_id": row["activity_id"], "name": row["name"],
+                               "act_start": row["act_start"], "act_end": row["act_end"]},
+                })
+
+    if signed_time_unknown:
+        errors.append({"kind": "signed_activity_time_unknown",
+                       "activity_id": signed_time_unknown[0]["activity_id"],
+                       "name": signed_time_unknown[0]["name"],
+                       "activities": signed_time_unknown})
+    if signed_overlaps:
+        errors.append({"kind": "signed_activity_overlap",
+                       "activity_id": signed_overlaps[0]["activity_id"],
+                       "name": signed_overlaps[0]["name"],
+                       "signed": signed_overlaps[0]["signed"],
+                       "overlaps": signed_overlaps})
+
     return {
         "ok": not errors and bool(specs),
         "errors": errors,
         "conflicts": conflicts,
+        "signed_overlaps": signed_overlaps,
+        "signed_time_unknown": signed_time_unknown,
         "specs": specs,
     }
 
@@ -258,17 +329,40 @@ class PlanCoordinator:
         # 伪造历史。checkpoint 先到先得；attempts/last_reason 跟随最新提交。
         self._details: dict[str, dict] = {}
         self._thread: threading.Thread | None = None
+        # 锁顺序（P2-1）：协调器状态锁只保护内存，绝不跨出本对象调用 emit。
+        # 发布事件统一在释放状态锁之后、由独立的 _emit_lock 串行化：
+        #   Api 锁 → 协调器锁（snapshot）与 协调器锁 → Api 锁（emit）不再构成环。
+        self._emit_lock = threading.Lock()
+        self._emit_errors: list[str] = []
+        # 不可变状态快照：Api 的 busy 判定只读这一个字符串，不取协调器锁
+        self._status_cache = "ready"
+
+    def published_status(self) -> str:
+        """锁外可读的计划状态（只返回已发布的不可变字符串）。"""
+        return str(self._status_cache)
+
+    def _publish(self, kind: str, payload: dict) -> None:
+        """串行发布事件；回调异常隔离，绝不让任务线程死在桥接上（D-05）。"""
+        with self._emit_lock:
+            try:
+                self.emit(kind, payload)
+            except Exception as exc:      # noqa: BLE001 - 回调异常只记录，不杀任务
+                self._emit_errors.append("%s: %s" % (kind, type(exc).__name__))
 
     def start(self) -> None:
         """只启动一个协调线程；批次内部再各起一个任务线程。"""
         with self._lock:
             if self._thread and self._thread.is_alive():
                 raise RuntimeError("计划已经在运行")
-            self.emit("plan", self._plan_payload("ready"))
+            payload = self._plan_payload("ready")
+            self._status_cache = "ready"
             self._thread = threading.Thread(target=self._run, name="signup-plan", daemon=True)
-            self._thread.start()
+        # 事件在状态锁外发布：桥接回调可能同步读 Api 快照（P2-1）
+        self._publish("plan", payload)
+        self._thread.start()
 
     def cancel_task(self, task_id: str) -> bool:
+        payload = None
         with self._lock:
             event = self._events.get(str(task_id))
             state = self._states.get(str(task_id))
@@ -276,10 +370,14 @@ class PlanCoordinator:
                 return False
             event.set()
             if state in {"queued", "waiting"}:
-                self._set_state(str(task_id), "canceled", {"reason": "用户取消了这一场"})
-            return True
+                payload = self._set_state_locked(str(task_id), "canceled",
+                                                {"reason": "用户取消了这一场"})
+        if payload is not None:
+            self._publish("task", payload)
+        return True
 
     def stop(self) -> bool:
+        payloads = []
         with self._lock:
             if self._stop.is_set():
                 return False
@@ -287,12 +385,19 @@ class PlanCoordinator:
             for task_id, event in self._events.items():
                 event.set()
                 if self._states.get(task_id) in {"queued", "waiting"}:
-                    self._set_state(task_id, "canceled", {"reason": "计划已停止"})
-            return True
+                    payload = self._set_state_locked(task_id, "canceled",
+                                                     {"reason": "计划已停止"})
+                    if payload is not None:
+                        payloads.append(payload)
+            # 即使没有可取消场次，停止本身也改变计划状态
+            self._status_cache = self._plan_status_locked()
+        for payload in payloads:
+            self._publish("task", payload)
+        return True
 
     def snapshot(self) -> dict:
         with self._lock:
-            return self._plan_payload(self._plan_status())
+            return self._plan_payload(self._plan_status_locked())
 
     def next_prepare_epoch(self) -> "float | None":
         """仍未终态场次里最早的准备时刻（业务 epoch）；没有返回 None。
@@ -358,13 +463,18 @@ class PlanCoordinator:
                                else max(60.0, float(max(
                                    [int(spec.retry_for_s or 0) for spec in self.specs] or [0])))
                                + 30.0)
-            self.emit("plan_done", {
+            status = self._plan_status()
+            payload = {
                 "plan_id": self.plan_id,
-                "status": self._plan_status(),
-                "ok": self._plan_status() == "completed",
+                "status": status,
+                "ok": status == "completed",
                 "clock_unavailable": clock_lost or None,
                 "summary": self._summary(),
-            })
+            }
+            if self._emit_errors:
+                # 回调异常是事实：作为可审阅字段随终态交出去，不静默吞掉
+                payload["emit_errors"] = list(self._emit_errors)
+            self._publish("plan_done", payload)
 
     @staticmethod
     def _join_threads(threads: list, timeout_s: "float | None" = None) -> None:
@@ -409,15 +519,23 @@ class PlanCoordinator:
         self._set_state(spec.task_id, status, result)
 
     def _set_state(self, task_id: str, status: str, detail: dict | None = None) -> None:
+        """状态写入与事件发布分离：先锁内改状态，再锁外发布（P2-1）。"""
+        payload = self._set_state_locked(task_id, status, detail)
+        if payload is not None:
+            self._publish("task", payload)
+
+    def _set_state_locked(self, task_id: str, status: str,
+                          detail: dict | None = None) -> "dict | None":
+        """调用方持 self._lock；只更新状态与快照，不做任何回调。"""
         with self._lock:
             if task_id not in self._states:
-                return
+                return None
             if self._states[task_id] in TERMINAL_TASK_STATES and status not in TERMINAL_TASK_STATES:
-                return
+                return None
             self._states[task_id] = status
             spec = next((item for item in self.specs if item.task_id == task_id), None)
             if not spec:
-                return
+                return None
             # detail 合并进运行时快照：checkpoint 字段先到先得（重放/迟到的
             # 同名字段不得改写已发生的节点，空值不落库）；其余字段跟随最新。
             merged = self._details.setdefault(task_id, {})
@@ -441,9 +559,15 @@ class PlanCoordinator:
                 "status": status,
             }
             payload.update(merged)
-            self.emit("task", payload)
+            # 状态缓存与状态写入同一临界区：Api 的 busy 判定不需要再取本锁
+            self._status_cache = self._plan_status_locked()
+            return payload
 
     def _plan_status(self) -> str:
+        with self._lock:
+            return self._plan_status_locked()
+
+    def _plan_status_locked(self) -> str:
         states = list(self._states.values())
         if self._stop.is_set():
             return "stopped"
