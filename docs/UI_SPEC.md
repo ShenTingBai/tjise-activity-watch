@@ -12,6 +12,9 @@
 
 - 本工具正式名称统一为**「天软活动预报名工具」**：页面 `document.title`、WebView 窗口标题、README 与本规范一致；辅助弹窗以「使用帮助」标明用途，不用其他产品名。
 - 窄窗口（≤860px 视口）品牌区可使用短标签**「天软预报名工具」**，但不得改正式窗口标题。
+- ≤560px 视口顶栏整行换行：品牌独占首行、动作组按原 DOM 顺序换行、控件 `max-width:100%`
+  且不被 `max-height:720px` 的 50px 顶栏级联裁剪；断点与具体尺寸以
+  `design/specs/terms-consent.md` §八 为唯一来源，本文件不复制数值。
 - 「准点」是早期视觉原型（`design/prototype/`）的历史称呼，只允许出现在历史说明与设计资料里，**不得**作为运行时产品名、窗口标题或帮助标题出现。
 - 名称契约由 `local/tests/test_ui_contract.py` 的 NameContractTests 静态守护。
 
@@ -100,7 +103,7 @@
 
 | 方法 | 参数 | 立即返回 | 结果从哪来 |
 |---|---|---|---|
-| `bootstrap()` | — | `{version, prefs, help, login:{session_present, session_expired, hours_left}, busy}` | 直接返回（同步，别当异步用） |
+| `bootstrap()` | — | `{version, prefs, help, login:{session_present, session_expired, hours_left}, busy, terms:{version, accepted_version, accepted_at}}` | 直接返回（同步，别当异步用）；`terms` 缺 `version` 即条款状态未知 |
 | `help()` | — | `{title, subtitle, steps:[{no,title,text}], note}` | 直接返回 |
 | `front_ready()` | — | `{ok:true}` | 直接返回（可选调用，冒烟用） |
 | `check()` | — | `{ok:true, queued:true}` | `onBackend.check` |
@@ -113,6 +116,7 @@
 | `stop()` | — | `{ok:bool, text?}` | 兼容旧 UI：停止当前计划或单活动任务 |
 | `open_data()` | — | `{ok:true}` | 直接返回 |
 | `save_prefs(patch)` | 对象，浅合并写入统一数据根下的 `ui.json`（先确保数据目录存在） | `{ok:true}` | 直接返回 |
+| `accept_terms(document_version)` | `document_version` = 用户实际读到的内嵌全文版本（`#dlg-terms-document-version`，如 `2026-10-27-r2`） | `{ok:true, terms:{version, accepted_version, accepted_at}}` 或 `{ok:false, error:"terms_version_mismatch", text, terms}` / `{ok:false, text}`（如 prefs 锁竞争） | 直接返回（本机桥接，不进学校 API） |
 
 > `bootstrap()`/`help()` 是唯一可以在 `boot()` 里 `await` 的；其余别 `await` 结果数据。
 
@@ -129,6 +133,7 @@
 | `onBackend.plan_done(payload)` | `{plan_id, status, ok, summary}`；`status` 为 `completed` / `partial` / `failed` / `stopped` |
 
 约定：
+- **条款同意门**（验收条款，版本 `2026-10-27-r2`；界面规范见 `design/specs/terms-consent.md`）：`bootstrap.terms` 缺 `version` 即状态未知（fail closed，本地不许乐观解锁）；未同意或未知时登录、活动列表与报名计划的学校动作停用——后端 `_terms_gate` 与前端横幅双重拦截，demo 豁免不变。`accept_terms(document_version)` 只接受与 `TERMS_VERSION` 严格相等的字符串，校验发生在写入之前：无参、空值、非法类型或不同版本返回 `error:"terms_version_mismatch"` 且**零写入**；prefs 锁竞争沿用 `prefs_busy`。条款决定先于首次欢迎与六步引导（延后到同意后只继续一次，绝不写 `tour_version`）；条款弹窗打开时 document 级 Enter/Esc/Ctrl+F/斜杠/F5 不穿透背景（原生 Tab 与重载保留），保存中的 Esc 被 `cancel` 拦下；已同意同版从帮助打开为只读查看（只有「关闭」，零写入、零学校加载）。条款弹窗排版为三层 DOM：固定标题区、唯一滚动阅读区（反馈与「重新确认状态」在阅读区内，非空反馈回顶不移焦点）、固定底栏三选择动作（可点盒 ≥36px）；窄窗顶栏换行不越界同属本契约——**结构与具体尺寸只写在 `design/specs/terms-consent.md`**，本文件不复制数值。
 - **登录四态**（验收条款，2026-10-26 起取代旧的「三态/校验失败即过期」口径）：「没有登录」= `session.json` 不存在、无法解析或缺少 `token`（`session_present:false`，按钮显示「登录」，胶囊「未登录」）；只有学校接口明确返回 4001/失效才是「登录已过期」；网络异常、超时、组件缺失与认不出的失败一律「暂时无法确认」，不得诱导重新登录，也不得撤销已保存的会话。`hours_left=0` 不能单独代表首次未登录；缺 token 时 `hours_left` 必须为 `null`，不得按 `saved_at` 报假的小时数。四态由 `login_state()` + `_check_result()` 统一产出，`bootstrap` 与 `check` 载荷口径一致。
 - **check 归因看来源行**（验收条款）：`reason`/`hint`/`result` 都基于输出中第一条 `[X]` 来源行判定，失败输出末尾的「请重新登录」指引不得参与归因——HTTPError、URLError、超时、接口异常和认不出的失败一律 `unknown`，只有 4001/明确身份验证失败是 `expired`；网络异常不得转化为重新登录提示。`_do_check` 捕获 worker 启动/解析异常并保证发出一次 `unknown` 结论。
 - `grab` 的 `ok` 由后端从输出里判断（含「报名成功」且退出码 0），`reason` 已去掉 `[X]` 前缀的来源行。

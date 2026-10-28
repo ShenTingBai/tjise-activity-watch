@@ -84,6 +84,119 @@
     </footer>
   </div>
 
+  <!-- 使用条款与隐私告知：首次需要学校网络动作前完整展示；「暂不使用」不退出程序，
+       但登录、活动列表与报名计划保持停用，直到通过横幅或帮助里的入口重新同意。 -->
+  <dialog class="dlg dlg-terms" id="dlg-terms" aria-labelledby="dlg-terms-title" aria-describedby="dlg-terms-sub">
+    <div class="dlg-head terms-head">
+      <h2 id="dlg-terms-title" tabindex="-1">使用条款与隐私告知</h2>
+      <form method="dialog"><button class="dlg-x" type="submit" aria-label="暂不使用并关闭条款"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button></form>
+    </div>
+    <div class="dlg-body terms-body">
+      <div class="terms-feedback">
+        <p class="help-status" id="dlg-terms-status" role="status" aria-live="polite" hidden></p>
+        <button class="btn btn-line" id="btn-terms-recheck" type="button" hidden>重新确认状态</button>
+      </div>
+      <p id="dlg-terms-sub">本份条款 <b id="dlg-terms-document-version">2026-10-27-r2</b>；程序要求版本 <b id="dlg-terms-version">—</b>。同意后才能登录、查看活动列表与开始报名计划。</p>
+      <div class="terms-toolbar">
+        <h3 id="dlg-terms-view-title">条款要点</h3>
+        <button class="btn btn-line" id="btn-terms-full" type="button" aria-controls="dlg-terms-full-text" aria-expanded="false">查看完整条款</button>
+      </div>
+      <section class="terms-summary" id="dlg-terms-summary" aria-labelledby="dlg-terms-view-title">
+        <ul class="terms-points">
+          <li><div class="t">非官方个人作品</div><div class="d">本工具与学校、学校系统运营方及飞书均无隶属、合作或授权关系，按「现状」免费提供，不承诺无缺陷或报名成功。</div></li>
+          <li><div class="t">数据与对外通信</div><div class="d">登录凭据、活动缓存与设置只存在这台电脑的数据目录；学校访问（同意后含周期刷新）、校时和手动更新会联网，没有云端备份。</div></li>
+          <li><div class="t">只做重复操作自动化</div><div class="d">同意后会自动校验登录态并周期刷新活动列表，这些学校访问不限于你手动点击的那一次；名额与结果始终由学校系统决定。</div></li>
+          <li><div class="t">你的义务</div><div class="d">只用本人账号，遵守学校规章制度；不得干扰学校系统、牟利或代他人报名。</div></li>
+          <li><div class="t">责任限制</div><div class="d">在法律允许范围内不对未报上名、账号受限等损失承担责任；法律强制不得排除的责任（含故意或重大过失）不在此列。</div></li>
+        </ul>
+        <p class="rules" id="dlg-terms-gate-note">暂不使用后，登录、活动列表与报名计划保持停用；你仍可查看帮助，之后也能回来同意。</p>
+        <p class="terms-offline">本份条款可离线阅读：全文就在本窗口内，不依赖网络或仓库文档。</p>
+      </section>
+      <section class="terms-document" id="dlg-terms-full-text" hidden aria-label="完整条款">
+        <div class="terms-section terms-preamble"><h3>使用条款与隐私告知</h3><p>版本：<strong>2026-10-27-r2</strong>（程序内条款弹窗与此文件使用同一版本号；条款内容更新后版本号随之更新，程序会请你再次点击同意）</p><p>产品：天软活动预报名工具（本机版 / 服务器版）</p><p>开发者：个人开发者（LiXinwen），非商业、非官方作品</p><p><strong>重要提示</strong>：请完整阅读本条款，特别是第 5 条（使用提醒）、第 6 条（个人信息与对外通信）与第 7 条（责任限制）——这些条款与你存在重大利害关系。若你不同意本条款，可以继续使用帮助、设置与离线演示，但登录、活动列表和报名计划会保持停用。本文件是产品使用说明与隐私告知，不是法律意见；有具体法律疑问请咨询执业律师。</p></div>
+        <div class="terms-section"><h3>1. 定义</h3><ul>
+          <li><strong>本工具</strong>：天软活动预报名工具，含本机版（Windows 图形界面程序）与服务器版（自部署脚本与机器人）。</li>
+          <li><strong>开发者</strong>：编写并公开本工具源码的个人，仅通过 GitHub 与电子邮件与使用者沟通。</li>
+          <li><strong>使用者（你）</strong>：下载、运行或部署本工具的人。</li>
+          <li><strong>学校系统</strong>：你所在学校运营的学生端活动报名平台（含其 App 与网页）。本工具与该系统的运营方不存在任何隶属、合作或授权关系。</li>
+          <li><strong>飞书</strong>：服务器版用来推送消息的第三方即时通讯服务。</li>
+          <li><strong>学校动作</strong>：登录、登录态校验、活动列表拉取、报名提交与报名计划这些会访问学校系统的操作；校时、更新检查、帮助、设置与离线演示不属于学校动作。</li>
+        </ul></div>
+        <div class="terms-section"><h3>2. 条款的接受与生效</h3><ul>
+          <li>本条款在程序首次需要执行学校动作之前完整展示，你点击「我已阅读并同意」后才开始执行学校动作；</li>
+          <li>你选择「暂不使用」时程序<strong>不会退出</strong>：帮助、设置、条款全文与离线演示照常可用，登录、活动列表和报名计划保持停用，并通过横幅与帮助保留重新同意的入口；</li>
+          <li>同一版本在你选择「暂不使用」后不再反复弹窗，但停用状态不变，直到你主动同意；</li>
+          <li><strong>条款版本变化后，程序会再次展示条款并要求你重新点击同意</strong>；此前任何一次的同意都不会自动延伸到新版本；</li>
+          <li>本条款可随时在程序「帮助 → 使用条款与隐私」内与随源码分发的本文件中查阅。</li>
+        </ul></div>
+        <div class="terms-section"><h3>3. 软件性质</h3><ul>
+          <li>本工具是个人开发的辅助工具，<strong>非官方作品</strong>，与学校、学校系统运营方及飞书均无隶属、合作或授权关系；</li>
+          <li>免费开源，代码按 MIT 许可分发（见随包 LICENSE），不含收费项目、广告与商业推广；</li>
+          <li>按「现状」与「现有」提供，不承诺无缺陷、运行不中断或与任意环境兼容；</li>
+          <li>本工具只把「刷新活动列表、到点打开页面并提交报名」这类重复操作自动化；<strong>它不构成报名代理，不承诺报名成功，名额与结果始终由学校系统决定</strong>。</li>
+        </ul></div>
+        <div class="terms-section"><h3>4. 授权范围</h3><ul>
+          <li>代码授权以仓库中的 <strong>LICENSE（MIT）为准</strong>：MIT 授予的权利就是本工具的权利，本条款不新增 LICENSE 之外的分发或使用禁止；</li>
+          <li>MIT 本身要求保留版权与许可声明：再次分发代码或衍生作品时请连同 LICENSE 一起保留，这是许可的条件，不是本工具额外加的限制；</li>
+          <li>使用提醒（不是许可限制）：本工具是个人自用的辅助工具，<strong>请只用于你本人的账号与场景</strong>；若要把它以服务形式提供给他人，相关责任与合规义务由你自行承担。</li>
+        </ul></div>
+        <div class="terms-section"><h3>5. 使用提醒</h3><p>以下不是许可证条款，而是避免把工具用坏的提醒：</p><ul>
+          <li>仅使用你本人的合法账号；</li>
+          <li>遵守学校规章制度与学校系统的用户协议，并自行确认你的使用方式不违反上述规定；</li>
+          <li>不要利用本工具干扰学校系统的正常运行，也不要以本工具对外承揽报名业务；</li>
+          <li>妥善保管你的电脑与账号，设备被他人使用产生的后果由你承担；</li>
+          <li>未满 18 周岁的使用者建议在监护人知情并同意后使用本工具。</li>
+        </ul></div>
+        <div class="terms-section"><h3>6. 个人信息与对外通信</h3><h4>6.1 本机版（Windows 图形界面程序）</h4><ul>
+          <li><strong>处理者</strong>：本工具只在你自己的电脑上运行。开发者不接触、不收集、不存储、不传输你的任何个人信息；</li>
+          <li><strong>信息种类</strong>：登录凭据（Cookie/会话令牌）、活动列表缓存、界面偏好与运行记录；</li>
+          <li><strong>存储位置</strong>：仅本机数据目录——冻结程序为 <code>%LOCALAPPDATA%\TianSoftActivityPreRegistration\data</code>，源码与开发形态为程序目录旁的 <code>local/data/</code>；环境变量 <code>TJISE_DATA_DIR</code> 可以覆盖这个位置（对源码态与冻结 EXE 都生效，相对路径按当前工作目录解析），指定后程序读写的、以及界面「打开数据目录」打开的都是覆盖后的目录；</li>
+          <li><strong>旧数据迁移</strong>：冻结程序第一次使用新数据根时，会把旧版 EXE 旁边的 <code>data/</code> 里的登录态与偏好<strong>复制</strong>到统一数据目录，只补缺失、不覆盖目标已有文件，<strong>源文件保留在原处不删除</strong>；迁移完成后旧 EXE 旁那份副本依然存在，是否删除由你自行确认；</li>
+          <li><strong>保存与删除</strong>：保存到你删除该目录为止。删除某个目录只删除<strong>该目录里</strong>的内容。卸载向导里「是否一并删除登录数据」的确认<strong>只针对默认数据目录</strong> <code>%LOCALAPPDATA%\TianSoftActivityPreRegistration</code>：默认停在「否」，静默卸载一律保留；<code>TJISE_DATA_DIR</code> 指定的目录与旧 EXE 旁的迁移源副本都不在卸载的删除范围内，需要你自行确认路径后逐一清理。<strong>本机是否还存在其他副本（备份、同步盘、系统还原点）不在删除动作的控制范围内</strong>，需要你自行确认。程序不设云端备份，也不向开发者上传任何内容；</li>
+          <li><strong>对外通信（实际会发生的三类）</strong>：<ol>
+            <li><strong>学校系统</strong>：登录、登录态校验、活动列表、报名提交与计划执行——其中登录态校验与活动列表在你同意条款后会按界面操作与周期刷新发生，不限于你手动点击的那一次；</li>
+            <li><strong>网络授时（NTP / 公共 HTTP 时间源）</strong>：程序启动与运行期间会为「独立北京时间」校时，这是时间服务，不携带账号或活动信息；</li>
+            <li><strong>GitHub 发布页</strong>：只有你点「检查更新」或「前往下载页」时才会访问，用于比较版本号，不自动下载、不自动安装；</li>
+          </ol></li>
+          <li>除以上三类，程序不向其他第三方发送数据；<strong>它不内置任何开发者侧的遥测或统计</strong>；</li>
+          <li><strong>你的权利</strong>：查阅与备份（打开数据目录即可）、更正（界面设置）、删除（删除数据目录）、撤回同意（停止使用并删除数据；未同意条款时学校动作本就保持停用）。</li>
+        </ul><h4>6.2 服务器版（自行部署者适用）</h4><ul>
+          <li>部署服务器版的你才是<strong>个人信息处理者</strong>：服务器上的会话文件、活动缓存与推送记录都在你的服务器上，由你负责保管、权限设置与删除；</li>
+          <li>服务器只使用<strong>部署者本人</strong>的学校会话查询活动字段；<strong>群成员不需要、也不要向机器人提供学校账号或密码</strong>（这一点请在群内自行说明）；</li>
+          <li>群机器人只读：向群里推送公开活动信息、回答查询；不替群成员执行任何报名动作；</li>
+          <li>私聊机器人仅服务于部署者本人（owner）的预报名与结果通知；</li>
+          <li><strong>飞书侧接收与保存的数据</strong>：飞书开放平台会把消息与卡片交互事件发到你的服务，其中包含发送者的 <code>open_id</code>、会话 <code>chat_id</code>、消息内容与卡片交互字段；这些数据的保存期限、删除与权限由你决定并负责；</li>
+          <li>凭证（飞书应用凭据、学校会话文件）保存在服务器上，权限应设为仅部署者可读，且不得提交到任何代码仓库。</li>
+        </ul><h4>6.3 日志风险</h4><ul>
+          <li>运行日志不记录账号、密码、验证码、令牌、姓名与学号；</li>
+          <li>但日志可能包含活动名称、时间与你操作的时间线；向外发送日志前请自行核对并脱敏，<strong>不要</strong>把 <code>session.json</code>、<code>storage_state.json</code> 或未脱敏的运行日志发给任何人（包括开发者）。</li>
+        </ul></div>
+        <div class="terms-section"><h3>7. 责任限制</h3><p>在适用法律允许的最大范围内：</p><ul>
+          <li>开发者不对使用或无法使用本工具造成的任何直接或间接损失承担责任，包括未报上名、错过报名、账号被学校限制、数据丢失；</li>
+          <li>因学校系统升级、接口变更或风控策略调整导致功能失效，开发者无义务修复或维持可用；</li>
+          <li>因不可抗力、网络故障或设备故障导致的中断，开发者不承担责任；</li>
+          <li><strong>上述限制不适用于法律不允许排除的情形</strong>，包括但不限于：因故意或者重大过失造成财产损失的责任、造成人身损害的责任，以及法律强制性规定不得排除的其他责任。</li>
+        </ul></div>
+        <div class="terms-section"><h3>8. 知识产权</h3><ul>
+          <li>本工具代码依 MIT 许可证分发；文档与名称的权利归其权利人；</li>
+          <li>学校系统及其页面内容的权利归学校及相关权利人；飞书及其界面的权利归其运营方。</li>
+        </ul></div>
+        <div class="terms-section"><h3>9. 条款变更与终止</h3><ul>
+          <li>条款变更后在程序内与代码仓库中公示，并显示新的版本号；</li>
+          <li><strong>版本变化后必须由你再次点击同意，学校动作才会恢复</strong>；不同意时可以继续使用帮助、设置与离线演示，也可以停止使用并删除数据目录；</li>
+          <li>开发者可随时停止维护或将发布页下架，且不因此承担责任。</li>
+        </ul></div>
+        <div class="terms-section"><h3>10. 法律适用与争议</h3><p>本条款适用中华人民共和国法律。因本工具产生的争议先协商解决；协商不成，向开发者所在地有管辖权的人民法院提起诉讼。</p></div>
+        <div class="terms-section"><h3>11. 联系方式</h3><ul>
+          <li>GitHub Issues：<code>https://github.com/ShenTingBai/tjise-activity-watch/issues</code></li>
+          <li>电子邮件：<code>feng.ye147800@gmail.com</code></li>
+        </ul>
+        <p>反馈问题时请附脱敏截图与文字描述（含版本号）；<strong>不要</strong>发送登录文件或未脱敏的运行日志。</p></div>
+      </section>
+      <span class="help-esc">Esc 暂不使用</span>
+    </div>
+    <div class="dlg-foot terms-foot"><button class="btn btn-line" id="btn-terms-close" type="button" hidden>关闭</button><button class="btn btn-line" id="btn-terms-decline" type="button" title="保持停用登录、活动列表与报名计划，可随时回来重新同意">暂不使用</button><button class="btn btn-blue" id="btn-terms-accept" type="button" title="同意当前版本的使用条款与隐私告知，之后才能登录和报名">我已阅读并同意</button></div>
+  </dialog>
   <!-- 一个帮助面板承载使用与辅助操作；报名状态与更新状态彼此独立。 -->
   <dialog class="dlg dlg-help" id="help" aria-labelledby="help-title">
     <div class="dlg-head help-head">
@@ -102,8 +215,12 @@
           <div class="help-actions"><button class="btn btn-line" id="btn-update-check" type="button">检查更新</button><button class="btn btn-line" id="btn-help-latest" type="button">前往下载页</button></div>
         </div>
         <div class="help-tool-row">
-          <div class="help-tool-text"><h3>本机数据</h3><p>登录信息、工具设置和运行记录保存在这台电脑。</p></div>
+          <div class="help-tool-text"><h3>本机数据</h3><p id="help-data-path">登录信息、工具设置和运行记录保存在这台电脑。</p></div>
           <button class="btn btn-line" id="btn-help-data" type="button">打开数据目录</button>
+        </div>
+        <div class="help-tool-row">
+          <div class="help-tool-text"><h3>使用条款与隐私</h3><p>当前条款版本 <b id="help-terms-version">—</b>；同意记录保存在本机设置里。</p></div>
+          <div class="help-actions"><button class="btn btn-line" id="btn-help-terms" type="button">查看条款</button></div>
         </div>
         <p class="help-status" id="help-status" role="status" hidden></p>
       </section>

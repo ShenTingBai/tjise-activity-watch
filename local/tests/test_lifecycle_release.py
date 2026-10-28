@@ -115,8 +115,11 @@ class AssetNamingTests(unittest.TestCase):
                          "tjise-activity-watch-v1.2.3-win-x64.exe")
         self.assertEqual(self.rel.zip_asset_name(version),
                          "tjise-activity-watch-v1.2.3-win-x64.zip")
+        self.assertEqual(self.rel.installer_asset_name(version),
+                         "tjise-activity-watch-installer-v1.2.3-win-x64.exe")
         self.assertEqual(self.rel.tag_of(version), "v1.2.3")
-        for name in (self.rel.exe_asset_name(version), self.rel.zip_asset_name(version)):
+        for name in (self.rel.exe_asset_name(version), self.rel.zip_asset_name(version),
+                     self.rel.installer_asset_name(version)):
             self.assertTrue(name.isascii(), "下载名必须是 ASCII：%r" % name)
             self.assertNotIn("天软", name, "中文名交给 Release 标题，不进文件名")
 
@@ -124,6 +127,8 @@ class AssetNamingTests(unittest.TestCase):
         """中文产品名仍用于 Release 标题/说明，不能因为改文件名就丢掉品牌。"""
         self.assertEqual(self.rel.PRODUCT_NAME, "天软活动预报名工具")
         notes = self.rel.release_notes("v1.2.3")
+        self.assertIn("tjise-activity-watch-installer-v1.2.3-win-x64.exe", notes,
+                      "说明里的下载名必须与资产名同源（安装器是推荐形态）")
         self.assertIn("tjise-activity-watch-v1.2.3-win-x64.exe", notes,
                       "说明里的下载名必须与资产名同源")
         self.assertIn("tjise-activity-watch-v1.2.3-win-x64.zip", notes)
@@ -269,6 +274,113 @@ class PortableBundleTests(unittest.TestCase):
             self.assertFalse(data2["source_dirty"])
 
 
+class InstallerSourceIntegrationTests(unittest.TestCase):
+    """安装器纳入发布流水线：同一份冻结 EXE 派生三资产，manifest 全量记账。
+
+    全程 mock 构建器（不装 Inno、不跑 PyInstaller），只验证 release.py 的
+    装配契约：谁把哪个文件喂给安装器、产物落哪、manifest 记了什么。
+    """
+
+    VERSION = "1.2.3"
+
+    class _FakeBuilder:
+        """替身 build_installer：记录被喂的 EXE，吐出约定命名的假安装包。"""
+        PRODUCT_NAME = "天软活动预报名工具"
+
+        def __init__(self):
+            self.calls = []
+
+        def build(self, exe, out_dir, version=None, iscc=None):
+            from pathlib import Path as _P
+            # 暂存目录在装配完成后会被整体删除，字节必须在被喂进来时就读下
+            self.calls.append((_P(exe).name, _P(exe).read_bytes(), version))
+            out = _P(out_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            stub = out / ("%s-安装版-%s.exe" % (self.PRODUCT_NAME, version))
+            stub.write_bytes(b"installer-stub")
+            return stub
+
+    def _stage(self, tmp):
+        """跑一遍 stage_local_assets（构建与安装器都 mock），返回 (结果, 假构建器)。"""
+        rel = load_release()
+        frozen_body = b"frozen-exe-body-1.2.3"
+        out = Path(tmp) / "tjise-grab-exe"
+        out.mkdir(parents=True)
+        (out / "tjise-activity-watch.exe").write_bytes(frozen_body)
+        fake = self._FakeBuilder()
+        state = {"branch": "main", "dirty": "", "commit": "f" * 7, "full": "f" * 40}
+        with mock.patch.object(rel, "DIST", Path(tmp)), \
+                mock.patch.object(rel, "git_state", lambda: state), \
+                mock.patch.object(rel, "build_exe_onefile", lambda: out), \
+                mock.patch.object(rel, "BUILD_INSTALLER", fake):
+            got = rel.stage_local_assets(self.VERSION)
+        return rel, got, fake, frozen_body
+
+    def test_installer_built_from_same_frozen_exe(self):
+        """安装器必须吃暂存区里那份冻结 EXE，且与独立 EXE 资产字节一致。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as name:
+            rel, got, fake, frozen = self._stage(name)
+            self.assertEqual(len(fake.calls), 1, "安装器恰构建一次")
+            fed_name, fed_bytes, fed_version = fake.calls[0]
+            self.assertEqual(fed_version, self.VERSION, "版本必须显式传给安装器")
+            self.assertEqual(fed_name, rel.exe_asset_name(self.VERSION),
+                             "喂给安装器的必须是暂存区那份冻结 EXE（白名单净地）")
+            self.assertEqual(fed_bytes, frozen,
+                             "喂给安装器的必须是本次冻结 EXE 的字节")
+            self.assertEqual(fed_bytes, got["exe"].read_bytes(),
+                             "独立 EXE 资产与安装器来源必须是同一份字节")
+            self.assertEqual(got["installer"].read_bytes(), b"installer-stub")
+            self.assertEqual(got["installer"].name, rel.installer_asset_name(self.VERSION),
+                             "上传资产统一 ASCII 名（本地中文名只留在构建目录）")
+
+    def test_manifest_records_all_three_assets(self):
+        """manifest 必须同时记账 ZIP、独立 EXE、安装器的哈希与大小。"""
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as name:
+            rel, got, _fake, _frozen = self._stage(name)
+            data = json.loads(got["manifest"].read_text(encoding="utf-8"))
+            stage_dir = got["manifest"].parent
+            for key in (rel.zip_asset_name(self.VERSION),
+                        rel.exe_asset_name(self.VERSION),
+                        rel.installer_asset_name(self.VERSION)):
+                self.assertIn(key, data["files"],
+                              "manifest 缺 %s 的记录" % key)
+                self.assertEqual(data["files"][key]["sha256"],
+                                 rel.sha256_of(stage_dir / key))
+            self.assertFalse(data["source_dirty"], "mock 干净来源必须如实记账")
+            # 安装器构建的中间目录不留残骸：stage 里只有四份上传物
+            leftovers = sorted(p.name for p in stage_dir.iterdir())
+            self.assertEqual(leftovers,
+                             sorted([rel.zip_asset_name(self.VERSION),
+                                     rel.exe_asset_name(self.VERSION),
+                                     rel.installer_asset_name(self.VERSION),
+                                     "manifest.json"]),
+                             "暂存目录不得留下 .installer-build/.zip-root 残骸")
+
+    def test_installer_failure_fails_prepare(self):
+        """安装器构建失败（如没装 ISCC）：prepare 整体失败，不产出半套资产。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as name:
+            rel = load_release()
+            out = Path(name) / "tjise-grab-exe"
+            out.mkdir(parents=True)
+            (out / "tjise-activity-watch.exe").write_bytes(b"frozen")
+            state = {"branch": "main", "dirty": "", "commit": "f" * 7, "full": "f" * 40}
+
+            class BrokenBuilder:
+                def build(self, *a, **k):
+                    raise SystemExit("[iss] 没找到 Inno Setup 编译器（ISCC.exe）")
+
+            with mock.patch.object(rel, "DIST", Path(name)), \
+                    mock.patch.object(rel, "git_state", lambda: state), \
+                    mock.patch.object(rel, "build_exe_onefile", lambda: out), \
+                    mock.patch.object(rel, "BUILD_INSTALLER", BrokenBuilder()):
+                with self.assertRaises(SystemExit):
+                    rel.stage_local_assets(self.VERSION)
+
+
 class AssetVerificationTests(unittest.TestCase):
     """R1/R2：publish 前逐项核验候选资产；拒绝路径全部在 tag/push/upload 之前。
 
@@ -285,20 +397,23 @@ class AssetVerificationTests(unittest.TestCase):
                 "commit": (full or "f" * 40)[:7], "full": full or "f" * 40}
 
     def _candidate(self, tmp, version=VERSION, dirty=""):
-        """在临时 DIST 下搭一份候选：EXE + 四成员白名单 ZIP（内外 EXE 字节一致）+ 真实 write_manifest。"""
+        """在临时 DIST 下搭一份候选：EXE + 四成员白名单 ZIP（内外 EXE 字节一致）
+        + 安装器 + 真实 write_manifest。"""
         import zipfile as zf_mod
         stage = Path(tmp) / ("release-" + self.rel.tag_of(version))
         stage.mkdir(parents=True, exist_ok=True)
         exe = stage / self.rel.exe_asset_name(version)
         zp = stage / self.rel.zip_asset_name(version)
+        inst = stage / self.rel.installer_asset_name(version)
         exe.write_bytes(b"exe-body")
+        inst.write_bytes(b"installer-body")
         with zf_mod.ZipFile(zp, "w") as zf:
             zf.writestr(self.rel.exe_asset_name(version), b"exe-body")   # 内外 EXE 一致
             zf.writestr("README.md", "readme")
             zf.writestr("启动说明.txt", "note")
             zf.writestr("LICENSE", "lic")
         manifest = self.rel.write_manifest(stage, version, self.rel.tag_of(version),
-                                           [zp, exe], build_state=self._state(dirty))
+                                           [zp, exe, inst], build_state=self._state(dirty))
         return stage, exe, zp, manifest
 
     def _patched(self, tmp):
@@ -314,6 +429,9 @@ class AssetVerificationTests(unittest.TestCase):
                 self._candidate(name)
                 got = self.rel.verify_release_assets(self.VERSION)
                 self.assertEqual(got["exe"].name, self.rel.exe_asset_name(self.VERSION))
+                self.assertEqual(got["installer"].name,
+                                 self.rel.installer_asset_name(self.VERSION),
+                                 "安装器是第三份必验资产，缺了就是候选不完整")
                 self.assertEqual(got["manifest"].name, "manifest.json")
             finally:
                 mock.patch.stopall()
@@ -342,6 +460,12 @@ class AssetVerificationTests(unittest.TestCase):
 
         def tamper_exe(stage, exe, zp, manifest):
             exe.write_bytes(b"tampered")
+
+        def tamper_installer(stage, exe, zp, manifest):
+            (stage / self.rel.installer_asset_name(self.VERSION)).write_bytes(b"tampered")
+
+        def drop_installer(stage, exe, zp, manifest):
+            (stage / self.rel.installer_asset_name(self.VERSION)).unlink()
 
         def set_wrong_bytes(stage, exe, zp, manifest):
             data = json.loads(manifest.read_text(encoding="utf-8"))
@@ -376,6 +500,7 @@ class AssetVerificationTests(unittest.TestCase):
 
         cases = [("dirty", set_dirty), ("stale-head", set_stale_head),
                  ("wrong-version", set_wrong_version), ("hash", tamper_exe),
+                 ("installer-hash", tamper_installer), ("installer-missing", drop_installer),
                  ("size", set_wrong_bytes), ("extra-member", add_data_member),
                  ("inner-exe-mismatch", swap_inner_exe)]
         messages = {"extra-member": "白名单", "inner-exe-mismatch": "ZIP 内主 EXE"}
@@ -499,9 +624,11 @@ class AssetVerificationTests(unittest.TestCase):
                 self.assertEqual(recorded["tag"][0], tag)
                 self.assertEqual(recorded["tag"][1], "f" * 40,
                                  "tag 必须绑定完整 HEAD")
-                self.assertEqual(recorded["upload"][1],
-                                 [zp.name, exe.name, "manifest.json"],
-                                 "上传清单=完整 ZIP + 单文件 EXE + manifest")
+                expected_upload = [zp.name, exe.name,
+                                   self.rel.installer_asset_name(self.VERSION),
+                                   "manifest.json"]
+                self.assertEqual(recorded["upload"][1], expected_upload,
+                                 "上传清单=完整 ZIP + 单文件 EXE + 安装器 + manifest")
                 self.assertFalse(recorded["upload"][2], "默认不覆盖已有附件")
             finally:
                 mock.patch.stopall()
@@ -738,14 +865,16 @@ class ConfirmedSourceRecheckTests(unittest.TestCase):
         stage.mkdir(parents=True, exist_ok=True)
         exe = stage / self.rel.exe_asset_name(version)
         zp = stage / self.rel.zip_asset_name(version)
+        inst = stage / self.rel.installer_asset_name(version)
         exe.write_bytes(b"exe-body")
+        inst.write_bytes(b"installer-body")
         with zf_mod.ZipFile(zp, "w") as zf:
             zf.writestr(self.rel.exe_asset_name(version), b"exe-body")   # 内外 EXE 一致
             zf.writestr("README.md", "readme")
             zf.writestr("启动说明.txt", "note")
             zf.writestr("LICENSE", "lic")
         manifest = self.rel.write_manifest(stage, version, self.rel.tag_of(version),
-                                           [zp, exe], build_state=self._state())
+                                           [zp, exe, inst], build_state=self._state())
         return stage, exe, zp, manifest
 
     def _run_do_publish(self, tmp, source_commits, mutate_after_confirm=None):

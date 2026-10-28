@@ -26,7 +26,7 @@ for _path in (str(LOCAL), str(TESTS)):
         sys.path.insert(0, _path)
 
 from fixtures.business_clock import TestWallClock  # noqa: E402
-from local.signup_plan import TaskSpec, validate_plan  # noqa: E402
+from local.signup_plan import TaskSpec, parse_timestamp, validate_plan  # noqa: E402
 
 
 def list_row(aid, name, sign_start, sign_end, act_start, act_end, signed=False):
@@ -80,7 +80,10 @@ class SignedLagContractTests(unittest.TestCase):
 class SignedOccupancyContractTests(unittest.TestCase):
     """已报名活动与本次选择按举办时段判冲突。"""
 
-    NOW = TestWallClock().now()
+    # 业务时间固定在报名窗口内（东八区 aware 时间戳）：防止机器日期轮换晚于
+    # 夹具 sign_end（2026-10-27 23:59:59）而先触发截止门禁；断言的时间形状与
+    # 冲突语义不变，parse_timestamp 与真实实现同源（见 local/signup_plan.py）。
+    NOW = parse_timestamp("2026-10-27 12:00:00").timestamp()
 
     def test_seven_real_shaped_activities_keep_selection_clean(self):
         # 真实列表有 7 场；这里保留同样数量级，验证全量基线不会误报

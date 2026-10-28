@@ -19,7 +19,7 @@
 | 群里 @ 查询 | 飞书群 @机器人（`BOT_ROLE=group_query`） | 只读：待开放 / 报名已开放 / 全部，卡片回复，没有任何个人动作 |
 | 私人提醒 | cron 07:05 | 只发 owner 私聊：今天要参加的活动 |
 | 预报名 | owner 私聊卡片按钮（`BOT_ROLE=private_owner`） | 点一下排队，可再点取消；群里点会被拒绝 |
-| 到点抢报名 | watchlist_runner（每分钟） | **只执行 owner 自己清单里的场次**，开放时刻点「立即报名」，结果私聊回报 |
+| 到点自动报名 | watchlist_runner（每分钟） | **只执行 owner 自己清单里的场次**，开放时刻点「立即报名」，结果私聊回报 |
 | 登录态续期 | `tjise-login` 守护进程 | 每 2 小时校验，成功即刷新会话文件 |
 | 失效重登 | `tjise-autologin.timer`（每 5 分钟） | 探针判失效才动作；用满 8h 主动换新；验证码 OCR（ddddocr 主 + Tesseract 兜底），最多 5 次、间隔 30 秒 |
 | 监控告警 | token 探针 / 出网自检 | 连续 2 次失败才私聊告警，同一周期只提醒一次 |
@@ -108,18 +108,29 @@ BOT_ROLE=group_query node bot/bot.js --selftest    # 打印该角色允许/拒�
 | [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md) | 数据流、模块职责、接口清单、去重机制 |
 | [docs/OPERATIONS.md](../docs/OPERATIONS.md) | 服务器布局、systemd、crontab、日志、部署更新、回滚 |
 | [docs/LOGIN.md](../docs/LOGIN.md) | token 寿命实测、守护续期、验证码 OCR 无人值守登录 |
-| [docs/GRAB.md](../docs/GRAB.md) | 预报名状态机、到点抢报名时间线 |
+| [docs/GRAB.md](../docs/GRAB.md) | 预报名状态机、到点自动报名时间线 |
+| [docs/TERMS_AND_PRIVACY.md](../docs/TERMS_AND_PRIVACY.md) | 使用条款与隐私告知（服务器版的数据边界） |
 | [docs/TIMING_AND_DEDUP_ANALYSIS.md](../docs/TIMING_AND_DEDUP_ANALYSIS.md) | 推送时点与去重推导、请求量账本 |
 
-## 边界
+## 边界（部署者是唯一的凭证持有人）
 
-- 只服务**本人账号**：不代他人报名、不做多账号批量报名、不占位。
-- **公共群只读**：群机器人只回答公开活动查询，不含个人报名状态，也不提供任何报名按钮。
-- **私聊只服务 owner**：`PRIVATE_OWNER_OPEN_ID` 那一个人；别人私聊只能得到「只对账号主人提供」的固定回答。
+服务器版的所有学校会话与飞书凭据都由**部署者本人**管理：
+
+- **凭证由部署者保管**：学校会话（`/root/tjise-login`）、飞书应用凭据（`config.json`，
+  权限 600）、`credentials.json`（唯一放账号密码的地方，`set_credentials.py` 交互写入）。
+  它们只存在于部署者的服务器上，不入库、不外发。
+- **群聊只读**：群机器人用部署者会话查询公开活动字段并推送/答问；**群成员不登录学校
+  系统，也不要向机器人提供学校账号或密码**——这不是匿名访问学校接口，而是部署者会话
+  的只读代答。
+- **私聊才处理个人操作**：仅 `PRIVATE_OWNER_OPEN_ID` 对应的部署者本人可以预报名、
+  收到结果回报；机器人不替任何群成员执行报名。
+- **公共群不含个人状态**：群机器人只回答公开活动查询，不含个人报名状态，也不提供任何报名按钮。
 - **动态发现不执行动作**：`activity_watch.py` 只读学校公开活动，永不调用报名入口，也不读写个人清单。
 - 日志不写账号、密码、验证码、token、姓名；`credentials.json` 与 `storage_state.json` 权限 600。
-- 只有你点了「预报名」的活动才会自动抢，不做无差别报名。
+- 只有部署者点了「预报名」的活动才会自动提交，不做无差别报名。
+- 向群成员提供推送服务前，请先向他们说明 [docs/TERMS_AND_PRIVACY.md](../docs/TERMS_AND_PRIVACY.md)
+  的数据边界：服务器版的数据处理者是你（部署者）本人。
 
 ---
 
-想在自己电脑上抢一两场、不想维护服务器：用仓库的 [`local` 分支](https://github.com/ShenTingBai/tjise-activity-watch/tree/local)（本机版）。
+想在自己电脑上报一两场、不想维护服务器：用仓库的 [`local` 分支](https://github.com/ShenTingBai/tjise-activity-watch/tree/local)（本机版）。

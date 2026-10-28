@@ -216,6 +216,26 @@ class LoginStateContractTests(unittest.TestCase):
 class CheckGateContractTests(unittest.TestCase):
     """check 归因与开始门禁：网络异常不得误判 expired；未确认登录不能开始真实计划。"""
 
+    def setUp(self):
+        """本类只验证登录态之后的 start_plan 业务校验：先把偏好钉到临时 ui.json，
+        再写入当前版本的条款同意，让 start_plan 先过 _terms_gate，否则断言
+        拿到的是 terms_required 而不是登录/截止/计划校验的结论。
+
+        同意状态只落在这轮临时文件的 terms_version / terms_accepted_at 两个键上，
+        不读写开发者真实数据目录，也不改本类任何一条原断言；未同意状态、
+        旧版本与 demo 豁免的专测在 test_terms_consent.py 里照旧构造。
+        """
+        app = self._app()
+        prefs_tmp = tempfile.TemporaryDirectory(prefix="tjise-terms-prefs-")
+        self.addCleanup(prefs_tmp.cleanup)
+        patcher = mock.patch.object(app, "PREFS",
+                                    Path(prefs_tmp.name) / "ui.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        if not app.update_prefs({"terms_version": app.TERMS_VERSION,
+                                 "terms_accepted_at": "2026-10-27 12:00:00"}):
+            self.fail("条款同意偏好夹具写入失败")
+
     def _app(self):
         sys.path.insert(0, str(LOCAL))
         try:

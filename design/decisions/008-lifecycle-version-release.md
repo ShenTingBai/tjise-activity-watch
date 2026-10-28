@@ -159,3 +159,28 @@ UTC），v2 缺失时退回旧文本路径并保持旧质量语义。软件版�
 - **实测范围**：本轮用真实双子进程验证「A 启动 → B 接管 → A 迟到心跳/关闭」
   与「B 持锁 0.4 秒时 A 的偏好保存必须等锁后合并」，证明归属与排他；
   这不等于真实学校时钟或跨机器场景已验收。发布规则、资产白名单与版本号均未改变。
+
+## 2026-10-27 分发契约补记（计划 20261027-distribution-contract-release）
+
+决策 010 的「独立 EXE + 四成员 ZIP」两资产口径自本轮起**扩展为三资产**：
+
+- **新增安装版安装器为正式 Release 资产**（推荐下载项）。上传名固定 ASCII：
+  `tjise-activity-watch-installer-vX.Y.Z-win-x64.exe`；本地 Inno 产物中文名只留在构建目录。
+- **同源规则**：`tools/release.py --prepare` 构建一次冻结 onefile EXE，由**同一份 EXE** 派生
+  独立 EXE、完整 ZIP 与安装器（经 `build_installer.build()` 显式传参，安装器不得自行重新
+  构建主程序）；manifest 记录三资产名称/大小/SHA-256，publish 逐项复核。
+- **安装器核验边界**：不与 EXE 比原始字节（自解压容器）；同源证据 = 授权后的安装探针
+  （隔离临时目录静默安装，安装出的主 EXE SHA-256 与独立 EXE 一致）。
+- **绿色版降级为历史形态**：v1.0.2 及以前的 `tjise-grab-portable-*.zip` 保留历史资产与
+  `make_portable.py` 构建能力，不再进入正式资产清单；旧 Release 页标注「已停止更新」
+  属发布侧人工动作。`check_only` 的必需输入相应加入 `build_installer.py` 与
+  `local/installer/ChineseSimplified.isl`（语言文件随仓库走，UTF-8 带 BOM 例外见
+  `local/tests/test_installer_script.py`）。
+- AppId/产品名/数据目录**不改**：`{{8B1E9C4A-…-7E14}`、`TjiseActivityWatch`、
+  `TianSoftActivityPreRegistration` 保持稳定，升级覆盖安装与登录态迁移不因此破坏；
+  产品名全仓统一为「天软活动预报名工具」（安装向导/卸载项/安装包文件名同一口径）。
+- 实机装/卸验收已在 2026-10-27 完成一轮（静默装到 `%LOCALAPPDATA%\Programs`、
+  安装目录无 data/、`--runtime-check` 通过、静默卸载保留数据目录）；**安装后哈希探针与
+  三资产正式构建仍待授权执行**，不得引用旧轮数字冒充。
+
+决策 013 记录分发形态、条款同意策略与服务器版认证边界的完整规则。

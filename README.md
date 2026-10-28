@@ -12,7 +12,7 @@
 <sub>当前界面（mock 演示数据，待用户验收）；六步引导的分步截图见 [design/current-ui/](design/current-ui/)。</sub>
 
 > **适用对象**：天津市大学软件学院（天软）**专升本**学生。项目按该校学生端的接口与页面写死；换学校要改 `SCHOOL_ORIGIN` 与接口适配，不在支持范围内。
-> **不适用范围**：不代他人报名、不多账号批量占位、不抢别人的名额。
+> **不适用范围**：不代他人报名、不多账号批量占位、不占用他人的报名名额。
 
 ## 目录
 
@@ -32,10 +32,10 @@
 
 ## 这是什么
 
-学校学生端每天挂着各种「校园活动」：有的要卡点抢报名，有的报名了但时间在几天后容易忘。这个项目做两件事：
+学校学生端每天挂着各种「校园活动」：有的报名开放时间一到就要手动点，有的报上了但活动在几天后容易忘。这个项目做两件事：
 
 1. **盯**：定时把「今天要参加的」「即将开放报名的」整理成卡片，推到飞书群，人手一份。
-2. **抢**：开放报名的那一刻自动点「立即报名」，结果回执发到私聊。
+2. **报名**：在报名开放的那一刻自动点「立即报名」，结果回执发到私聊。
 
 登录态寿命不稳定：实测 10.7～17.5 小时。服务器版用守护进程每 2 小时续一次，用到 8 小时主动换新；真失效了用验证码 OCR 无人值守重登，连续失败再私聊告警。
 
@@ -43,23 +43,31 @@
 
 | 你的情况 | 用这个 | 需要什么 |
 |---|---|---|
-| 只想抢某一两场，不想维护服务器 | [本机版](#快速开始--本机版5-分钟)（`local/` / Release 绿色版） | 一台 Windows，双击就能跑 |
+| 只想报某一两场，不想维护服务器 | [本机版](#快速开始--本机版5-分钟)（`local/` / Release 正式资产） | 一台 Windows，双击就能跑 |
 | 想让群里同学都能看推送，还想 @ 查询 | [服务器版](#快速开始--服务器版15-分钟)（`server/`） | 一台 7×24 Linux + 飞书自建应用 |
 
-两版共用同一套接口知识，抢报名时序完全一致（提前开详情页 → 开放前 reload → 点按钮 → 读返回码 → 复核结果）。
+两版共用同一套接口知识，报名时序完全一致（提前开详情页 → 开放前 reload → 点按钮 → 读返回码 → 复核结果）。
 
 ## 快速开始 · 本机版（5 分钟）
 
-**不想装 Python**：到 [Releases](https://github.com/ShenTingBai/tjise-activity-watch/releases) 下载本机版资产，任选其一：
+**不想装 Python**：到 [Releases](https://github.com/ShenTingBai/tjise-activity-watch/releases) 下载**当前 Release 实际提供**的本机版资产（以发布页附件为准）：
 
-- `tjise-activity-watch-vX.Y.Z-win-x64.zip`（**完整便携包，推荐**）：独立 EXE、README 和启动说明都在里面，解压双击主 EXE 即用；
-- `tjise-activity-watch-vX.Y.Z-win-x64.exe`：**独立可用单文件**——程序组件（grab-worker）已内置，拷到任何空目录双击即可，不再需要同目录的 worker；
-- `tjise-grab-portable-*.zip` 绿色版：解压双击 `启动.bat`。
+- `tjise-activity-watch-vX.Y.Z-win-x64.zip`（**完整 ZIP，免安装**）：独立 EXE、README 和启动说明都在里面，解压双击主 EXE 即用；
+- `tjise-activity-watch-vX.Y.Z-win-x64.exe`：**独立可用单文件**——程序组件（grab-worker）已内置，拷到任何空目录双击即可。
 
+> **安装版目前是候选，还没发布**：`tjise-activity-watch-installer-vX.Y.Z-win-x64.exe`
+> 的构建脚本与文件清单已经就绪（`local/build_installer.py`），会随下一个正式版本并列发布；
+> 在那之前发布页上不会有这个附件，也请不要把它当作已发布资产去找。候选阶段只能
+> 自己在干净工作区构建试用。
+>
+> 已发布的两种形态的程序本体是同一份 EXE（manifest 记录哈希可核验），登录态都只写
+> `%LOCALAPPDATA%\TianSoftActivityPreRegistration\data`，不会写进安装目录。
+> v1.0.2 及更早的 `tjise-grab-portable-*.zip` **绿色版是历史形态，已停止新增发布**：
+> 数据在程序旁边的 `data/`，仅旧版本可用，新用户请用上面两种。
 > 下载名固定用 ASCII 基名：GitHub 会把中文前缀规范化，v1.1.0 上传时就靠人工改过一次名
 > （见 `tools/release.py` 的 `exe_asset_name`）。中文产品名只出现在 Release 标题和包里说明。
-> 独立 EXE 与四成员 ZIP 形态自 v1.1.0 起生效；**v1.1.0 已于 2026-10-26 发布**，
-> 1.1.1 是尚未上传的补丁候选（真实学校窗口仍待用户真机验收）。
+> 独立 EXE 与四成员 ZIP 形态自 v1.1.0 起生效并**已于 2026-10-26 发布**；当前工作区版本
+> 1.1.1 仍是尚未上传的补丁候选（真实学校窗口仍待用户真机验收）。
 
 右上角 **「帮助」** 集中三步使用说明、重看六步引导、当前版本和本机数据目录。点「检查更新」才会查询 GitHub 最新正式版并比较版本；失败会显示原因与重试入口，当前候选比正式版新时明确提示「当前为预览版本」。检查结果附检查时间，不自动下载或安装；「查看发布页」用系统浏览器打开 [最新发布](https://github.com/ShenTingBai/tjise-activity-watch/releases/latest)。当前版本以 [VERSION](VERSION) 为准。
 
@@ -123,7 +131,7 @@ python3 scripts/run.py --force        # 真推一次
 | 群里 @ 查询 | 飞书群 @机器人 | 待开放 / 已开放 / 全部活动，卡片回复 |
 | 私人提醒 | cron 07:05 | 只发 owner 私聊：今天要参加的活动 |
 | 预报名 | 私聊卡片按钮 | 点一下排队，可再点「取消预报名」 |
-| 到点抢报名 | watchlist_runner（每分钟） | 到开放时刻自动点「立即报名」并私聊回报 |
+| 到点自动报名 | watchlist_runner（每分钟） | 到开放时刻自动点「立即报名」并私聊回报 |
 | 本机多活动计划 | `local/app.py` 图形界面（天软活动预报名工具） | 多选活动、跨批次等待、同批非冲突并发、逐场取消和整计划停止 |
 | 登录态续期 | tjise-login 守护进程 | 每 2 小时校验一次，成功即刷新会话文件 |
 | 失效重登 | tjise-autologin.timer（每 5 分钟） | 探针判失效才动作；用满 8h 主动换新；验证码 OCR（ddddocr 主 + Tesseract 兜底），最多 5 次、间隔 30 秒 |
@@ -137,7 +145,7 @@ python3 scripts/run.py --force        # 真推一次
 | 登录 | 无人值守：探针判失效 → 验证码 OCR 重登，5 次失败私聊告警（30 分钟后下一轮继续试） | 手动弹真实 Chrome 登录一次，token 存本地 |
 | 能力 | 定时日报、群 @ 查询、私聊预报名、到点自动报名、失效重登、断网自检 | 多活动报名计划、活动时段冲突检查、签到/签退要求筛选、图形界面 |
 | 依赖 | Python + Node 20 + Chromium + ddddocr + Tesseract + cron | Python + Playwright（或本机 Chrome） |
-| 适合 | 7×24 盯着，群里同学都能看 | 只想抢某一两场，不想维护服务器 |
+| 适合 | 7×24 盯着，群里同学都能看 | 只想报某一两场，不想维护服务器 |
 
 ## 飞书机器人怎么建
 
@@ -161,7 +169,7 @@ cp server/config.example.json server/config.json   # 再填 webhook / 应用凭�
 
 ## 常见问题
 
-**Q：抢报名会不会被学校查到/封号？**
+**Q：自动报名会不会被学校查到/封号？**
 只操作你自己的账号、只在开放时刻点一次、不批量。请求量和人工点几下差不多（每天约 400 次业务接口，含 288 次带 token 的探针）。
 
 **Q：推送没样式，是一段纯文本？**
@@ -179,8 +187,8 @@ cp server/config.example.json server/config.json   # 再填 webhook / 应用凭�
 **Q：私聊一条都收不到？**
 先查 `data/remind.log` 有没有 `[i] 未配置 PRIVATE_OWNER_OPEN_ID`；再对照 [docs/CONFIG.md](docs/CONFIG.md) 的四条判据。
 
-**Q：能给我舍友的账号也抢吗？**
-不能。多账号批量报名属于占位，会损害其他同学，也容易触发平台风控。本机版给舍友自己跑，各自抢各自的。
+**Q：能代我舍友的账号报名吗？**
+不能。多账号批量报名属于占位，会损害其他同学，也容易触发平台风控。本机版给舍友自己跑，各自处理各自账号的报名。
 
 ## 目录结构
 
@@ -188,7 +196,7 @@ cp server/config.example.json server/config.json   # 再填 webhook / 应用凭�
 tjise-activity-watch/
 ├── server/        # 服务器版：scripts/（生产脚本）bot/（飞书机器人）deploy/（systemd、登录）tests/
 ├── local/         # 本机版：app.py + grab.py + signup_plan.py + ui/ + 打包入口
-├── docs/          # 架构、运维、登录、抢报名、时点推导、飞书机器人、配置
+├── docs/          # 架构、运维、登录、自动报名、时点推导、飞书机器人、配置
 ├── tools/         # 发版工具（拆分支、打 zip、发 Release）
 └── README.md / CHANGELOG.md / LICENSE
 ```
@@ -216,15 +224,16 @@ tjise-activity-watch/
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | 服务器布局、systemd、crontab、日志、部署更新、回滚、故障处理 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 数据流、模块职责、接口清单、去重机制 |
 | [docs/LOGIN.md](docs/LOGIN.md) | token 寿命实测、守护续期、验证码 OCR 无人值守登录 |
-| [docs/GRAB.md](docs/GRAB.md) | 预报名状态机、到点抢报名时间线、结果回执 |
+| [docs/GRAB.md](docs/GRAB.md) | 预报名状态机、到点自动报名时间线、结果回执 |
 | [docs/TIMING_AND_DEDUP_ANALYSIS.md](docs/TIMING_AND_DEDUP_ANALYSIS.md) | 推送时点与去重的设计推导、请求量账本 |
+| [docs/TERMS_AND_PRIVACY.md](docs/TERMS_AND_PRIVACY.md) | 使用条款与隐私告知（本机版/服务器版的数据边界） |
 | [CHANGELOG.md](CHANGELOG.md) | 变更记录 |
 
 ## 边界与安全
 
 - 只服务**本人账号**：不代他人报名、不做多账号批量报名、不占位。
 - 日志不写账号、密码、验证码、token、姓名；`credentials.json` 与 `storage_state.json` 权限 600。
-- 抢报名只在用户明确点了「预报名」的清单内动作，不会无差别抢。
+- 自动报名只在用户明确点了「预报名」的清单内动作，不会无差别提交。
 - 本项目与学校无关，接口若有调整，随时可能失效。
 
 ## License

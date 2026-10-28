@@ -51,6 +51,16 @@ APP_FILES = [
 
 UI_DIR = "ui"                    # 界面本体（HTML/CSS/JS）
 
+# 运行时会落在 data/ 里的文件名（与 runtime_paths.py 的 SESSION_FILE / STATE_FILE /
+# UI_STATE_FILE / LOG_FILE 对齐）。打包前逐个删掉，避免本机残留混进发布包。
+RUNTIME_DATA_FILES = (
+    "session.json",        # 登录态
+    "storage_state.json",  # 浏览器 cookie
+    "ui.json",             # 界面偏好
+    "ui.json.lock",        # 偏好文件写锁
+    "grab.log",            # 运行日志
+)
+
 PY_DIR_NAME = "python"          # 便携解释器放在这里
 LAUNCHER = "启动.bat"
 
@@ -212,7 +222,18 @@ def copy_app(out: Path) -> None:
     lic = HERE.parent / "LICENSE"
     if lic.exists():
         shutil.copy2(lic, out / "LICENSE")
-    (out / "data").mkdir(exist_ok=True)
+    # 绿色版的数据目录随程序走（DATA_DIR 就是 out/data），本机试跑过便携版、
+    # 或者图省事在 dist 里直接启动时，data/ 会落下 ui.json / session.json。
+    # 而 out 目录是复用重写的（main() 只 mkdir 不清空），这里不主动清理的话，
+    # 这些本机运行时文件会被一直带进后续每个发布 zip —— 同学解压后会继承到
+    # 你的界面偏好，最坏情况是本机的登录态。按名字精确删，不碰子目录。
+    data = out / "data"
+    data.mkdir(exist_ok=True)
+    for name in RUNTIME_DATA_FILES:
+        victim = data / name
+        if victim.is_file():
+            victim.unlink()
+            log("  清理打包残留：data/%s" % name)
 
 
 def write_launcher(out: Path) -> None:

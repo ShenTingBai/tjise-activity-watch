@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -3239,6 +3240,95 @@ out.push({ latest, data, url: RELEASES_LATEST_URL });
         self.assertIn("没有权限", case["data"]["text"])
         self.assertEqual(case["data"]["tone"], "bad")
 
+    def test_open_data_success_writes_real_path_into_help_text(self):
+        """成功打开数据目录：真实路径进正文说明行，错误位保持隐藏。"""
+        res = run_js(r"""
+const realPath = "C:\\Users\\demo\\AppData\\Local\\TianSoftActivityPreRegistration\\data";
+window.pywebview = { api: {
+  open_data: () => Promise.resolve({ ok: true, path: realPath }),
+} };
+document.querySelector("#btn-help").click();
+document.querySelector("#btn-help-data").click();
+await Promise.resolve(); await Promise.resolve();
+const line = document.querySelector("#help-data-path");
+const status = document.querySelector("#help-status");
+out.push({ lineText: line.textContent, statusHidden: status.hidden,
+  statusText: status.textContent });
+""")
+        case = res[0]
+        self.assertIn("C:\\Users\\demo", case["lineText"],
+                      "用户最常问的就是数据在哪，真实路径必须写在正文里")
+        self.assertTrue(case["statusHidden"], "成功不是错误，不得点亮错误位")
+        self.assertEqual(case["statusText"], "", "错误位不得混入成功路径")
+
+    def test_open_data_failure_keeps_help_text_and_shows_reason(self):
+        """失败时正文说明行不被清空或污染，错误只进错误位。"""
+        res = run_js(r"""
+window.pywebview = { api: {
+  open_data: () => Promise.reject(new Error("目录被占用")),
+} };
+document.querySelector("#btn-help").click();
+const line = document.querySelector("#help-data-path");
+const before = line.textContent;
+document.querySelector("#btn-help-data").click();
+await Promise.resolve(); await Promise.resolve();
+const status = document.querySelector("#help-status");
+out.push({ before, after: line.textContent, statusHidden: status.hidden,
+  statusText: status.textContent });
+""")
+        case = res[0]
+        self.assertEqual(case["after"], case["before"],
+                         "失败不改写正文说明，重试语义由错误位承载")
+        self.assertNotIn("目录被占用", case["after"], "错误原因不得污染正文行")
+        self.assertFalse(case["statusHidden"])
+        self.assertIn("打不开数据目录", case["statusText"])
+        self.assertIn("目录被占用", case["statusText"])
+
+
+class OpenDataContractTests(unittest.TestCase):
+    """后端 open_data 契约：只回 ok + 目录路径，绝不回传登录文件内容。"""
+
+    def test_api_open_data_returns_only_ok_and_path(self):
+        """用 ast 隔离求值 Api.open_data：返回字典只允许 ok/path 两个键。"""
+        import ast
+        import os
+        import tempfile
+
+        tree = ast.parse(read("app.py"))
+        node = next(item for item in ast.walk(tree)
+                    if isinstance(item, ast.FunctionDef) and item.name == "open_data"
+                    and [arg.arg for arg in item.args.args][:1] == ["self"])
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        with tempfile.TemporaryDirectory() as name:
+            # os.startfile 只在真打开目录时有副作用；用假实现替掉，断言不执行
+            namespace = {"os": type("FakeOS", (), {"startfile": staticmethod(
+                lambda p: launched.append(p))})(),
+                         "ensure_data_dir": lambda: Path(name)}
+            launched = []
+            exec(compile(module, "<Api.open_data>", "exec"), namespace)  # noqa: S102 - 只编译受控片段
+            result = namespace["open_data"](None)
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(sorted(result.keys()), ["ok", "path"],
+                         "回传键固定为 ok/path：多一个字段就是把不该给的塞给界面")
+        self.assertEqual(result["path"], str(Path(name)))
+        self.assertEqual(launched, [str(Path(name))],
+                         "打开目录的副作用必须仍然发生（os.startfile 恰一次）")
+
+    def test_success_handler_does_not_touch_login_files(self):
+        """前端成功分支只引用 res.path；登录文件名不得出现在处理块里。"""
+        js = read("ui/app.js")
+        start = js.index('$("#btn-help-data").addEventListener')
+        end = js.index("window.addEventListener(\"resize\"", start)
+        block = js[start:end]
+        for banned in ("session.json", "storage_state", "token"):
+            self.assertNotIn(banned, block,
+                             "打开数据目录的成功反馈不得引用登录文件：%s" % banned)
+        self.assertIn("help-data-path", block, "成功路径必须写回正文说明行")
+        then_branch = block[block.index(".then"):block.index(".catch")]
+        self.assertNotIn("helpStatus", then_branch,
+                         "成功反馈不得写错误位（进入 then 前的 helpStatus("") 只是清场复位）")
+
 
 class ManualUpdateUiBehaviorTests(unittest.TestCase):
     """更新通道独立于报名，覆盖请求时序、失败收尾与页面恢复。"""
@@ -3501,6 +3591,1757 @@ out.push({ opened: opened, closed: closed, prevented: event.defaultPrevented,
         self.assertTrue(data["prevented"], "Enter 必须阻止默认滚动/提交")
         self.assertEqual(data["selected"], 0, "展开地点不得勾选活动")
         self.assertEqual(data["afterA"], "false", "其他按键不改变展开状态")
+
+
+class TermsConsentContractTests(unittest.TestCase):
+    """决策 013 / 条款同意门：后端快照、ui.json 落盘与版本同源契约。"""
+
+    # 版本形如 2026-10-27 或 2026-10-27-r2：修订版必须能被解析，否则
+    # 「已同意版本 != 当前版本」的判定会被旧同意记录静默绕过
+    DOCS_VERSION_RE = r"版本：\*\*(\d{4}-\d{2}-\d{2}(?:-r\d+)?)\*\*"
+
+    def _docs_terms_version(self) -> str:
+        text = (LOCAL.parent / "docs" / "TERMS_AND_PRIVACY.md").read_text(encoding="utf-8")
+        match = re.search(self.DOCS_VERSION_RE, text)
+        self.assertIsNotNone(match, "docs/TERMS_AND_PRIVACY.md 必须带 版本：**YYYY-MM-DD** 字段")
+        return match.group(1)
+
+    def _app_terms_version(self) -> str:
+        import ast
+
+        tree = ast.parse(read("app.py"))
+        node = next(item for item in tree.body
+                    if isinstance(item, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == "TERMS_VERSION"
+                            for target in item.targets))
+        return ast.literal_eval(node.value)
+
+    def test_terms_version_matches_docs_file(self):
+        """程序内条款版本与 docs/TERMS_AND_PRIVACY.md 是同一份（决策 013）。"""
+        self.assertEqual(self._app_terms_version(), self._docs_terms_version(),
+                         "TERMS_VERSION 与条款文件版本字段漂移了；两处必须一起改")
+
+    def test_terms_state_reads_only_declared_prefs_keys(self):
+        """terms_state 只读 ui.json 的 terms_version / terms_accepted_at。"""
+        import ast
+
+        tree = ast.parse(read("app.py"))
+        node = next(item for item in ast.walk(tree)
+                    if isinstance(item, ast.FunctionDef) and item.name == "terms_state"
+                    and [arg.arg for arg in item.args.args][:1] == ["prefs"])
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {"TERMS_VERSION": "9.9.9-test"}
+        exec(compile(module, "<terms_state>", "exec"), namespace)  # noqa: S102
+        terms_state = namespace["terms_state"]
+
+        self.assertEqual(terms_state({}),
+                         {"version": "9.9.9-test", "accepted_version": "", "accepted_at": ""})
+        self.assertEqual(
+            terms_state({"terms_version": "1.0.0", "terms_accepted_at": "2026-10-27 09:00:00"}),
+            {"version": "9.9.9-test", "accepted_version": "1.0.0",
+             "accepted_at": "2026-10-27 09:00:00"})
+        self.assertEqual(terms_state(None)["accepted_version"], "", "None 偏好必须回退为未同意")
+
+        # 只碰声明的两个键：不读 session/storage，也不写日志
+        source = ast.unparse(node)
+        self.assertIn("terms_version", source)
+        self.assertIn("terms_accepted_at", source)
+        for banned in ("SESSION_FILE", "STORAGE_STATE", "storage_state", "grab.log", "log"):
+            self.assertNotIn(banned, source, "terms_state 不得触碰登录文件或日志")
+
+    def test_bootstrap_carries_terms_snapshot(self):
+        """bootstrap 载荷必须带 terms 快照（terms_state(prefs)），界面据此判定门禁。"""
+        import ast
+
+        tree = ast.parse(read("app.py"))
+        node = next(item for item in ast.walk(tree)
+                    if isinstance(item, ast.FunctionDef) and item.name == "bootstrap"
+                    and [arg.arg for arg in item.args.args][:1] == ["self"])
+        source = ast.unparse(node)
+        self.assertIn("'terms': terms_state(prefs)", source,
+                      "bootstrap 必须把 terms_state(prefs) 放进载荷")
+
+    def test_accept_terms_writes_prefs_transaction_only(self):
+        """accept_terms：经 update_prefs 原子事务写两个键；不碰登录文件与日志。"""
+        import ast
+
+        tree = ast.parse(read("app.py"))
+        node = next(item for item in ast.walk(tree)
+                    if isinstance(item, ast.FunctionDef) and item.name == "accept_terms"
+                    and [arg.arg for arg in item.args.args][:1] == ["self"])
+        # accept_terms 的返回载荷复用 terms_state：一起编译，保持与真实实现同源
+        state_node = next(item for item in ast.walk(tree)
+                          if isinstance(item, ast.FunctionDef) and item.name == "terms_state"
+                          and [arg.arg for arg in item.args.args][:1] == ["prefs"])
+        module = ast.Module(body=[node, state_node], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        source = ast.unparse(node)
+        self.assertIn("update_prefs", source, "必须走 ui.json 原子偏好事务")
+        for banned in ("SESSION_FILE", "STORAGE_STATE", "storage_state",
+                       "read_text", "_trace", "addLog"):
+            self.assertNotIn(banned, source, "同意状态不得读写登录文件或写日志")
+
+        stamp = "2026-10-27 12:00:00"
+
+        class FakeTime:
+            @staticmethod
+            def strftime(fmt, value):
+                return stamp
+
+            @staticmethod
+            def localtime():
+                return ()
+
+        written = []
+
+        def fake_update(patch):
+            written.append(dict(patch))
+            return True
+
+        namespace = {"time": FakeTime, "TERMS_VERSION": "9.9.9-test",
+                     "update_prefs": fake_update,
+                     "load_prefs": lambda: {"terms_version": "9.9.9-test",
+                                            "terms_accepted_at": stamp}}
+        exec(compile(module, "<accept_terms>", "exec"), namespace)  # noqa: S102
+        accept_terms = namespace["accept_terms"]
+
+        # AST 抽出的真实签名是 accept_terms(self, document_version="")：首参
+        # 会绑定 self，document_version 必须用关键字（或第二实参）传入；单传
+        # 一个字符串会把版本绑进 self、让 document_version 退回默认空串，
+        # 在写前被版本校验拒绝——那测不到成功事务本身。
+        got = accept_terms(None, document_version="9.9.9-test")
+        self.assertEqual(got["ok"], True)
+        self.assertEqual(got["terms"], {"version": "9.9.9-test",
+                                        "accepted_version": "9.9.9-test",
+                                        "accepted_at": stamp})
+        self.assertEqual(written, [{"terms_version": "9.9.9-test",
+                                    "terms_accepted_at": stamp}])
+
+        # 拿不到跨进程锁：如实失败，不落盘也不谎报成功。
+        # 「尝试过写入」与「真正持久化」必须用两个容器区分：busy_attempts 记录
+        # 每次尝试的 patch（期望恰为正确两键一次），written 只记真正落盘的键
+        # （忙锁分支必须仍为空）——不能用一个从未被写入的列表冒充"未持久化"。
+        written.clear()  # 先清空成功持久化容器：本分支只观察忙锁轮次
+        busy_attempts = []
+
+        def busy_update(patch):
+            busy_attempts.append(dict(patch))
+            return False
+
+        namespace["update_prefs"] = busy_update
+        busy = accept_terms(None, document_version="9.9.9-test")
+        self.assertEqual(busy["ok"], False)
+        self.assertEqual(busy["error"], "prefs_busy")
+        self.assertEqual(busy_attempts,
+                         [{"terms_version": "9.9.9-test",
+                           "terms_accepted_at": stamp}],
+                         "忙锁分支仍必须恰好尝试一次正确的两键")
+        self.assertEqual(written, [], "成功持久化容器在忙锁分支保持为空")
+
+    def test_accept_terms_rejects_mismatched_version_before_write(self):
+        """版本不匹配（缺参/旧版/非法类型）必须在写前拒绝：零 update_prefs。"""
+        import ast
+        import time
+
+        tree = ast.parse(read("app.py"))
+        node = next(item for item in ast.walk(tree)
+                    if isinstance(item, ast.FunctionDef) and item.name == "accept_terms"
+                    and [arg.arg for arg in item.args.args][:1] == ["self"])
+        source = ast.unparse(node)
+        # 判定必须先于任何写入与时间戳生成（顺序即证据）
+        self.assertLess(source.index("document_version == TERMS_VERSION"),
+                        source.index("update_prefs"),
+                        "版本判定必须位于原子写之前")
+        self.assertLess(source.index("document_version == TERMS_VERSION"),
+                        source.index("strftime"),
+                        "版本判定必须位于时间戳生成之前")
+
+        state_node = next(item for item in ast.walk(tree)
+                          if isinstance(item, ast.FunctionDef) and item.name == "terms_state"
+                          and [arg.arg for arg in item.args.args][:1] == ["prefs"])
+        module = ast.Module(body=[node, state_node], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        written = []
+        store = {"terms_version": "9.9.9-test", "terms_accepted_at": "2026-10-27 12:00:00"}
+        namespace = {"time": time, "TERMS_VERSION": "9.9.9-test",
+                     "update_prefs": lambda patch: (written.append(dict(patch)), True)[1],
+                     "load_prefs": lambda: dict(store)}
+        exec(compile(module, "<accept_terms>", "exec"), namespace)  # noqa: S102
+        accept_terms = namespace["accept_terms"]
+
+        # 非法 document_version 全集逐项拒绝（subTest 便于定位到具体输入）；
+        # self 传 None 只是给首参占位——被检对象始终是 document_version。
+        for bad in ("", "9.9.8-old", "9.9.10-new", None, 999, {"v": "9.9.9-test"}):
+            with self.subTest(document_version=bad):
+                got = accept_terms(None, document_version=bad)
+                self.assertEqual(got["ok"], False, "非法输入 %r 必须拒绝" % (bad,))
+                self.assertEqual(got["error"], "terms_version_mismatch")
+                self.assertIn("terms", got, "拒绝时可带只读 terms 快照供界面比对")
+        # 缺 document_version 是独立场景：签名默认空串，不能拿空串冒充缺参表达
+        got_missing = accept_terms(None)
+        self.assertEqual(got_missing["ok"], False, "缺 document_version 必须拒绝")
+        self.assertEqual(got_missing["error"], "terms_version_mismatch")
+        self.assertIn("terms", got_missing)
+        self.assertEqual(written, [], "任何被拒输入都不得触发 update_prefs")
+        self.assertEqual(store, {"terms_version": "9.9.9-test",
+                                 "terms_accepted_at": "2026-10-27 12:00:00"},
+                         "被拒后内存偏好与原同意时间必须原样不变")
+
+    def test_terms_copy_avoids_over_promises(self):
+        """负向断言：不写 MIT 之外的禁令、不写「继续使用视为同意」、不夸通信范围。"""
+        docs = (LOCAL.parent / "docs" / "TERMS_AND_PRIVACY.md").read_text(encoding="utf-8")
+        html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
+        for label, text in (("docs", docs), ("html", html)):
+            self.assertNotIn("个人非商业使用", text,
+                             "%s：不得用条款收窄 MIT 已授予的权利" % label)
+            self.assertNotIn("禁止商业销售", text,
+                             "%s：不得新增 LICENSE 之外的分发禁止" % label)
+            self.assertNotIn("去除本条款后分发", text,
+                             "%s：去除补充文档不该写成许可限制" % label)
+            self.assertNotIn("继续使用视为接受新版本", text,
+                             "%s：版本变化必须显式重新同意，不能默认延续" % label)
+            self.assertNotIn("仅在你主动操作时向学校系统发起访问", text,
+                             "%s：同意后有周期刷新，不能写成只在手动时通信" % label)
+        # 责任限制仍需保留法律不可排除的部分
+        self.assertIn("不适用于法律不允许排除的情形", docs)
+
+    def test_terms_version_is_shared_by_docs_html_and_backend(self):
+        """2026-10-27-r2 必须在文档、内嵌全文与后端常量里同时出现。"""
+        docs = (LOCAL.parent / "docs" / "TERMS_AND_PRIVACY.md").read_text(encoding="utf-8")
+        html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
+        version = self._app_terms_version()
+        self.assertIn(version, docs, "文档版本字段与后端常量漂移")
+        self.assertIn(version, html,
+                      "内嵌全文必须写明同一版本：冻结程序没有 docs 目录可对照")
+        self.assertIn("条款变更与终止", docs)
+        self.assertIn("再次点击同意", docs,
+                      "版本变化必须要求显式重新同意")
+        # 内嵌全文不另立版本常量：版本由后端 bootstrap 带进来
+        self.assertNotIn("TERMS_VERSION", html)
+
+    def test_disclosure_covers_tjise_data_dir_migration_and_uninstall_scope(self):
+        """§6.1 披露四件事：TJISE_DATA_DIR 覆盖、迁移源副本保留、卸载只删
+        默认数据目录、同意后的周期学校刷新；两处误导性旧表述必须绝迹。"""
+        docs = (LOCAL.parent / "docs" / "TERMS_AND_PRIVACY.md").read_text(encoding="utf-8")
+        html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
+        readme = (LOCAL / "README.md").read_text(encoding="utf-8")
+        tips = (LOCAL / "遇到问题先看我.txt").read_text(encoding="utf-8")
+        for label, text in (("docs", docs), ("内嵌全文", html)):
+            self.assertIn("TJISE_DATA_DIR", text,
+                          "%s：必须写明 TJISE_DATA_DIR 对数据目录的覆盖" % label)
+            self.assertIn("源文件保留在原处", text,
+                          "%s：迁移是复制，源文件必须写明保留" % label)
+            self.assertIn("只针对默认数据目录", text,
+                          "%s：卸载可选删除必须限定在默认数据目录" % label)
+            self.assertIn("按界面操作与周期刷新发生", text,
+                          "%s：同意后的周期学校刷新必须写明" % label)
+            self.assertNotIn("仅在你主动操作时以你的账号访问学校系统", text,
+                             "%s：同意后有周期刷新，不能写成只在手动时访问学校" % label)
+            self.assertNotIn("彻底删除所有数据", text,
+                             "%s：删一个目录只删该处，不能声称一次清光所有副本" % label)
+        self.assertIn("TJISE_DATA_DIR", readme,
+                      "README 必须在 TJISE_DATA_DIR 说明附近补迁移与卸载范围")
+        self.assertIn("原文件保留在旧位置", readme, "README：迁移必须写明保留原文件")
+        self.assertIn("只针对默认的", readme, "README：卸载可选删除只针对默认数据目录")
+        # 排障说明是固定宽度折行文本，先去掉全部空白再断言，避免跨行断词误报
+        tips_compact = "".join(tips.split())
+        self.assertIn("TJISE_DATA_DIR", tips, "排障说明必须区分自定义覆盖目录")
+        self.assertIn("迁移过来的原文件也还留在原处", tips_compact,
+                      "排障说明必须写明旧 EXE 旁迁移源副本仍在")
+        self.assertIn("不等于所有副本都没了", tips_compact,
+                      "排障说明必须写明删一个目录不等于清光全部副本")
+
+    def test_docs_and_embedded_text_share_eleven_sections(self):
+        """文档与内嵌全文的 11 节标题与顺序必须一致（冻结 EXE 无 docs/ 也可读）。"""
+        docs = (LOCAL.parent / "docs" / "TERMS_AND_PRIVACY.md").read_text(encoding="utf-8")
+        html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
+        doc_titles = re.findall(r"^## (\d+)\. (.+)$", docs, flags=re.M)
+        html_titles = re.findall(r"<h3>(\d+)\. (.+?)</h3>", html)
+        self.assertEqual([t[0] for t in doc_titles],
+                         [str(i) for i in range(1, 12)], "文档必须是 1..11 节")
+        self.assertEqual([t[0] for t in html_titles],
+                         [str(i) for i in range(1, 12)], "内嵌全文必须是 1..11 节")
+        for (no, title), (hno, htitle) in zip(doc_titles, html_titles):
+            self.assertEqual((no, title), (hno, htitle),
+                             "第 %s 节标题两处必须一字不差" % no)
+
+    def test_index_html_has_terms_dialog_contract(self):
+        """条款弹窗契约：弹窗、查看完整条款、同意、暂不使用与帮助内入口。"""
+        html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
+        for required in ('id="dlg-terms"', 'id="btn-terms-full"', 'id="btn-terms-accept"',
+                         'id="btn-terms-decline"', 'id="dlg-terms-version"',
+                         'id="dlg-terms-full-text"', 'id="btn-help-terms"',
+                         'id="dlg-terms-status"'):
+            self.assertIn(required, html, "条款弹窗缺少 %s" % required)
+        self.assertIn("我已阅读并同意", html)
+        self.assertIn("暂不使用", html)
+        self.assertIn("查看完整条款", html)
+        # 完整条款必须覆盖全部 11 节（与 docs/TERMS_AND_PRIVACY.md 同构）
+        for index in range(1, 12):
+            self.assertIn("%d. " % index, html, "完整条款缺第 %d 节" % index)
+        # 不出现任何报名成功承诺
+        for banned in ("包成功", "保证报名成功", "必定成功"):
+            self.assertNotIn(banned, html)
+
+    # ---- 内嵌全文 ↔ 规范真源逐字契约（计划 20261028-terms-embedded-exact-sync）----
+
+    MAINTENANCE_NOTE = ("本文件是随源码分发的可审阅规范来源；程序界面内嵌同一份完整条款，"
+                        "即使没有这个文件，也能在「帮助 → 使用条款与隐私」里读到。")
+    DISCLAIMER = "本文件是产品使用说明与隐私告知，不是法律意见；有具体法律疑问请咨询执业律师。"
+    OFFLINE_NOTE = "本份条款可离线阅读：全文就在本窗口内，不依赖网络或仓库文档。"
+
+    @staticmethod
+    def _norm_canonical(text: str, *, strip_ordered: bool) -> str:
+        # HTMLParser 已去标签；HTML 中的 Markdown 字符就是可见文字，必须参与比较。
+        if not strip_ordered:
+            return re.sub(r"\s+", "", text)
+        text = text.replace("**", "").replace("`", "")
+        text = re.sub(r"(?m)^\s*>\s?", "", text)
+        text = re.sub(r"(?m)^\s*-\s+", "", text)
+        text = re.sub(r"(?m)^\s*\d+\.\s+", "", text)
+        text = re.sub(r"(?m)^\s*#{1,6}\s*", "", text)
+        return re.sub(r"\s+", "", text)
+
+    @staticmethod
+    def _first_diff(a: str, b: str) -> int:
+        for index, (left, right) in enumerate(zip(a, b)):
+            if left != right:
+                return index
+        return min(len(a), len(b))
+
+    def _docs_canonical_texts(self):
+        """只读解析 docs/TERMS_AND_PRIVACY.md →（前言规范化文本, {1..11: 规范化文本}）。
+        前言剔除已知排除项「规范来源维护说明句」（计划 task4 clarify 记录），剔除前先断言
+        该句仍在 docs，避免排除项在规范演化后失效。"""
+        docs = (LOCAL.parent / "docs" / "TERMS_AND_PRIVACY.md").read_text(encoding="utf-8")
+        start = re.search(r"(?m)^## 1\. ", docs)
+        self.assertIsNotNone(start, "docs 必须从 ## 1. 定义 起进入 11 节结构")
+        preamble_raw = docs[:start.start()]
+        title = re.search(r"(?m)^# (.+)$", preamble_raw)
+        self.assertIsNotNone(title, "docs 必须带 # 一级标题")
+        quote = "\n".join(re.findall(r"(?m)^\s*>\s?(.*)$", preamble_raw))
+        quote_n = self._norm_canonical(quote, strip_ordered=True)
+        maint_n = re.sub(r"\s+", "", self.MAINTENANCE_NOTE)
+        self.assertIn(maint_n, quote_n, "维护说明句必须仍在 docs 前言，否则该排除项失去依据")
+        preamble = (self._norm_canonical(title.group(1), strip_ordered=True)
+                    + quote_n.replace(maint_n, ""))
+        sections = {}
+        for part in re.split(r"(?m)^(?=## \d+\. )", docs):
+            match = re.match(r"## (\d+)\. ", part)
+            if match:
+                sections[int(match.group(1))] = self._norm_canonical(part, strip_ordered=True)
+        self.assertEqual(sorted(sections), list(range(1, 12)), "docs 必须是 1..11 节")
+        return preamble, sections
+
+    def _embedded_canonical_texts(self, html=None):
+        """标准库 HTMLParser 从 #dlg-terms-full-text 抽取用户可见规范文本 →
+        （前言, {1..11}, 容器内全部文本）。html 为 None 时才读真实 index.html，
+        传入字符串时只解析内存样例（task3 突变用例）。采集范围不越过该 section：
+        不误收要点、版本副标题、工具栏、帮助 UI 或离线说明。"""
+        from html.parser import HTMLParser
+
+        class _TermsFullTextParser(HTMLParser):
+            """按 terms-section 分桶收集可见文本：terms-preamble 归前言，
+            其余按 h3 的节号归节；all_text 记录容器内全部文本供全量比较与排除断言。
+            section/div 两个深度界定桶起止、识别不支持的嵌套；其他标签不计深度。"""
+
+            def __init__(self):
+                super().__init__(convert_charrefs=True)
+                self.in_full = False
+                self.full_roots = 0      # 全文根 section 出现次数（必须恰好 1）
+                self.section_depth = 0   # 根闭合后必须归 0
+                self.div_depth = 0        # 容器内 div 深度（根 section 自身不计）
+                self.bucket = None       # {"preamble", "num", "parts"} | None
+                self.bucket_depth = None # 建桶时的 div_depth，只在同深度闭合封桶
+                self.h3_parts = None
+                self.preamble = []
+                self.sections = {}
+                self.section_order = []  # 封桶先后（章序断言）
+                self.all_text = []
+
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if not self.in_full:
+                    if tag == "section" and attrs.get("id") == "dlg-terms-full-text":
+                        self.full_roots += 1
+                        self.in_full = True
+                        self.section_depth = 1
+                    return
+                if tag == "section":
+                    raise AssertionError("全文容器内出现嵌套 section：结构不受支持")
+                if tag == "div":
+                    self.div_depth += 1
+                    classes = (attrs.get("class") or "").split()
+                    if "terms-section" in classes:
+                        if self.bucket is not None:
+                            raise AssertionError("terms-section 嵌套在另一节内：结构不受支持")
+                        self.bucket = {"preamble": "terms-preamble" in classes,
+                                       "num": None, "parts": []}
+                        self.bucket_depth = self.div_depth
+                elif tag == "h3" and self.bucket is not None:
+                    self.h3_parts = []
+
+            def handle_endtag(self, tag):
+                if not self.in_full:
+                    return
+                if tag == "section":
+                    self.in_full = False
+                    self.section_depth = 0
+                    return
+                if tag == "h3" and self.bucket is not None:
+                    head = re.match(r"(\d+)\.", "".join(self.h3_parts or []).strip())
+                    if head and not self.bucket["preamble"]:
+                        self.bucket["num"] = int(head.group(1))
+                    self.h3_parts = None
+                elif tag == "div":
+                    # 只在建桶时的深度封桶：桶内纯结构嵌套 div 不提前截断
+                    if self.bucket is not None and self.div_depth == self.bucket_depth:
+                        text = "".join(self.bucket["parts"])
+                        if self.bucket["preamble"]:
+                            self.preamble.append(text)
+                        else:
+                            if self.bucket["num"] is None:
+                                raise AssertionError("非前言桶没有可解析章号：结构不受支持")
+                            self.sections.setdefault(self.bucket["num"], []).append(text)
+                            self.section_order.append(self.bucket["num"])
+                        self.bucket = None
+                        self.bucket_depth = None
+                    self.div_depth -= 1
+
+            def handle_data(self, data):
+                if not self.in_full:
+                    return
+                if self.h3_parts is not None:
+                    self.h3_parts.append(data)
+                if self.bucket is not None:
+                    self.bucket["parts"].append(data)
+                self.all_text.append(data)
+
+        if html is None:
+            html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
+        parser = _TermsFullTextParser()
+        parser.feed(html)
+        parser.close()
+        self.assertFalse(parser.in_full, "#dlg-terms-full-text 必须闭合")
+        self.assertEqual(parser.full_roots, 1, "全文根 section 必须恰好出现一次")
+        self.assertEqual(parser.section_depth, 0, "根闭合后 section 深度必须归 0")
+        self.assertIsNone(parser.bucket, "根闭合后不得残留未封的桶")
+        self.assertEqual(parser.div_depth, 0, "容器内 div 必须全部闭合")
+        self.assertEqual(sorted(parser.sections), list(range(1, 12)), "内嵌必须是 1..11 节")
+        self.assertTrue(all(len(texts) == 1 for texts in parser.sections.values()),
+                        "每章必须恰好一个桶")
+        self.assertEqual(parser.section_order, list(range(1, 12)), "章序必须是 1..11")
+        self.assertEqual(len(parser.preamble), 1, "内嵌前言块必须恰好一个")
+        return parser
+
+    def _assert_embedded_matches_docs(self, html=None):
+        """两道精确比较：前言 + 逐节（保留原首差诊断），最后加全文容器全量相等。
+        桶外额外正文只能进 all_text，会被第三道断言抓住；两个既定排除项
+        （离线提示、规范来源维护说明句）仍只按各自原位置排除，不设白名单。"""
+        docs_preamble, docs_sections = self._docs_canonical_texts()
+        parser = self._embedded_canonical_texts(html)
+        html_preamble = self._norm_canonical("".join(parser.preamble), strip_ordered=False)
+        gap = self._first_diff(html_preamble, docs_preamble)
+        self.assertEqual(
+            html_preamble, docs_preamble,
+            "前言与规范真源不逐字一致（首差 @%d）：\n  docs: …%s…\n  html: …%s…"
+            % (gap, docs_preamble[max(0, gap - 30): gap + 60],
+               html_preamble[max(0, gap - 30): gap + 60]))
+        self.assertEqual(list(parser.sections), list(range(1, 12)), "章节顺序必须是 1..11")
+        for number in range(1, 12):
+            docs_text = docs_sections[number]
+            html_text = self._norm_canonical("".join(parser.sections[number]),
+                                             strip_ordered=False)
+            gap = self._first_diff(html_text, docs_text)
+            self.assertEqual(
+                html_text, docs_text,
+                "第 %d 节与 docs/TERMS_AND_PRIVACY.md 不逐字一致（首差 @%d）：\n"
+                "  docs: …%s…\n  html: …%s…"
+                % (number, gap, docs_text[max(0, gap - 30): gap + 60],
+                   html_text[max(0, gap - 30): gap + 60]))
+        expected_full = docs_preamble + "".join(docs_sections[n] for n in range(1, 12))
+        actual_full = self._norm_canonical("".join(parser.all_text), strip_ordered=False)
+        gap = self._first_diff(actual_full, expected_full)
+        self.assertEqual(actual_full, expected_full,
+                         "全文容器有未纳入章节的正文或文本次序漂移（首差 @%d）" % gap)
+
+    def test_embedded_full_text_is_verbatim_identical_to_docs(self):
+        """内嵌全文与只读规范真源逐字一致：唯一允许差异为结构标签与折叠空白。"""
+        self._assert_embedded_matches_docs()
+
+    def test_disclaimer_sits_in_preamble_not_section_10(self):
+        """免责声明只在前言；第 10 节以规范原文「人民法院提起诉讼。」结束。"""
+        parser = self._embedded_canonical_texts()
+        preamble = self._norm_canonical("".join(parser.preamble), strip_ordered=False)
+        section10 = self._norm_canonical("".join(parser.sections[10]), strip_ordered=False)
+        self.assertIn(self.DISCLAIMER, preamble, "免责声明必须出现在前言")
+        self.assertNotIn("不是法律意见", section10, "第 10 节正文不得出现免责声明")
+        self.assertTrue(section10.endswith("人民法院提起诉讼。"),
+                        "第 10 节必须以规范原文「人民法院提起诉讼。」结束")
+
+    def test_offline_note_lives_outside_canonical_comparison_flow(self):
+        """「本份条款可离线阅读」是独立 UI 包装：比较容器外、真源文件里没有它。"""
+        parser = self._embedded_canonical_texts()
+        html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
+        self.assertNotIn(self.OFFLINE_NOTE, "".join(parser.all_text),
+                         "离线提示不得进入规范正文比较流")
+        self.assertIn(self.OFFLINE_NOTE, html, "离线提示必须仍存在于界面包装")
+        self.assertLess(html.find(self.OFFLINE_NOTE), html.find('id="dlg-terms-full-text"'),
+                        "离线提示应位于全文比较容器之前的要点区")
+        docs = (LOCAL.parent / "docs" / "TERMS_AND_PRIVACY.md").read_text(encoding="utf-8")
+        self.assertNotIn(self.OFFLINE_NOTE, docs, "界面提示不得写入规范真源")
+
+    def test_preamble_maintenance_sentence_is_known_exclusion(self):
+        """已知排除项：规范来源维护说明句只在 docs 前言，内嵌前言按计划不呈现。"""
+        maint = re.sub(r"\s+", "", self.MAINTENANCE_NOTE)
+        docs = (LOCAL.parent / "docs" / "TERMS_AND_PRIVACY.md").read_text(encoding="utf-8")
+        # docs 侧必须做结构规范化再比较（剥 Markdown 标记、行首有序标记、标题符
+        # 并折叠空白）：该句在 docs 里位于 blockquote 中，裸折叠空白会留下 `>`
+        # 块引用符导致误报不一致。前言取 `^## 1\.` 之前，先断言分界存在；不能
+        # 复用 _docs_canonical_texts 的前言——它已剔除本排除项。
+        boundary = re.search(r"^## 1\.", docs, flags=re.M)
+        self.assertIsNotNone(boundary, "docs 必须存在 `## 1.` 章节分界")
+        preamble_raw = docs[:boundary.start()]
+        self.assertIn(maint, self._norm_canonical(preamble_raw, strip_ordered=True),
+                      "docs 前言必须保留规范来源说明")
+        parser = self._embedded_canonical_texts()
+        self.assertNotIn(maint, self._norm_canonical("".join(parser.preamble),
+                                                     strip_ordered=False),
+                         "内嵌前言按计划排除规范来源说明句")
+
+    def test_parity_rejects_text_outside_section_buckets(self):
+        """桶外额外正文必须被全文容器比较抓住：只比章节桶不算一致。"""
+        html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
+        anchor = '<div class="terms-section terms-preamble">'
+        self.assertEqual(html.count(anchor), 1)
+        changed = html.replace(anchor, '<p>额外条款句。</p>' + anchor, 1)
+        with self.assertRaises(AssertionError):
+            self._assert_embedded_matches_docs(changed)
+
+    def test_parity_keeps_literal_markdown_characters_in_html(self):
+        """HTML 里的 **、`、# 是可见文字，不得被规范化当 Markdown 抹掉。"""
+        html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
+        anchor = "本条款适用中华人民共和国法律。"
+        self.assertEqual(html.count(anchor), 1)
+        for marker in ("**", "`", "# "):
+            with self.subTest(marker=marker):
+                changed = html.replace(anchor, "\n" + marker + anchor, 1)
+                with self.assertRaises(AssertionError):
+                    self._assert_embedded_matches_docs(changed)
+
+    def test_parity_accepts_text_preserving_html_wrapper(self):
+        """仅标签包装不改变可见文字：只折叠空白仍判相等。"""
+        html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
+        anchor = "本条款适用中华人民共和国法律。"
+        self.assertEqual(html.count(anchor), 1)
+        changed = html.replace(anchor, "<span>" + anchor + "</span>", 1)
+        self._assert_embedded_matches_docs(changed)
+
+    def test_parity_accepts_pure_structural_nested_div(self):
+        """纯结构嵌套 div 不提前封桶：字符顺序不变时仍相等（深度边界正向样例）。"""
+        html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
+        num10 = html.index("<h3>10. ")
+        start = html.rfind('<div class="terms-section">', 0, num10)
+        self.assertNotEqual(start, -1, "第 10 节开标签必须存在")
+        end = html.index('<div class="terms-section">', start + 1)
+        open_tag = '<div class="terms-section">'
+        block = html[start:end]
+        self.assertEqual(len(re.findall(re.escape(block), html)), 1, "第 10 节块必须唯一")
+        content = block[len(open_tag):block.rfind("</div>")]
+        wrapped_block = open_tag + "<div>" + content + "</div></div>"
+        changed = html[:start] + wrapped_block + html[end:]
+        self._assert_embedded_matches_docs(changed)
+
+    def test_terms_dialog_structure_contract(self):
+        """三层布局结构契约（HTMLParser 只查父子归属与 ID 唯一性）：
+        head/body/foot 都是同一 dialog 的直接子级、正文控件全部在唯一
+        terms-body 血统内、底栏三动作相对顺序不变、全文默认 hidden 且
+        aria-controls 关联正确。不声称能证明 CSS 滚动或按钮可见——
+        那些必须由后续授权的浏览器测量负责。"""
+        from html.parser import HTMLParser
+
+        class _LayoutParser(HTMLParser):
+            VOID = {"br", "img", "input", "meta", "link", "hr",
+                    "area", "base", "col", "embed", "source", "track", "wbr"}
+            # 结构类名按优先级取首个作为规范标记，避免 dlg-foot/terms-foot
+            # 这种双类名容器被记成 .dlg-foot 导致归属断言落空
+            STRUCT = ("terms-head", "terms-body", "terms-feedback", "terms-foot",
+                      "terms-toolbar", "terms-summary", "help-esc")
+
+            def __init__(self):
+                super().__init__(convert_charrefs=True)
+                self.stack = []   # [(tag, attrs_dict)]
+                self.ids = {}     # id -> 出现次数
+                self.info = {}    # 关键标记 -> {parent, ancestors, attrs, order}
+                self._seq = 0
+
+            @classmethod
+            def _marker(cls, tag, attrs):
+                if attrs.get("id"):
+                    return "#" + attrs["id"]
+                tokens = (attrs.get("class") or "").split()
+                for struct in cls.STRUCT:
+                    if struct in tokens:
+                        return "." + struct
+                if tokens:
+                    return "." + tokens[0]
+                return "<" + tag + ">"
+
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                parent = (self._marker(*self.stack[-1]) if self.stack else None)
+                ancestors = [self._marker(t, a) for t, a in self.stack]
+                interest = []
+                if attrs.get("id"):
+                    self.ids[attrs["id"]] = self.ids.get(attrs["id"], 0) + 1
+                    interest.append("#" + attrs["id"])
+                tokens = set((attrs.get("class") or "").split())
+                for struct in self.STRUCT:
+                    if struct in tokens:
+                        interest.append("." + struct)
+                if tag == "form" and attrs.get("method") == "dialog":
+                    interest.append("<form#dialog>")
+                # 只记录条款 dialog 内部的元素（帮助弹窗也有自己的 help-esc）
+                if interest and ("#dlg-terms" in ancestors or "#dlg-terms" in interest):
+                    self._seq += 1
+                    for key in interest:
+                        self.info.setdefault(key, {
+                            "parent": parent,
+                            "ancestors": ancestors,
+                            "attrs": attrs,
+                            "order": self._seq,
+                        })
+                if tag not in self.VOID:
+                    self.stack.append((tag, attrs))
+
+            def handle_endtag(self, tag):
+                for i in range(len(self.stack) - 1, -1, -1):
+                    if self.stack[i][0] == tag:
+                        del self.stack[i:]
+                        break
+
+        html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
+        parser = _LayoutParser()
+        parser.feed(html)
+        parser.close()
+
+        self.assertIsNotNone(parser.info.get("#dlg-terms"), "条款 dialog 必须存在")
+        # head/body/foot 均为 dialog 直接子级：放错层级会改变滚动归属
+        for key in (".terms-head", ".terms-body", ".terms-foot"):
+            el = parser.info.get(key)
+            self.assertIsNotNone(el, "缺失结构区：" + key)
+            self.assertEqual(el["parent"], "#dlg-terms",
+                             key + " 必须是 dialog 的直接子级，不许塞进 body")
+        # 阅读区是唯一滚动区：以下控件必须位于 terms-body 血统内
+        for key in ("#dlg-terms-sub", ".terms-toolbar", "#dlg-terms-summary",
+                    "#dlg-terms-full-text", "#dlg-terms-status",
+                    "#btn-terms-recheck", ".terms-feedback", ".help-esc"):
+            el = parser.info.get(key)
+            self.assertIsNotNone(el, "阅读区内缺失：" + key)
+            self.assertIn(".terms-body", el["ancestors"],
+                          key + " 必须位于唯一阅读区 terms-body 内")
+        # 标题与 X 关闭都在 head
+        self.assertIn(".terms-head",
+                      parser.info["#dlg-terms-title"]["ancestors"],
+                      "标题必须在 terms-head 内")
+        x_form = parser.info.get("<form#dialog>")
+        self.assertIsNotNone(x_form, "右上角 X 必须走 method=dialog 原生关闭")
+        self.assertIn(".terms-head", x_form["ancestors"],
+                      "X 关闭表单必须在 terms-head 内")
+        # 底栏三动作都在 foot，且相对顺序不变
+        for key in ("#btn-terms-close", "#btn-terms-decline", "#btn-terms-accept"):
+            el = parser.info.get(key)
+            self.assertIsNotNone(el, "底栏缺失：" + key)
+            self.assertEqual(el["parent"], ".terms-foot",
+                             key + " 必须是 terms-foot 的直接子级")
+        orders = [parser.info[k]["order"] for k in
+                  ("#btn-terms-close", "#btn-terms-decline", "#btn-terms-accept")]
+        self.assertEqual(orders, sorted(orders),
+                         "底栏动作相对顺序必须保持 close→decline→accept")
+        # 全文默认隐藏，切换按钮的 aria-controls 正确关联
+        full = parser.info["#dlg-terms-full-text"]
+        self.assertIn("hidden", full["attrs"], "全文区默认必须 hidden")
+        toggle = parser.info["#btn-terms-full"]
+        self.assertEqual(toggle["attrs"].get("aria-controls"),
+                         "dlg-terms-full-text",
+                         "要点/全文切换必须 aria-controls 指向全文区")
+        # 关键 ID 全文唯一（结构契约的前提）
+        for dom_id in ("dlg-terms", "dlg-terms-title", "dlg-terms-sub",
+                       "dlg-terms-view-title", "btn-terms-full",
+                       "dlg-terms-summary", "dlg-terms-full-text",
+                       "dlg-terms-status", "btn-terms-recheck",
+                       "btn-terms-close", "btn-terms-decline",
+                       "btn-terms-accept", "dlg-terms-document-version",
+                       "dlg-terms-version"):
+            self.assertEqual(parser.ids.get(dom_id), 1, "ID 必须唯一：" + dom_id)
+
+
+class TermsConsentBehaviorTests(unittest.TestCase):
+    """决策 013 / 条款同意门：首弹、拒绝不重弹、同意持久化解锁、版本变更再提示。"""
+
+    TERMS = {"version": "2026-10-27", "accepted_version": "", "accepted_at": ""}
+
+    def test_first_boot_opens_terms_and_blocks_network_actions(self):
+        """首次未同意：弹一次条款；登录/列表/报名计划都不发起学校网络动作。"""
+        res = run_js(r"""
+let calls = [];
+window.pywebview = { api: {
+  login: () => { calls.push("login"); return new Promise(() => {}); },
+  check: (id) => { calls.push("check"); return new Promise(() => {}); },
+  list_activities: (id) => { calls.push("list"); return new Promise(() => {}); },
+  start_plan: () => { calls.push("start"); return new Promise(() => {}); },
+} };
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+const opened = document.querySelector("#dlg-terms").open;
+refresh(false);
+doLogin();
+startPlan();
+await Promise.resolve(); await Promise.resolve();
+out.push({ opened, calls,
+  loginDisabled: document.querySelector("#btn-login").disabled,
+  refreshDisabled: document.querySelector("#btn-refresh").disabled,
+  planDisabled: document.querySelector("#btn-plan").disabled,
+  banner: document.querySelector("#banners").innerHTML });
+""")
+        case = res[0]
+        self.assertTrue(case["opened"], "首次未同意必须弹条款")
+        self.assertEqual(case["calls"], [], "未同意时不得发起任何学校网络动作")
+        self.assertTrue(case["loginDisabled"], "登录按钮必须禁用")
+        self.assertTrue(case["refreshDisabled"], "刷新按钮必须禁用")
+        self.assertTrue(case["planDisabled"], "开始按钮必须禁用")
+        self.assertIn("使用条款", case["banner"], "必须挂条款横幅提供再同意入口")
+
+    def test_accept_persists_unlocks_and_reloads(self):
+        """同意：走后端 accept_terms 落盘，解锁网络动作并补上首轮加载。"""
+        res = run_js(r"""
+let calls = [], saved = [], accepted = 0, sentDocVersion = [];
+window.pywebview = { api: {
+  accept_terms: (documentVersion) => {
+    accepted += 1;
+    sentDocVersion.push(documentVersion);
+    return Promise.resolve({ ok: true, terms: { version: "2026-10-27",
+      accepted_version: "2026-10-27", accepted_at: "2026-10-27 12:00:00" } });
+  },
+  save_prefs: (patch) => { saved.push(JSON.parse(JSON.stringify(patch))); return Promise.resolve({ ok: true }); },
+  check: (id) => { calls.push("check"); return new Promise(() => {}); },
+  list_activities: (id) => { calls.push("list"); return new Promise(() => {}); },
+} };
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+/* 内嵌全文版本字段（生产取自 index.html）；harness 的 DOM 桩不解析 HTML，
+ * 这里按真实页面写入同版，才能验证「回执版本 == 用户读到的版本」的校验 */
+document.querySelector("#dlg-terms-document-version").textContent = "2026-10-27";
+document.querySelector("#btn-terms-accept").click();
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+out.push({ accepted, calls, saved, sentDocVersion,
+  docNode: document.querySelector("#dlg-terms-document-version").textContent,
+  dialogOpen: document.querySelector("#dlg-terms").open,
+  loginDisabled: document.querySelector("#btn-login").disabled,
+  refreshDisabled: document.querySelector("#btn-refresh").disabled,
+  banner: document.querySelector("#banners").innerHTML });
+""")
+        case = res[0]
+        self.assertEqual(case["accepted"], 1, "同意必须恰好调用一次后端接口")
+        self.assertEqual(case["sentDocVersion"], [case["docNode"]],
+                         "提交的 documentVersion 必须等于可见内嵌版本节点")
+        self.assertEqual(case["calls"], ["check", "list"],
+                         "同意后要补上被拦下的首轮加载")
+        self.assertIn({"terms_declined_version": ""}, case["saved"],
+                      "同意后要清掉拒绝版本标记")
+        self.assertFalse(case["dialogOpen"], "同意成功必须关掉条款弹窗")
+        self.assertFalse(case["loginDisabled"], "同意后登录必须解锁")
+        self.assertNotIn("使用条款", case["banner"], "同意后必须撤掉条款横幅")
+
+    def test_accept_failure_keeps_dialog_open_with_reason(self):
+        """保存失败（prefs_busy）：留在弹窗里给重试说明，门禁保持。"""
+        res = run_js(r"""
+window.pywebview = { api: {
+  accept_terms: () => Promise.resolve({ ok: false, text: "条款同意状态暂未保存，另一个窗口正在保存数据；请再点一次。" }),
+} };
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+document.querySelector("#dlg-terms-document-version").textContent = "2026-10-27";
+document.querySelector("#btn-terms-accept").click();
+await Promise.resolve(); await Promise.resolve();
+out.push({ open: document.querySelector("#dlg-terms").open,
+  statusHidden: document.querySelector("#dlg-terms-status").hidden,
+  statusText: document.querySelector("#dlg-terms-status").textContent,
+  locked: termsLocked() });
+""")
+        case = res[0]
+        self.assertTrue(case["open"], "保存失败必须留在条款弹窗里")
+        self.assertFalse(case["statusHidden"])
+        self.assertIn("再点一次", case["statusText"], "失败说明要给出重试指引")
+        self.assertTrue(case["locked"], "失败时门禁不得放行")
+
+    def test_unknown_terms_accept_with_matching_receipt_unlocks_once(self):
+        """未知态：只有回执字段齐全且版本与内嵌全文同版，才清 unknown、
+        关弹窗，并且只补一次被拦下的首轮加载。"""
+        res = run_js(r"""
+let calls = [], saved = [], accepted = 0;
+window.pywebview = { api: {
+  accept_terms: () => {
+    accepted += 1;
+    return Promise.resolve({ ok: true, terms: { version: "2026-10-27-r2",
+      accepted_version: "2026-10-27-r2", accepted_at: "2026-10-27 12:00:00" } });
+  },
+  save_prefs: (patch) => { saved.push(JSON.parse(JSON.stringify(patch))); return Promise.resolve({ ok: true }); },
+  check: (id) => { calls.push("check"); return new Promise(() => {}); },
+  list_activities: (id) => { calls.push("list"); return new Promise(() => {}); },
+  login: () => { calls.push("login"); return new Promise(() => {}); },
+  start_plan: () => { calls.push("start"); return new Promise(() => {}); },
+} };
+S.demo = false;
+S.prefs = {};
+markTermsUnknown();
+const lockedBefore = termsLocked();
+const autoOpenBefore = document.querySelector("#dlg-terms").open;
+const bannerBefore = document.querySelector("#banners").innerHTML;
+openTerms();
+/* 内嵌全文版本（生产取自 index.html）：harness 的 DOM 桩不解析 HTML */
+document.querySelector("#dlg-terms-document-version").textContent = "2026-10-27-r2";
+document.querySelector("#btn-terms-accept").click();
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+const after = { unknown: S.terms.unknown, locked: termsLocked(),
+  version: S.terms.version, acceptedVersion: S.terms.acceptedVersion,
+  acceptedAt: S.terms.acceptedAt, prompted: S.terms.prompted,
+  dialogOpen: document.querySelector("#dlg-terms").open,
+  loginDisabled: document.querySelector("#btn-login").disabled,
+  banner: document.querySelector("#banners").innerHTML,
+  calls: calls.slice(), saved: saved.slice(), accepted };
+out.push({ lockedBefore, autoOpenBefore, bannerBefore, after });
+""")
+        case = res[0]
+        self.assertTrue(case["lockedBefore"], "未知态本身必须是锁住的")
+        self.assertFalse(case["autoOpenBefore"], "未知态不自动弹窗，用户点开的才可确认")
+        self.assertIn("条款状态没能确认", case["bannerBefore"])
+        after = case["after"]
+        self.assertFalse(after["unknown"], "回执校验通过后才允许清 unknown")
+        self.assertFalse(after["locked"], "确认成功必须解锁门禁")
+        self.assertEqual(after["version"], "2026-10-27-r2", "要写入回执里的条款版本")
+        self.assertEqual(after["acceptedVersion"], "2026-10-27-r2")
+        self.assertEqual(after["acceptedAt"], "2026-10-27 12:00:00")
+        self.assertTrue(after["prompted"])
+        self.assertFalse(after["dialogOpen"], "确认成功必须关掉条款弹窗")
+        self.assertFalse(after["loginDisabled"])
+        self.assertNotIn("条款状态没能确认", after["banner"], "确认成功后撤掉未知横幅")
+        self.assertEqual(after["accepted"], 1, "同意必须恰好调用一次后端接口")
+        self.assertEqual(after["calls"], ["check", "list"],
+                         "只补一次首轮加载（check+list 各一次），不得重复触发")
+        self.assertIn({"terms_declined_version": ""}, after["saved"],
+                      "确认成功要清掉拒绝版本标记")
+
+    def test_unknown_terms_accept_rejects_bad_receipts(self):
+        """未知态的残缺/矛盾/错版回执与桥接异常：一律留在弹窗、不清 unknown、
+        不落盘，并继续阻止任何学校动作（fail closed，不做本地乐观更新）。"""
+        res = run_js(r"""
+let calls = [], saved = [], mode = "missing_at";
+window.pywebview = { api: {
+  accept_terms: () => {
+    if (mode === "reject") return Promise.reject(new Error("桥接断了"));
+    if (mode === "prefs_busy") return Promise.resolve({ ok: false, text: "条款同意状态暂未保存，另一个窗口正在保存数据；请再点一次。" });
+    if (mode === "missing_at") return Promise.resolve({ ok: true, terms: { version: "2026-10-27-r2", accepted_version: "2026-10-27-r2" } });
+    if (mode === "version_mismatch") return Promise.resolve({ ok: true, terms: { version: "2026-10-27-r2", accepted_version: "2026-10-27", accepted_at: "2026-10-27 12:00:00" } });
+    if (mode === "doc_mismatch") return Promise.resolve({ ok: true, terms: { version: "2026-11-05-r1", accepted_version: "2026-11-05-r1", accepted_at: "2026-11-05 09:00:00" } });
+  },
+  save_prefs: (patch) => { saved.push(JSON.parse(JSON.stringify(patch))); return Promise.resolve({ ok: true }); },
+  login: () => { calls.push("login"); return new Promise(() => {}); },
+  check: (id) => { calls.push("check"); return new Promise(() => {}); },
+  list_activities: (id) => { calls.push("list"); return new Promise(() => {}); },
+  start_plan: () => { calls.push("start"); return new Promise(() => {}); },
+} };
+S.demo = false;
+S.prefs = {};
+async function probe(m, docVersion) {
+  mode = m;
+  markTermsUnknown();
+  openTerms();
+  /* 内嵌全文版本（生产取自 index.html）：doc_mismatch 用一份过期副本 */
+  document.querySelector("#dlg-terms-document-version").textContent = docVersion;
+  document.querySelector("#btn-terms-accept").click();
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  const state = { open: document.querySelector("#dlg-terms").open,
+    unknown: S.terms.unknown, locked: termsLocked(),
+    version: S.terms.version, acceptedVersion: S.terms.acceptedVersion,
+    status: document.querySelector("#dlg-terms-status").textContent };
+  refresh(false);
+  doLogin();
+  startPlan();
+  return state;
+}
+const missingAt = await probe("missing_at", "2026-10-27-r2");
+const versionMismatch = await probe("version_mismatch", "2026-10-27-r2");
+const docMismatch = await probe("doc_mismatch", "2026-10-27-r2");
+const prefsBusy = await probe("prefs_busy", "2026-10-27-r2");
+const bridgeReject = await probe("reject", "2026-10-27-r2");
+out.push({ missingAt, versionMismatch, docMismatch, prefsBusy, bridgeReject,
+  calls, saved });
+""")
+        data = res[0]
+        expect = {
+            "missingAt": "缺字段",
+            "versionMismatch": "自相矛盾",
+            "docMismatch": "当前条款副本不匹配",
+            "prefsBusy": "再点一次",
+            "bridgeReject": "再点一次",
+        }
+        for name, hint in expect.items():
+            case = data[name]
+            self.assertTrue(case["open"], "%s：失败必须留在条款弹窗里" % name)
+            self.assertTrue(case["unknown"], "%s：失败不得清 unknown" % name)
+            self.assertTrue(case["locked"], "%s：失败时门禁不得放行" % name)
+            self.assertEqual(case["version"], "", "%s：不得写入任何条款版本" % name)
+            self.assertEqual(case["acceptedVersion"], "",
+                             "%s：不得本地乐观标记为已同意" % name)
+            self.assertIn(hint, case["status"], "%s：失败说明要讲清原因" % name)
+        self.assertEqual(data["calls"], [],
+                         "所有失败路径都不得发起任何学校动作")
+        self.assertEqual(data["saved"], [], "失败时不得落盘任何同意标记")
+
+    def test_decline_does_not_reprompt_and_keeps_help_available(self):
+        """拒绝：不退出、不再强弹；帮助与条款入口仍可用，网络动作保持禁用。"""
+        res = run_js(r"""
+let calls = [], saved = [];
+window.pywebview = { api: {
+  login: () => { calls.push("login"); return new Promise(() => {}); },
+  check: (id) => { calls.push("check"); return new Promise(() => {}); },
+  list_activities: (id) => { calls.push("list"); return new Promise(() => {}); },
+  start_plan: () => { calls.push("start"); return new Promise(() => {}); },
+  save_prefs: (patch) => { saved.push(JSON.parse(JSON.stringify(patch))); return Promise.resolve({ ok: true }); },
+} };
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+const firstOpen = document.querySelector("#dlg-terms").open;
+document.querySelector("#btn-terms-decline").click();
+await Promise.resolve(); await Promise.resolve();
+const afterDecline = { open: document.querySelector("#dlg-terms").open,
+  declined: S.terms.declined };
+refresh(false);
+doLogin();
+startPlan();
+const reopened = document.querySelector("#dlg-terms").open;
+document.querySelector("#btn-help").click();
+const helpOpen = document.querySelector("#help").open;
+document.querySelector("#btn-help-terms").click();
+const termsFromHelp = document.querySelector("#dlg-terms").open;
+out.push({ firstOpen, afterDecline, reopened, helpOpen, termsFromHelp, calls, saved,
+  loginDisabled: document.querySelector("#btn-login").disabled,
+  refreshDisabled: document.querySelector("#btn-refresh").disabled,
+  planDisabled: document.querySelector("#btn-plan").disabled });
+""")
+        case = res[0]
+        self.assertTrue(case["firstOpen"], "拒绝前条款弹窗在场")
+        self.assertFalse(case["afterDecline"]["open"], "拒绝后必须关掉弹窗")
+        self.assertTrue(case["afterDecline"]["declined"])
+        self.assertFalse(case["reopened"], "拒绝后不得再强弹条款")
+        self.assertEqual(case["calls"], [], "拒绝后网络动作仍全部被拦")
+        self.assertTrue(case["helpOpen"], "帮助必须继续可用")
+        self.assertTrue(case["termsFromHelp"], "帮助里的条款入口必须能重新打开条款")
+        self.assertIn({"terms_declined_version": "2026-10-27"}, case["saved"],
+                      "拒绝版本必须落盘（跨重启不再强弹）")
+        self.assertTrue(case["loginDisabled"])
+        self.assertTrue(case["refreshDisabled"])
+        self.assertTrue(case["planDisabled"])
+
+    def test_declined_version_persists_and_version_change_reprompts(self):
+        """重启后同一版本不重弹；条款版本变化时重新提示。"""
+        res = run_js(r"""
+let saved = [];
+window.pywebview = { api: {
+  save_prefs: (patch) => { saved.push(JSON.parse(JSON.stringify(patch))); return Promise.resolve({ ok: true }); },
+} };
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+document.querySelector("#btn-terms-decline").click();
+await Promise.resolve(); await Promise.resolve();
+/* 模拟重启：全新会话，prefs 带回上次拒绝过的版本 */
+S.terms = { version: "", acceptedVersion: "", acceptedAt: "", declined: false, prompted: false };
+ingestTerms({ version: "2026-10-27", accepted_version: "" });
+const sameVersion = document.querySelector("#dlg-terms").open;
+document.querySelector("#dlg-terms").close();
+/* 条款版本变化：重新提示 */
+S.terms = { version: "", acceptedVersion: "", acceptedAt: "", declined: false, prompted: false };
+ingestTerms({ version: "2026-11-01", accepted_version: "2026-10-27" });
+const newVersion = document.querySelector("#dlg-terms").open;
+out.push({ saved, sameVersion, newVersion });
+""")
+        case = res[0]
+        self.assertIn({"terms_declined_version": "2026-10-27"}, case["saved"])
+        self.assertFalse(case["sameVersion"], "重启后同一版本不得再强弹")
+        self.assertTrue(case["newVersion"], "条款版本变化必须重新提示")
+
+    def test_restart_restores_declined_and_blocks_autoload_chain(self):
+        """重启后刷新、F5 和可见性恢复都不再强弹，也不发学校动作（返修缺陷 1）。"""
+        res = run_js(r"""
+let calls = [];
+window.pywebview = { api: {
+  login: () => { calls.push("login"); return new Promise(() => {}); },
+  check: (id) => { calls.push("check"); return new Promise(() => {}); },
+  list_activities: (id) => { calls.push("list"); return new Promise(() => {}); },
+  start_plan: () => { calls.push("start"); return new Promise(() => {}); },
+  save_prefs: () => Promise.resolve({ ok: true }),
+} };
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27-r2", accepted_version: "", accepted_at: "" });
+document.querySelector("#btn-terms-decline").click();
+await Promise.resolve(); await Promise.resolve();
+/* 模拟重启：全新会话状态 + prefs 带回上次拒绝过的版本 */
+S.terms = { version: "", acceptedVersion: "", acceptedAt: "", declined: false,
+            prompted: false, unknown: false };
+ingestTerms({ version: "2026-10-27-r2", accepted_version: "" });
+const afterRestart = { open: document.querySelector("#dlg-terms").open,
+  declined: S.terms.declined };
+refresh(false);
+__dispatchKey({ key: "F5" });
+doLogin();
+startPlan();
+out.push({ afterRestart, calls, open: document.querySelector("#dlg-terms").open });
+""")
+        case = res[0]
+        self.assertFalse(case["afterRestart"]["open"], "重启后同一版本不得再强弹")
+        self.assertTrue(case["afterRestart"]["declined"],
+                        "重启后必须把拒绝态恢复成会话状态，否则刷新会重复弹窗")
+        self.assertEqual(case["calls"], [], "F5/刷新/可见性恢复都不得发学校动作")
+        self.assertFalse(case["open"], "整条自动链路都不许再弹条款")
+
+    def test_unknown_terms_state_fails_closed_and_keeps_help_open(self):
+        """bootstrap 失败、返回 null、缺 terms、空版本或结构非法：一律拦住。"""
+        res = run_js(r"""
+let calls = [];
+window.pywebview = { api: {
+  login: () => { calls.push("login"); return new Promise(() => {}); },
+  check: (id) => { calls.push("check"); return new Promise(() => {}); },
+  list_activities: (id) => { calls.push("list"); return new Promise(() => {}); },
+  start_plan: () => { calls.push("start"); return new Promise(() => {}); },
+} };
+S.demo = false;
+S.prefs = {};
+function probe(payload) {
+  S.terms = { version: "", acceptedVersion: "", acceptedAt: "", declined: false,
+              prompted: false, unknown: false };
+  document.querySelector("#dlg-terms").close();
+  ingestTerms(payload);
+  const locked = termsLocked();
+  refresh(false);
+  doLogin();
+  startPlan();
+  const autoOpen = document.querySelector("#dlg-terms").open;
+  const banner = document.querySelector("#banners").innerHTML;
+  document.querySelector("#btn-help").click();
+  const helpOpen = document.querySelector("#help").open;
+  document.querySelector("#btn-help-terms").click();
+  const manualOpen = document.querySelector("#dlg-terms").open;
+  document.querySelector("#dlg-terms").close();
+  return { locked, unknown: S.terms.unknown, autoOpen, manualOpen, helpOpen, banner };
+}
+const nullPayload = probe(null);
+const missing = probe({ version: "", accepted_version: "" });
+const emptyObject = probe({});
+const badType = probe("不是对象");
+out.push({ nullPayload, missing, emptyObject, badType, calls });
+""")
+        data = res[0]
+        for name in ("nullPayload", "missing", "emptyObject", "badType"):
+            case = data[name]
+            self.assertTrue(case["locked"], "%s：条款状态未知必须拦住学校动作" % name)
+            self.assertTrue(case["unknown"], "%s：必须标记为未知态" % name)
+            self.assertFalse(case["autoOpen"], "%s：未知态不自动弹窗" % name)
+            self.assertTrue(case["manualOpen"], "%s：帮助里的条款入口仍可显式打开" % name)
+            self.assertTrue(case["helpOpen"], "%s：帮助必须始终可用" % name)
+            self.assertIn("条款状态没能确认", case["banner"], "%s：必须挂可重试横幅" % name)
+        self.assertEqual(data["calls"], [], "未知态不得发起任何学校动作")
+
+    def test_version_change_prompts_only_once(self):
+        """条款版本变化只强弹一次：同版本重复 ingest 不再弹。"""
+        res = run_js(r"""
+S.demo = false;
+S.prefs = { terms_declined_version: "2026-10-27" };
+ingestTerms({ version: "2026-10-27-r2", accepted_version: "" });
+const firstOpen = document.querySelector("#dlg-terms").open;
+document.querySelector("#dlg-terms").close();
+ingestTerms({ version: "2026-10-27-r2", accepted_version: "" });
+const againOpen = document.querySelector("#dlg-terms").open;
+document.querySelector("#dlg-terms").close();
+/* 已拒绝过当前版本：不再弹 */
+S.prefs.terms_declined_version = "2026-10-27-r2";
+S.terms = { version: "", acceptedVersion: "", acceptedAt: "", declined: false,
+            prompted: false, unknown: false };
+ingestTerms({ version: "2026-10-27-r2", accepted_version: "" });
+const declinedOpen = document.querySelector("#dlg-terms").open;
+out.push({ firstOpen, againOpen, declinedOpen });
+""")
+        case = res[0]
+        self.assertTrue(case["firstOpen"], "版本变化必须重新提示一次")
+        self.assertFalse(case["declinedOpen"], "本版本已拒绝过就不该再弹")
+
+    def test_demo_mode_is_not_gated(self):
+        """离线演示（demo）不做学校网络动作：条款门禁不拦演示形态。"""
+        res = run_js(r"""
+S.demo = true;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+out.push({ opened: document.querySelector("#dlg-terms").open,
+  locked: termsLocked(),
+  loginDisabled: document.querySelector("#btn-login").disabled,
+  banner: document.querySelector("#banners").innerHTML });
+""")
+        case = res[0]
+        self.assertFalse(case["opened"], "演示模式不弹条款")
+        self.assertFalse(case["locked"])
+        self.assertFalse(case["loginDisabled"], "演示模式登录入口不受条款门禁")
+        self.assertNotIn("使用条款", case["banner"])
+
+
+class TermsInteractionLoopTests(unittest.TestCase):
+    """close-terms-interaction-loop：在途保存、10 秒超时未确认、重新确认、
+    只读查看、关闭收口、来源焦点、引导延后与条款弹窗键盘隔离的行为契约。
+    DOM 桩只复用既有能力（focus/activeElement、listeners、计时器替换），
+    不把 showModal/hidden 桩当排版证据。"""
+
+    def test_double_click_saves_once_and_locks_footer(self):
+        """连续点击只登记一次在途：一次请求、保存态三控件禁用、文案「正在保存…」。"""
+        res = run_js(r"""
+let accepted = 0;
+window.pywebview = { api: {
+  accept_terms: () => { accepted += 1; return new Promise(() => {}); },
+} };
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+document.querySelector("#dlg-terms-document-version").textContent = "2026-10-27";
+document.querySelector("#btn-terms-accept").click();
+document.querySelector("#btn-terms-accept").click();
+const accept = document.querySelector("#btn-terms-accept");
+const decline = document.querySelector("#btn-terms-decline");
+const dlg = document.querySelector("#dlg-terms");
+out.push({ accepted,
+  acceptDisabled: accept.disabled, acceptText: accept.textContent,
+  declineDisabled: decline.disabled, xDisabled: dlg.querySelector(".dlg-x").disabled,
+  escText: dlg.querySelector(".help-esc").textContent, locked: termsLocked() });
+""")
+        case = res[0]
+        self.assertEqual(case["accepted"], 1, "保存中重复点击只能发出一次 accept_terms")
+        self.assertTrue(case["acceptDisabled"])
+        self.assertEqual(case["acceptText"], "正在保存…")
+        self.assertTrue(case["declineDisabled"])
+        self.assertTrue(case["xDisabled"])
+        self.assertEqual(case["escText"], "正在保存…")
+        self.assertTrue(case["locked"], "在途保存期间门禁保持")
+
+    def test_accept_failure_restores_buttons_and_keeps_dialog(self):
+        """明确失败：留在弹窗、给出原因、三控件恢复可点，不假称未确认。"""
+        res = run_js(r"""
+window.pywebview = { api: {
+  accept_terms: () => Promise.resolve({ ok: false,
+    text: "设置保存失败（设置可能正在被占用），请稍后再试。" }),
+} };
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+document.querySelector("#dlg-terms-document-version").textContent = "2026-10-27";
+document.querySelector("#btn-terms-accept").click();
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+const accept = document.querySelector("#btn-terms-accept");
+const dlg = document.querySelector("#dlg-terms");
+out.push({ open: dlg.open,
+  acceptDisabled: accept.disabled, acceptText: accept.textContent,
+  declineDisabled: document.querySelector("#btn-terms-decline").disabled,
+  xDisabled: dlg.querySelector(".dlg-x").disabled,
+  escText: dlg.querySelector(".help-esc").textContent, locked: termsLocked(),
+  status: document.querySelector("#dlg-terms-status").textContent });
+""")
+        case = res[0]
+        self.assertTrue(case["open"], "失败必须留在弹窗里")
+        self.assertFalse(case["acceptDisabled"])
+        self.assertEqual(case["acceptText"], "我已阅读并同意")
+        self.assertFalse(case["declineDisabled"])
+        self.assertFalse(case["xDisabled"])
+        self.assertEqual(case["escText"], "Esc 暂不使用")
+        self.assertTrue(case["locked"])
+        self.assertIn("设置保存失败", case["status"])
+        self.assertNotIn("未确认", case["status"], "明确失败不能说成未确认")
+
+    def test_accept_success_refreshes_exactly_once_and_closes(self):
+        """完整成功：关窗解锁、首轮学校加载只补一次、延后的引导只消费一次。"""
+        res = run_js(r"""
+let calls = [], saved = [];
+window.pywebview = { api: {
+  accept_terms: () => Promise.resolve({ ok: true, terms: { version: "2026-10-27",
+      accepted_version: "2026-10-27", accepted_at: "2026-10-27 12:00:00" } }),
+  save_prefs: (patch) => { saved.push(JSON.parse(JSON.stringify(patch))); return Promise.resolve({ ok: true }); },
+  check: () => { calls.push("check"); return new Promise(() => {}); },
+  list_activities: () => { calls.push("list"); return new Promise(() => {}); },
+} };
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+document.querySelector("#dlg-terms-document-version").textContent = "2026-10-27";
+S.terms.deferredIntro = { tour: false, welcome: true };
+document.querySelector("#btn-terms-accept").click();
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+await Promise.resolve(); await Promise.resolve();
+out.push({ open: document.querySelector("#dlg-terms").open,
+  locked: termsLocked(), calls, deferred: S.terms.deferredIntro,
+  declinedCleared: saved.some((p) => "terms_declined_version" in p),
+  focus: document.activeElement && document.activeElement.__sel });
+""")
+        case = res[0]
+        self.assertFalse(case["open"], "成功才关弹窗")
+        self.assertFalse(case["locked"])
+        self.assertEqual(case["calls"], ["check", "list"], "完整成功最多补加载一次")
+        self.assertIsNone(case["deferred"], "延后的引导只继续一次（消费即清空）")
+        self.assertTrue(case["declinedCleared"])
+        self.assertEqual(case["focus"], "#btn-help", "同意成功焦点回 #btn-help")
+
+    def test_save_timeout_keeps_gate_reopens_close_and_drops_late_receipt(self):
+        """10 秒未获可确认结果：不假称失败/取消，门禁保持、关闭权限恢复、
+        禁止直接再次写同意；迟到回执不关窗、不覆盖、不重复刷新。"""
+        res = run_js(r"""
+let timers = [], accepted = 0, calls = [], resolveAccept = null;
+window.pywebview = { api: {
+  accept_terms: () => { accepted += 1;
+    return new Promise((resolve) => { resolveAccept = resolve; }); },
+  check: () => { calls.push("check"); return new Promise(() => {}); },
+  list_activities: () => { calls.push("list"); return new Promise(() => {}); },
+} };
+setTimeout = (fn) => { timers.push(fn); return timers.length; };
+clearTimeout = () => {};
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+document.querySelector("#dlg-terms-document-version").textContent = "2026-10-27";
+document.querySelector("#btn-terms-accept").click();
+const dlg = document.querySelector("#dlg-terms");
+const cancelEv = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+(dlg.listeners.cancel || []).forEach((fn) => fn(cancelEv));
+const savingState = { prevented: cancelEv.defaultPrevented,
+  acceptDisabled: document.querySelector("#btn-terms-accept").disabled };
+timers[0](); /* 10 秒超时 → 未确认 */
+const statusAfterTimeout = document.querySelector("#dlg-terms-status").textContent;
+const accept = document.querySelector("#btn-terms-accept");
+document.querySelector("#btn-terms-accept").click(); /* 未确认期间再点：不得再发请求 */
+const afterRetryClick = accepted;
+resolveAccept({ ok: true, terms: { version: "2026-10-27",
+  accepted_version: "2026-10-27", accepted_at: "2026-10-27 12:00:00" } });
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+const recheck = document.querySelector("#btn-terms-recheck");
+out.push({ savingState, statusAfterTimeout, accepted, afterRetryClick,
+  open: dlg.open, locked: termsLocked(),
+  acceptDisabled: accept.disabled,
+  declineDisabled: document.querySelector("#btn-terms-decline").disabled,
+  xDisabled: dlg.querySelector(".dlg-x").disabled,
+  recheckHidden: recheck.hidden, recheckDisabled: recheck.disabled,
+  escText: dlg.querySelector(".help-esc").textContent,
+  statusFinal: document.querySelector("#dlg-terms-status").textContent,
+  calls });
+""")
+        case = res[0]
+        self.assertTrue(case["savingState"]["prevented"], "保存中的 Esc 必须被 cancel 拦下")
+        self.assertTrue(case["savingState"]["acceptDisabled"])
+        self.assertIn("未确认", case["statusAfterTimeout"])
+        self.assertNotIn("没有保存成功", case["statusAfterTimeout"], "超时不能假称失败")
+        self.assertNotIn("已拒绝", case["statusAfterTimeout"], "超时不能假称取消")
+        self.assertEqual(case["afterRetryClick"], 1, "未确认期间禁止直接再次写同意")
+        self.assertTrue(case["open"], "迟到回执不许关窗")
+        self.assertTrue(case["locked"], "迟到回执不许解锁")
+        self.assertTrue(case["acceptDisabled"], "未确认期间同意按钮保持禁用")
+        self.assertTrue(case["declineDisabled"])
+        self.assertFalse(case["xDisabled"], "关闭权限恢复")
+        self.assertFalse(case["recheckHidden"], "亮出重新确认状态")
+        self.assertFalse(case["recheckDisabled"])
+        self.assertEqual(case["escText"], "Esc 关闭")
+        self.assertEqual(case["calls"], [], "迟到回执不许重复刷新")
+        self.assertEqual(case["statusFinal"], case["statusAfterTimeout"],
+                         "迟到回执不许覆盖未确认状态")
+        self.assertEqual(case["accepted"], 1)
+
+    def test_recheck_confirmed_acceptance_closes_without_new_write(self):
+        """重新确认读到「已同意同版+有时间+匹配本份」：按成功收口，零新写请求。"""
+        res = run_js(r"""
+let timers = [], accepted = 0, calls = [], saved = [];
+window.pywebview = { api: {
+  accept_terms: () => { accepted += 1; return new Promise(() => {}); },
+  bootstrap: () => { calls.push("bootstrap");
+    return Promise.resolve({ terms: { version: "2026-10-27",
+      accepted_version: "2026-10-27", accepted_at: "2026-10-27 12:00:00" } }); },
+  save_prefs: (patch) => { saved.push(JSON.parse(JSON.stringify(patch))); return Promise.resolve({ ok: true }); },
+  check: () => { calls.push("check"); return new Promise(() => {}); },
+  list_activities: () => { calls.push("list"); return new Promise(() => {}); },
+} };
+setTimeout = (fn) => { timers.push(fn); return timers.length; };
+clearTimeout = () => {};
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+document.querySelector("#dlg-terms-document-version").textContent = "2026-10-27";
+S.terms.deferredIntro = { tour: false, welcome: false };
+document.querySelector("#btn-terms-accept").click();
+timers[0](); /* 超时 → 未确认 */
+document.querySelector("#btn-terms-recheck").click();
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+await Promise.resolve(); await Promise.resolve();
+out.push({ open: document.querySelector("#dlg-terms").open,
+  locked: termsLocked(), accepted, calls, saved,
+  deferred: S.terms.deferredIntro,
+  focus: document.activeElement && document.activeElement.__sel });
+""")
+        case = res[0]
+        self.assertFalse(case["open"])
+        self.assertFalse(case["locked"])
+        self.assertEqual(case["accepted"], 1, "重新确认不得再发同意写请求")
+        self.assertEqual(case["calls"], ["bootstrap", "check", "list"],
+                         "只读一次 bootstrap，成功收口补一次加载")
+        self.assertTrue(any("terms_declined_version" in p for p in case["saved"]))
+        self.assertIsNone(case["deferred"], "成功收口把延后引导消费掉")
+        self.assertEqual(case["focus"], "#btn-help")
+
+    def test_recheck_explicitly_not_accepted_restores_accept_button(self):
+        """重新确认读到明确未同意：恢复同意按钮与关闭语义，可再点一次。"""
+        res = run_js(r"""
+let timers = [], accepted = 0;
+window.pywebview = { api: {
+  accept_terms: () => { accepted += 1; return new Promise(() => {}); },
+  bootstrap: () => Promise.resolve({ terms: { version: "2026-10-27",
+    accepted_version: "", accepted_at: "" } }),
+} };
+setTimeout = (fn) => { timers.push(fn); return timers.length; };
+clearTimeout = () => {};
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+document.querySelector("#dlg-terms-document-version").textContent = "2026-10-27";
+document.querySelector("#btn-terms-accept").click();
+timers[0]();
+document.querySelector("#btn-terms-recheck").click();
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+const recheck = document.querySelector("#btn-terms-recheck");
+out.push({ open: document.querySelector("#dlg-terms").open,
+  locked: termsLocked(), accepted,
+  acceptDisabled: document.querySelector("#btn-terms-accept").disabled,
+  recheckHidden: recheck.hidden,
+  escText: document.querySelector("#dlg-terms .help-esc").textContent,
+  status: document.querySelector("#dlg-terms-status").textContent });
+""")
+        case = res[0]
+        self.assertTrue(case["open"])
+        self.assertTrue(case["locked"], "明确未同意门禁保持")
+        self.assertFalse(case["acceptDisabled"], "恢复同意按钮供重试")
+        self.assertTrue(case["recheckHidden"], "未确认态收口后收起重新确认")
+        self.assertEqual(case["escText"], "Esc 暂不使用")
+        self.assertIn("尚未记录同意", case["status"])
+        self.assertEqual(case["accepted"], 1)
+
+    def test_recheck_read_failure_keeps_unconfirmed(self):
+        """重新确认读取失败：仍按未确认处理，按钮恢复可点，门禁保持。"""
+        res = run_js(r"""
+let timers = [], accepted = 0;
+window.pywebview = { api: {
+  accept_terms: () => { accepted += 1; return new Promise(() => {}); },
+  bootstrap: () => Promise.reject(new Error("桥接断了")),
+} };
+setTimeout = (fn) => { timers.push(fn); return timers.length; };
+clearTimeout = () => {};
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+document.querySelector("#dlg-terms-document-version").textContent = "2026-10-27";
+document.querySelector("#btn-terms-accept").click();
+timers[0]();
+document.querySelector("#btn-terms-recheck").click();
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+const recheck = document.querySelector("#btn-terms-recheck");
+out.push({ open: document.querySelector("#dlg-terms").open,
+  locked: termsLocked(), accepted,
+  acceptDisabled: document.querySelector("#btn-terms-accept").disabled,
+  recheckHidden: recheck.hidden, recheckDisabled: recheck.disabled,
+  recheckText: recheck.textContent,
+  status: document.querySelector("#dlg-terms-status").textContent });
+""")
+        case = res[0]
+        self.assertTrue(case["open"])
+        self.assertTrue(case["locked"])
+        self.assertTrue(case["acceptDisabled"], "读取失败不恢复同意按钮")
+        self.assertFalse(case["recheckHidden"])
+        self.assertFalse(case["recheckDisabled"], "重新确认恢复可点")
+        self.assertEqual(case["recheckText"], "重新确认状态")
+        self.assertIn("没能读到", case["status"])
+        self.assertIn("未确认", case["status"])
+        self.assertEqual(case["accepted"], 1)
+
+    def test_readonly_view_makes_no_writes_and_restores_help_focus(self):
+        """已同意查看：只读（只显示关闭），关闭零 accept/save/学校调用；
+        来源是帮助时打开期间先关帮助、关闭后重开并聚焦「查看条款」，不叠弹窗。"""
+        res = run_js(r"""
+let calls = [];
+window.pywebview = { api: {
+  accept_terms: () => { calls.push("accept"); return Promise.resolve({ ok: true }); },
+  save_prefs: () => { calls.push("save"); return Promise.resolve({ ok: true }); },
+  check: () => { calls.push("check"); return new Promise(() => {}); },
+  list_activities: () => { calls.push("list"); return new Promise(() => {}); },
+} };
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "2026-10-27",
+  accepted_at: "2026-10-27 12:00:00" });
+const help = document.querySelector("#help");
+help.showModal();
+document.querySelector("#btn-help-terms").click();
+const helpClosedByTerms = !help.open;
+const dlg = document.querySelector("#dlg-terms");
+const accept = document.querySelector("#btn-terms-accept");
+const decline = document.querySelector("#btn-terms-decline");
+const escBefore = dlg.querySelector(".help-esc").textContent;
+dlg.close();
+(dlg.listeners.close || []).forEach((fn) => fn());
+out.push({ helpClosedByTerms, calls, declined: S.terms.declined,
+  acceptHidden: accept.hidden, declineHidden: decline.hidden,
+  closeHidden: document.querySelector("#btn-terms-close").hidden,
+  recheckHidden: document.querySelector("#btn-terms-recheck").hidden,
+  xDisabled: dlg.querySelector(".dlg-x").disabled, escBefore,
+  helpOpen: help.open,
+  focus: document.activeElement && document.activeElement.__sel,
+  lockedAfter: termsLocked() });
+""")
+        case = res[0]
+        self.assertTrue(case["helpClosedByTerms"], "打开条款时帮助先关掉，不叠两个弹窗")
+        self.assertEqual(case["calls"], [], "只读查看零 accept/save/学校调用")
+        self.assertFalse(case["declined"], "只读关闭不记拒绝")
+        self.assertTrue(case["acceptHidden"])
+        self.assertTrue(case["declineHidden"])
+        self.assertFalse(case["closeHidden"], "只读只显示关闭")
+        self.assertTrue(case["recheckHidden"])
+        self.assertFalse(case["xDisabled"])
+        self.assertEqual(case["escBefore"], "Esc 关闭")
+        self.assertTrue(case["helpOpen"], "关闭后帮助重开")
+        self.assertEqual(case["focus"], "#btn-help-terms", "焦点回「查看条款」入口")
+        self.assertFalse(case["lockedAfter"])
+
+    def test_view_toggle_never_saves(self):
+        """要点⇄全文切换零保存、零学校调用，按钮文案/aria/阅读区标题三处同步。"""
+        res = run_js(r"""
+let calls = [];
+window.pywebview = { api: {
+  save_prefs: () => { calls.push("save"); return Promise.resolve({ ok: true }); },
+  accept_terms: () => { calls.push("accept"); return Promise.resolve({ ok: true }); },
+} };
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+const btn = document.querySelector("#btn-terms-full");
+const full = document.querySelector("#dlg-terms-full-text");
+const body = document.querySelector(".terms-body");
+body.scrollTop = 40;
+btn.click();
+const mid = { hidden: full.hidden, text: btn.textContent,
+  title: document.querySelector("#dlg-terms-view-title").textContent,
+  aria: btn.getAttribute("aria-expanded"), scrollTop: body.scrollTop };
+btn.click();
+out.push({ mid, back: { hidden: full.hidden, text: btn.textContent,
+    title: document.querySelector("#dlg-terms-view-title").textContent,
+    aria: btn.getAttribute("aria-expanded") },
+  calls, open: document.querySelector("#dlg-terms").open });
+""")
+        case = res[0]
+        self.assertFalse(case["mid"]["hidden"])
+        self.assertEqual(case["mid"]["text"], "返回条款要点")
+        self.assertEqual(case["mid"]["title"], "完整条款")
+        self.assertEqual(case["mid"]["aria"], "true")
+        self.assertEqual(case["mid"]["scrollTop"], 0, "切到全文滚回顶部")
+        self.assertTrue(case["back"]["hidden"])
+        self.assertEqual(case["back"]["text"], "查看完整条款")
+        self.assertEqual(case["back"]["title"], "条款要点")
+        self.assertEqual(case["back"]["aria"], "false")
+        self.assertEqual(case["calls"], [], "切换视图绝不保存")
+        self.assertTrue(case["open"])
+
+    def test_close_without_acceptance_keeps_decline_semantics(self):
+        """未同意关闭（Esc/X 同一条 close 收口）仍记「暂不使用」：
+        版本标记落盘、门禁保持、焦点回 #btn-help。"""
+        res = run_js(r"""
+let saved = [];
+window.pywebview = { api: {
+  save_prefs: (patch) => { saved.push(JSON.parse(JSON.stringify(patch))); return Promise.resolve({ ok: true }); },
+} };
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+const dlg = document.querySelector("#dlg-terms");
+const cancelEv = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+(dlg.listeners.cancel || []).forEach((fn) => fn(cancelEv));
+dlg.close();
+(dlg.listeners.close || []).forEach((fn) => fn());
+out.push({ prevented: cancelEv.defaultPrevented, declined: S.terms.declined,
+  saved, locked: termsLocked(),
+  banner: document.querySelector("#banners").innerHTML,
+  focus: document.activeElement && document.activeElement.__sel });
+""")
+        case = res[0]
+        self.assertFalse(case["prevented"], "未保存时 Esc 放行原生关闭")
+        self.assertTrue(case["declined"])
+        self.assertTrue(any(p.get("terms_declined_version") == "2026-10-27"
+                            for p in case["saved"]), "拒绝版本必须落盘")
+        self.assertTrue(case["locked"], "拒绝后门禁保持")
+        self.assertIn("使用条款", case["banner"])
+        self.assertEqual(case["focus"], "#btn-help", "自动来源焦点回 #btn-help")
+
+    def test_close_restores_banner_focus_without_stacking_dialogs(self):
+        """来源是横幅：关闭回原按钮；随后自动打开再关闭回 #btn-help。"""
+        res = run_js(r"""
+window.pywebview = { api: {
+  save_prefs: () => Promise.resolve({ ok: true }),
+} };
+S.demo = false;
+S.prefs = {};
+S.terms.prompted = true; // 同会话已提示过：防止 ingestTerms 自动首弹抢先
+                         // 登记来源，让横幅打开成为真实来源
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+const dlg = document.querySelector("#dlg-terms");
+const back = document.querySelector("#btn-plan");
+const beforeBannerOpen = dlg.open;
+openTerms("banner", back);
+const bannerOpen = dlg.open;
+const bannerSource = S.terms.source;
+const bannerBackIsPlan = S.terms.focusBack === back;
+const seqAfterBanner = S.terms.requestSeq;
+openTerms("auto"); // 守卫：已打开时不重置任何登记（保护首来源）
+const guardSource = S.terms.source;
+const guardBackIsPlan = S.terms.focusBack === back;
+const guardSeq = S.terms.requestSeq;
+dlg.close();
+(dlg.listeners.close || []).forEach((fn) => fn());
+const afterBanner = document.activeElement && document.activeElement.__sel;
+openTerms();
+dlg.close();
+(dlg.listeners.close || []).forEach((fn) => fn());
+const afterAuto = document.activeElement && document.activeElement.__sel;
+out.push({ beforeBannerOpen, bannerOpen, bannerSource, bannerBackIsPlan,
+  seqAfterBanner, guardSource, guardBackIsPlan, guardSeq,
+  afterBanner, afterAuto, declined: S.terms.declined,
+  helpOpen: document.querySelector("#help").open });
+""")
+        case = res[0]
+        self.assertFalse(case["beforeBannerOpen"], "prompted 已置：ingestTerms 不得自动首弹")
+        self.assertTrue(case["bannerOpen"], "横幅打开必须真实打开弹窗")
+        self.assertEqual(case["bannerSource"], "banner", "打开时必须登记横幅来源")
+        self.assertTrue(case["bannerBackIsPlan"], "打开时必须登记被点按钮为焦点返回点")
+        self.assertEqual(case["guardSource"], "banner", "守卫不得覆盖首来源登记")
+        self.assertTrue(case["guardBackIsPlan"], "守卫不得清空焦点返回点")
+        self.assertEqual(case["guardSeq"], case["seqAfterBanner"],
+                         "守卫空操作：不得再次作废请求代号")
+        self.assertEqual(case["afterBanner"], "#btn-plan", "横幅来源回被点的按钮")
+        self.assertEqual(case["afterAuto"], "#btn-help", "自动来源回 #btn-help")
+        self.assertTrue(case["declined"])
+        self.assertFalse(case["helpOpen"], "帮助没被误开（不叠弹窗）")
+
+    def test_boot_defers_intro_until_terms_accepted(self):
+        """真实 boot 首次 prefs 空且未同意：只弹条款、首轮学校加载被拦、
+        欢迎与引导都延后；同意后引导只继续一次，绝不伪造 tour_version。"""
+        res = run_js(r"""
+let calls = [], saved = [];
+window.pywebview = { api: {
+  bootstrap: () => { calls.push("bootstrap");
+    return Promise.resolve({ demo: false, prefs: {},
+      terms: { version: "2026-10-27", accepted_version: "", accepted_at: "" } }); },
+  save_prefs: (patch) => { saved.push(JSON.parse(JSON.stringify(patch))); return Promise.resolve({ ok: true }); },
+  front_ready: () => { calls.push("front_ready"); return Promise.resolve({ ok: true }); },
+  clock_snapshot: () => new Promise(() => {}),
+  check: () => { calls.push("check"); return new Promise(() => {}); },
+  list_activities: () => { calls.push("list"); return new Promise(() => {}); },
+  accept_terms: (v) => { calls.push("accept:" + v);
+    return Promise.resolve({ ok: true, terms: { version: "2026-10-27",
+      accepted_version: "2026-10-27", accepted_at: "2026-10-27 12:00:00" } }); },
+} };
+await boot();
+const schoolCalls = () => calls.filter((c) => c === "check" || c === "list");
+const atBoot = { termsOpen: document.querySelector("#dlg-terms").open,
+  helpOpen: document.querySelector("#help").open, tourOpen: S.tour.open,
+  deferred: JSON.parse(JSON.stringify(S.terms.deferredIntro || null)),
+  schoolCalls: schoolCalls() };
+document.querySelector("#dlg-terms-document-version").textContent = "2026-10-27";
+document.querySelector("#btn-terms-accept").click();
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+const afterAccept = { tourOpen: S.tour.open,
+  helpOpen: document.querySelector("#help").open,
+  deferred: S.terms.deferredIntro, schoolCalls: schoolCalls(),
+  tourVersionWritten: saved.some((p) => "tour_version" in p),
+  welcomeWritten: saved.some((p) => "welcome_seen" in p),
+  locked: termsLocked() };
+out.push({ atBoot, afterAccept });
+""")
+        at_boot, after = res[0]["atBoot"], res[0]["afterAccept"]
+        self.assertTrue(at_boot["termsOpen"], "首次未同意只弹条款")
+        self.assertFalse(at_boot["helpOpen"], "欢迎延后")
+        self.assertFalse(at_boot["tourOpen"], "引导延后")
+        self.assertEqual(at_boot["deferred"], {"tour": True, "welcome": False})
+        self.assertEqual(at_boot["schoolCalls"], [], "首轮学校加载被条款拦下")
+        self.assertTrue(after["tourOpen"], "同意后引导继续一次")
+        self.assertFalse(after["helpOpen"], "本例引导适用，不再叠欢迎")
+        self.assertIsNone(after["deferred"], "延后项消费后清空（只继续一次）")
+        self.assertEqual(after["schoolCalls"], ["check", "list"], "同意后补一次加载")
+        self.assertFalse(after["tourVersionWritten"], "绝不伪造 tour_version")
+        self.assertTrue(after["welcomeWritten"], "首次欢迎标记仍按原语义落盘")
+        self.assertFalse(after["locked"])
+
+    def test_decline_after_deferred_boot_does_not_fake_tour_completion(self):
+        """延后状态下关闭（暂不使用）：本会话不自动开引导、不写 tour_version，
+        引导完成状态保持未写（下次仍可正常判定）。"""
+        res = run_js(r"""
+let saved = [];
+window.pywebview = { api: {
+  bootstrap: () => Promise.resolve({ demo: false, prefs: {},
+    terms: { version: "2026-10-27", accepted_version: "", accepted_at: "" } }),
+  save_prefs: (patch) => { saved.push(JSON.parse(JSON.stringify(patch))); return Promise.resolve({ ok: true }); },
+  front_ready: () => Promise.resolve({ ok: true }),
+  clock_snapshot: () => new Promise(() => {}),
+} };
+await boot();
+const dlg = document.querySelector("#dlg-terms");
+dlg.close();
+(dlg.listeners.close || []).forEach((fn) => fn());
+out.push({ declined: S.terms.declined, tourOpen: S.tour.open,
+  helpOpen: document.querySelector("#help").open,
+  tourVersionWritten: saved.some((p) => "tour_version" in p),
+  tourStillEligible: tourShouldAutoStart(),
+  declinedSaved: saved.some((p) => p.terms_declined_version === "2026-10-27"),
+  focus: document.activeElement && document.activeElement.__sel });
+""")
+        case = res[0]
+        self.assertTrue(case["declined"])
+        self.assertFalse(case["tourOpen"], "拒绝后本会话不自动开引导")
+        self.assertFalse(case["helpOpen"])
+        self.assertFalse(case["tourVersionWritten"], "拒绝不伪造引导完成")
+        self.assertTrue(case["tourStillEligible"], "引导完成状态保持未写")
+        self.assertTrue(case["declinedSaved"])
+        self.assertEqual(case["focus"], "#btn-help")
+
+    def test_terms_dialog_keyboard_does_not_penetrate_background(self):
+        """打开的条款弹窗独占键盘：Enter/斜杠/Ctrl+F/F5 不穿透（不 preventDefault、
+        不抢搜索、不刷新），引导可见时 Esc 也不跳过引导。"""
+        res = run_js(r"""
+S.demo = false;
+S.prefs = {};
+ingestTerms({ version: "2026-10-27", accepted_version: "", accepted_at: "" });
+const eEnter = __dispatchKey({ key: "Enter" });
+const eSlash = __dispatchKey({ key: "/" });
+const eCtrlF = __dispatchKey({ key: "f", ctrlKey: true });
+const eF5 = __dispatchKey({ key: "F5" });
+const focusAfterSearch = document.activeElement && document.activeElement.__sel;
+/* 引导强行可见：Esc 不许跳过引导、不许写 tour_version */
+S.tour.open = true;
+S.tour.paused = false;
+S.terms.tourYield = false;
+const eEsc = __dispatchKey({ key: "Escape" });
+out.push({ enterPrevented: eEnter.defaultPrevented,
+  slashPrevented: eSlash.defaultPrevented,
+  ctrlFPrevented: eCtrlF.defaultPrevented,
+  f5Prevented: eF5.defaultPrevented, escPrevented: eEsc.defaultPrevented,
+  focusAfterSearch, tourOpen: S.tour.open,
+  tourVersionWritten: "tour_version" in S.prefs,
+  termsOpen: document.querySelector("#dlg-terms").open });
+""")
+        case = res[0]
+        self.assertFalse(case["enterPrevented"], "Enter 保留原生语义，不触发开始计划")
+        self.assertFalse(case["slashPrevented"], "斜杠不抢搜索框")
+        self.assertFalse(case["ctrlFPrevented"], "Ctrl+F 不抢搜索框")
+        self.assertFalse(case["f5Prevented"], "保存外的重载保留原生（不强拦）")
+        self.assertFalse(case["escPrevented"], "条款打开时 Esc 不穿透到引导")
+        self.assertEqual(case["focusAfterSearch"], "#dlg-terms-title",
+                         "焦点停在条款标题，没被搜索抢走")
+        self.assertTrue(case["tourOpen"], "引导没被条款内的 Esc 跳过")
+        self.assertFalse(case["tourVersionWritten"])
+        self.assertTrue(case["termsOpen"])
+
+    def test_terms_dialog_static_contract_native_close_and_anchors(self):
+        """静态守护：X 走原生 method=dialog 关闭（由 close 监听统一收口）、
+        阅读区/反馈/底栏结构与版本节点齐备。"""
+        html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
+        start = html.index('id="dlg-terms"')
+        block = html[start:html.index("</dialog>", start)]
+        self.assertIn('method="dialog"', block, "右上角 X 必须走原生关闭")
+        self.assertEqual(block.count('id="dlg-terms-document-version"'), 1)
+        self.assertEqual(block.count('id="dlg-terms-status"'), 1)
+        for anchor in ("terms-head", "terms-toolbar", "terms-body",
+                       "terms-feedback", "terms-foot", "terms-section"):
+            self.assertIn(anchor, block, "设计稿结构区缺失：" + anchor)
+        self.assertIn('id="dlg-terms-view-title"', block)
+        self.assertIn('id="btn-terms-recheck"', block)
+        self.assertIn('id="btn-terms-close"', block)
+        self.assertIn('id="btn-terms-full"', block)
+
+    def test_terms_status_feedback_resets_reading_scroll_zero_side_effects(self):
+        """termsStatus 反馈与阅读区滚动（只定义、待授权运行）：
+        非空消息把唯一阅读区 scrollTop 归零且文本/tone/hidden 正确；
+        清空分支提前 return，只隐藏状态、不动滚动；
+        焦点、全文展开态、条款请求代号全部不变，且反馈路径零桥调用。"""
+        res = run_js(r"""
+          // 本用例只验证 termsStatus 反馈，不走真实桥接：harness 不预置 pywebview，
+          // 先给五个键本地 no-op Promise 桩让包装器可挂接；任何意外调用都会被记录。
+          window.pywebview = { api: {
+            accept_terms: () => Promise.resolve({ ok: true }),
+            save_prefs: () => Promise.resolve({ ok: true }),
+            bootstrap: () => Promise.resolve({}),
+            check: () => Promise.resolve({ ok: true }),
+            list_activities: () => Promise.resolve({ ok: true, items: [] }),
+          } };
+          const body = $(".terms-body");
+          const status = $("#dlg-terms-status");
+          const full = $("#dlg-terms-full-text");
+          const bridge = window.pywebview.api;
+          const bridgeCalls = [];
+          ["accept_terms", "save_prefs", "bootstrap", "check", "list_activities"].forEach((key) => {
+            const fn = bridge[key];
+            bridge[key] = (...args) => { bridgeCalls.push(key); return fn.apply(bridge, args); };
+          });
+          body.scrollTop = 200;
+          const focusBefore = document.activeElement;
+          const seqBefore = S.terms.requestSeq;
+          const fullHiddenBefore = full.hidden;
+          termsStatus("保存结果未确认：请点「重新确认状态」核对本机记录。", "warn");
+          out.push({
+            scrollTop: body.scrollTop,
+            text: status.textContent,
+            tone: status.dataset.tone,
+            hidden: status.hidden,
+            focusUnchanged: document.activeElement === focusBefore,
+            seqUnchanged: S.terms.requestSeq === seqBefore,
+            fullHiddenUnchanged: full.hidden === fullHiddenBefore
+          });
+          body.scrollTop = 100;
+          termsStatus("", "warn");
+          out.push({
+            scrollTop: body.scrollTop,
+            hidden: status.hidden,
+            text: status.textContent
+          });
+          out.push({ bridgeCalls: bridgeCalls });
+        """)
+        shown, cleared, calls = res[0], res[1], res[2]
+        self.assertEqual(shown["scrollTop"], 0, "非空反馈必须把阅读区滚回顶部")
+        self.assertIn("保存结果未确认", shown["text"], "状态文本必须如实展示反馈消息")
+        self.assertEqual(shown["tone"], "warn", "tone 必须按传入值展示")
+        self.assertFalse(shown["hidden"], "非空反馈必须可见")
+        self.assertTrue(shown["focusUnchanged"], "反馈不许碰焦点")
+        self.assertTrue(shown["seqUnchanged"], "反馈不许改条款请求代号")
+        self.assertTrue(shown["fullHiddenUnchanged"], "反馈不许动全文展开态")
+        self.assertEqual(cleared["scrollTop"], 100,
+                         "清空分支必须提前 return，不能归零滚动")
+        self.assertTrue(cleared["hidden"], "清空后状态必须隐藏")
+        self.assertEqual(cleared["text"], "", "清空后状态文本必须置空")
+        self.assertEqual(calls["bridgeCalls"], [], "反馈路径必须零桥调用")
 
 
 if __name__ == "__main__":

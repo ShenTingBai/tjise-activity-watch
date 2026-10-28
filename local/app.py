@@ -97,6 +97,36 @@ def read_version() -> str:
 
 APP_VERSION = read_version()
 
+# 使用条款与隐私告知的当前版本：与 docs/TERMS_AND_PRIVACY.md 顶部的版本字段
+# 是同一份（契约测试会核对两处一致）。条款内容更新时同步改这两处，
+# 界面据此判断是否需要重新弹出条款确认。
+#
+# 版本形如「日期」或「日期-rN」：本轮修订修正了许可边界、通信披露和
+# 「版本变化必须再次点击同意」的接受语义，旧版本（2026-10-27）的同意
+# 记录不能静默覆盖新内容，所以提升到 -r1 而不是沿用同一天。
+TERMS_VERSION = "2026-10-27-r2"
+
+
+def terms_unknown_payload() -> dict:
+    """条款状态不可知时的统一拒绝载荷（界面据此提示重试，不猜）。"""
+    return {"ok": False, "error": "terms_required",
+            "text": "还没确认当前版本的使用条款；点「查看条款」阅读后再继续。"}
+
+
+def terms_state(prefs: dict) -> dict:
+    """条款同意快照（纯函数，供契约测试隔离求值）。
+
+    只读 ui.json 偏好里的 terms_version / terms_accepted_at 两个键：不碰
+    任何登录文件，也不把同意状态写进运行日志。bootstrap 把这份快照
+    带给界面，界面按「已同意版本 != 当前版本」判定门禁。
+    """
+    return {
+        "version": TERMS_VERSION,
+        "accepted_version": str((prefs or {}).get("terms_version") or ""),
+        "accepted_at": str((prefs or {}).get("terms_accepted_at") or ""),
+    }
+
+
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 # 组件诊断：结构化错误码 → 人话主文案。技术细节只进运行记录（日志），
@@ -991,6 +1021,28 @@ class Api:
         except Exception:
             pass
 
+    # ---------- 条款授权（学校动作的最终防线） ----------
+    def _terms_gate(self, request_id: str = "") -> "dict | None":
+        """学校联网动作的统一条款门禁；返回 None 才放行。
+
+        界面按钮只是第一道：脚本、快捷键、事件重放都能绕过按钮，所以真实
+        判定放在后端。只读 ui.json 的 terms_version / terms_accepted_at，
+        不读登录文件、不写运行日志；演示模式（DEMO）完全离线，不受此限。
+
+        未同意、版本不匹配、偏好读不出（load_prefs 兜底返回空）都按
+        **未授权**处理：不启动线程、worker、学校请求或计划协调器。
+        """
+        if DEMO:
+            return None
+        state = terms_state(load_prefs())
+        if state["accepted_version"] == TERMS_VERSION:
+            return None
+        payload = dict(terms_unknown_payload(), terms=state)
+        if request_id:
+            # 带上原 request_id：界面按 ID 对账，不把拒绝当成新一轮在途
+            payload["request_id"] = request_id
+        return payload
+
     # ---------- 读数据 ----------
     def bootstrap(self) -> dict:
         prefs = load_prefs()
@@ -1007,6 +1059,9 @@ class Api:
         payload = {
             "version": APP_VERSION,
             "prefs": prefs,
+            # 条款同意快照：界面据此决定是否弹条款、是否放行学校网络动作；
+            # 同意状态本身只存 ui.json（terms_version / terms_accepted_at）
+            "terms": terms_state(prefs),
             "business_clock": self._clock_payload(),
             "help": self.help(),
             "login": login_info,
@@ -1143,6 +1198,10 @@ class Api:
     def check(self, request_id: str = "") -> dict:
         # js_api 的处理跑在 UI 线程上：一旦在这里跑 subprocess，
         # 窗口会直接"未响应"。所以只负责起线程，结果用事件推回去。
+        # 条款门禁：登录态校验要访问学校接口，未获授权就不起线程（后端最终防线）
+        gate = self._terms_gate(request_id)
+        if gate is not None:
+            return dict(gate, queued=False)
         with self._lock:
             if self._closing:
                 # 关闭拒绝是取消语义：不给组件码，不再起线程
@@ -1163,6 +1222,10 @@ class Api:
         return {"ok": True, "queued": True, "request_id": request_id}
 
     def list_activities(self, request_id: str = "") -> dict:
+        # 条款门禁同上：活动列表来自学校接口，未获授权不拉列表
+        gate = self._terms_gate(request_id)
+        if gate is not None:
+            return dict(gate, queued=False)
         with self._lock:
             if self._closing:
                 return {"ok": False, "queued": False, "request_id": request_id,
@@ -1424,10 +1487,23 @@ class Api:
                 return {"ok": False, "text": "程序正在关闭，已取消本次登录"}
             if self._plan and self._plan.published_status() in {"running", "ready"}:
                 return {"ok": False, "text": "报名计划正在运行，先停止计划再登录"}
+        # 条款门禁：登录要打开学校登录页并写回会话，未获授权不起 worker
+        gate = self._terms_gate()
+        if gate is not None:
+            return gate
         return self._spawn(worker_command("login"), "登录", kind="login")
 
     def grab(self, activity_id: str, name: str, at: str = "",
              headed: bool = False) -> dict:
+        if DEMO:
+            # 演示模式绝不起真实 worker：grab 是学校动作，demo 只给离线结论
+            # （与计划协调器里的 demo runner 同一口径，不绕过条款门禁）
+            return {"ok": False, "demo": True,
+                    "text": "演示模式不联网：这里不会真正提交报名。"}
+        # 条款门禁：单场报名直接打学校接口，未获授权不起 worker
+        gate = self._terms_gate()
+        if gate is not None:
+            return gate
         args = worker_command("grab", "--activity-id", activity_id, "--name", name)
         if at:
             args += ["--at", at]
@@ -1552,6 +1628,19 @@ class Api:
                     replay = None
             if replay is not None:
                 return replay
+        # 条款门禁放在「幂等重放之后、真正建计划之前」：已接纳/已拒绝的
+        # 结论照旧重放，新的请求未获授权则立即把本次登记收成 rejected，
+        # 既不留下悬空 pending，也不启动计划协调器与任何 worker。
+        gate = self._terms_gate()
+        if gate is not None:
+            rejected = dict(gate)
+            if rid:
+                rejected["request_id"] = rid
+                with self._lock:
+                    record = self._start_requests.get(rid) or {}
+                    if record.get("state") == "pending":
+                        self._remember_start(rid, "rejected", result=rejected)
+            return rejected
         try:
             result = self._start_plan_inner(items, headed, retry_policy, rid)
         except Exception as exc:  # noqa: BLE001 - 本机异常也要留下真实结论
@@ -1941,9 +2030,15 @@ class Api:
         return {"ok": False, "text": "当前没有在跑的任务"}
 
     def open_data(self) -> dict:
+        """打开数据目录，并把**真实路径**回给界面。
+
+        只回 {"ok": true} 是不够的：用户最常问的就是「数据到底在哪」，
+        窗口一关就又不知道了。路径必须能被看见、能被复制，所以原样回传
+        实际解析出来的目录（TJISE_DATA_DIR 覆盖过的话也如实反映）。
+        """
         path = ensure_data_dir()
         os.startfile(str(path))            # noqa: S606 - Windows 桌面工具
-        return {"ok": True}
+        return {"ok": True, "path": str(path)}
 
     def open_latest_release(self) -> dict:
         """用户点「GitHub 最新版本」时用系统默认浏览器打开固定的 releases/latest 页。
@@ -1964,6 +2059,32 @@ class Api:
             return {"ok": False, "error": "prefs_busy",
                     "text": "设置暂未保存，另一个窗口正在保存数据。"}
         return {"ok": True}
+
+    def accept_terms(self, document_version: str = "") -> dict:
+        """同意使用条款：先核验界面实际读到的文档版本，再经 ui.json 原子偏好事务落盘。
+
+        同意必须绑定「用户读到的那份全文」：document_version 为空、旧版、
+        未知新版或类型非法，都说明界面副本与程序要求不同源（混合资源或旧
+        HTML），此时零写入直接拒绝——否则界面提示不匹配却已留下当前版同意，
+        刷新后会放行。只写 terms_version / terms_accepted_at 两个键——不读写
+        任何登录文件，不把同意状态写进运行日志；拿不到跨进程锁时如实返回
+        失败，让界面留在条款弹窗里重试。
+        """
+        # 版本判定必须在 time.strftime 与 update_prefs 之前：拒绝路径零副作用
+        if not (isinstance(document_version, str)
+                and document_version == TERMS_VERSION):
+            return {
+                "ok": False,
+                "error": "terms_version_mismatch",
+                "text": "界面显示的条款版本与程序要求的版本不一致，请重新下载完整版本后再确认。",
+                "terms": terms_state(load_prefs()),
+            }
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        if not update_prefs({"terms_version": TERMS_VERSION,
+                             "terms_accepted_at": stamp}):
+            return {"ok": False, "error": "prefs_busy",
+                    "text": "条款同意状态暂未保存，另一个窗口正在保存数据；请再点一次。"}
+        return {"ok": True, "terms": terms_state(load_prefs())}
 
     # ---------- 内部 ----------
     def _is_busy_locked(self) -> bool:

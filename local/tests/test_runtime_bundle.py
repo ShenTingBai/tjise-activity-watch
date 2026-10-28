@@ -57,6 +57,45 @@ def read(rel: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
+# ---- 条款同意夹具（计划 repair-terms-test-fixtures）----
+# check、list、login、start_plan 与协调器生命周期都先过 app._terms_gate，而门禁
+# 只读 app.PREFS：不把偏好钉到临时文件，这些用例就会去读开发者真实的 ui.json，
+# 门禁结论随机器上是否点过同意而漂移。同意状态只写在本轮临时 ui.json 的
+# terms_version / terms_accepted_at 两个键上，模块跑完即删；专门验证 terms_required
+# 未同意状态的用例在 test_terms_consent.py 里照旧构造，不受这里影响。
+_PREFS_PATCHER = None
+_PREFS_TMP = None
+
+
+def setUpModule():
+    """把本模块的偏好文件钉到临时 ui.json，并写入当前版本的条款同意。"""
+    global _PREFS_PATCHER, _PREFS_TMP
+    try:
+        local_app = _app()
+    except unittest.SkipTest:
+        # 导入失败时由各用例自己 skipTest，保持原有跳过行为，不替它们下结论
+        return
+    _PREFS_TMP = tempfile.TemporaryDirectory(prefix="tjise-terms-prefs-")
+    _PREFS_PATCHER = mock.patch.object(local_app, "PREFS",
+                                       Path(_PREFS_TMP.name) / "ui.json")
+    _PREFS_PATCHER.start()
+    if not local_app.update_prefs({"terms_version": local_app.TERMS_VERSION,
+                                   "terms_accepted_at": "2026-10-27 12:00:00"}):
+        tearDownModule()
+        raise RuntimeError("条款同意偏好夹具写入失败")
+
+
+def tearDownModule():
+    """还原真实的 app.PREFS，并删除本轮临时偏好目录。"""
+    global _PREFS_PATCHER, _PREFS_TMP
+    if _PREFS_PATCHER is not None:
+        _PREFS_PATCHER.stop()
+        _PREFS_PATCHER = None
+    if _PREFS_TMP is not None:
+        _PREFS_TMP.cleanup()
+        _PREFS_TMP = None
+
+
 class WorkerResolutionTests(unittest.TestCase):
     """worker 唯一来源：源码态 grab.py，冻结态资源根 grab-worker.exe。"""
 

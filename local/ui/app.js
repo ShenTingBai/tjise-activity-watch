@@ -97,6 +97,22 @@ const S = {
   /* 上一帧的运行阶段：跨过开放时刻/进入真正提交时要重画一次大屏摘要 */
   lastRunPhase: null,
   prefs: {},
+  /* 使用条款同意状态（决策 013）：version 是后端 bootstrap 带来的当前条款
+   * 版本；acceptedVersion 是本机 ui.json 里已同意的版本；declined 记「这一版
+   * 已经拒绝过」（重启时由 prefs.terms_declined_version 恢复）；unknown 记
+   * 「条款状态没读到」，是 fail-closed 的第二种形态——拒绝不退出、不再强弹，
+   * 但登录/列表/报名计划保持停用。 */
+  terms: { version: "", acceptedVersion: "", acceptedAt: "", declined: false,
+           prompted: false, unknown: false,
+           /* 交互收口的会话态（只存内存，不新增 prefs 键）：saving=正在保存；
+            * requestSeq=请求代号，超时/关闭时自增使迟到回执失效；unconfirmed=
+            * 10 秒没拿到可确认结果（既非成功也非失败）；viewOnly=已同意同版的
+            * 只读查看；source/focusBack=打开来源与要还回去的焦点；closeHandled=
+            * 程序性关闭自己处理焦点与引导，close 监听不再重复处理；tourYield=
+            * 打开条款时让位的引导；deferredIntro=boot 时被条款推迟的首次欢迎/引导 */
+           saving: false, requestSeq: 0, unconfirmed: false, viewOnly: false,
+           source: "", focusBack: null, closeHandled: false, tourYield: false,
+           deferredIntro: null },
   /* 后端 bootstrap 的 lifecycle 快照：上次关闭时长/质量 + 登录估算（只提示，不参与门禁） */
   lifecycle: null,
   /* 六步引导运行态：open=遮罩在场；paused=计划运行中暂停；restoreFocus=结束后要还的焦点 */
@@ -261,6 +277,9 @@ async function boot() {
      * 不参与登录四态判定，也不影响开始门禁 */
     S.lifecycle = info.lifecycle || null;
     applyPrefs(info.prefs || {});
+    /* 条款快照（bootstrap.terms）：未同意时拦下后面的首轮自动加载；
+     * 首次（且本版本从未拒绝过）弹一次条款，之后只留横幅入口不强弹 */
+    ingestTerms(info.terms);
     /* 独立北京时间：bootstrap 权威快照建立锚点（决策 012），
      * 桥接往返计入误差；随后由后台轮询接管后续快照 */
     ingestBusinessClock(info.business_clock, { authoritative: true, rttMs: bootRtt });
@@ -269,14 +288,25 @@ async function boot() {
              loginPresent(info.login, !!info.demo), info.login);
     setBusy(!!info.busy);
     ingestBootstrapPlan(info);
-    /* 首次使用：六步引导代替一次性静态弹窗；引导不会自动开始时才弹说明 */
+    /* 首次使用：六步引导代替一次性静态弹窗——但条款决定更早：未同意/未知
+     * 时欢迎与引导都延后到同意后只继续一次；「暂不使用」过（declined）本
+     * 会话不再自动开引导；绝不写 tour_version（看过与否只由引导自己落盘）。 */
     const tourWillAuto = tourShouldAutoStart();
-    if (!S.prefs.welcome_seen) {
-      savePrefs({ welcome_seen: true });
-      if (!tourWillAuto) showHelp();
+    const firstRun = !S.prefs.welcome_seen;
+    if (firstRun) savePrefs({ welcome_seen: true });
+    if (termsLocked()) {
+      S.terms.deferredIntro = {
+        tour: !S.terms.declined && tourWillAuto,
+        welcome: firstRun && !tourWillAuto,
+      };
+    } else {
+      if (firstRun && !tourWillAuto) showHelp();
+      if (tourWillAuto) startTour(0);
     }
-    if (tourWillAuto) startTour(0);
   } else {
+    /* 拿不到 bootstrap：条款状态也无从而知，按未知处理（fail closed），
+     * 学校动作交给后端门禁 + 前端横幅双重拦住 */
+    markTermsUnknown();
     setLogin(null, null);
     S.listState = "idle";
     render();
@@ -405,6 +435,13 @@ function refresh(quiet) {
     if (!quiet) setResult({ ok: false, title: "还没有连接本机程序", text: "请从图形界面启动，再点「刷新」加载活动列表。" });
     return;
   }
+  /* 条款未同意：真实校验与活动列表都是学校网络动作，这一轮不发起；
+   * 还没拒绝过就先弹条款，拒绝过或条款状态未知时安静返回——未知状态由
+   * 横幅给重试入口，不在每次自动刷新时反复弹窗（按钮本就禁用，此处兜底） */
+  if (termsLocked()) {
+    if (!S.terms.declined && !S.terms.unknown) openTerms();
+    return;
+  }
   const checkId = newRoundId("check");
   const listId = newRoundId("list");
   /* 每轮各自一个消费代次：这一轮的 ack/catch/终态只能收口这一轮，
@@ -531,6 +568,27 @@ function settleSynchronous(res, branch) {
     return;
   }
   if (res.ok !== false) return;
+  /* 后端条款回绝（terms_required）：按钮可能被脚本、快捷键或旧界面绕过，
+   * 这条路径必须把界面拉回条款门禁，而不是只把报错丢进结果框。 */
+  if (res.error === "terms_required") {
+    if (branch === "check") {
+      clearTimeout(S.round.checkTimer);
+      S.login.checking = false;
+      S.login.result = "unknown";
+      S.login.ok = false;
+      paintLogin();
+      refreshLoginEmptyState();
+      settleRefreshBranch("check");
+    } else {
+      clearTimeout(S.round.listTimer);
+      S.listState = "error";
+      S.listError = (res && res.text) || "活动列表没能开始加载";
+      render();
+      settleRefreshBranch("list");
+    }
+    noteTermsRequired(res);
+    return;
+  }
   if (branch === "check") {
     clearTimeout(S.round.checkTimer);
     S.login.checking = false;
@@ -1365,8 +1423,9 @@ function paintBoardActions() {
     return;
   }
   actions.hidden = false;
-  /* 缺组件时不给快捷登录入口（点了只会拿到结构化失败）；「刷新」可复查恢复 */
-  const needLogin = S.login.present === false && !S.runtime.error;
+  /* 缺组件时不给快捷登录入口（点了只会拿到结构化失败）；「刷新」可复查恢复。
+   * 条款未同意时同样不给快捷登录（登录是学校网络动作，决策 013）。 */
+  const needLogin = S.login.present === false && !S.runtime.error && !termsLocked();
   const next = nextOpen().bestId ? findItem(nextOpen().bestId) : null;
   /* 快捷「选这一场」只在真正空闲时占据操作区：已经结束的计划还要保留
    * 「清空选择/再看结果」入口，不能因为成功场次已从选择集合移除就把它藏掉。 */
@@ -1870,9 +1929,11 @@ function retryDeadline(task) {
 
 function updateControls() {
   const componentDown = !!S.runtime.error;
+  /* 条款门禁（决策 013）：未同意时登录/刷新/开始全部禁用；离线演示不受限 */
+  const termsGate = termsLocked();
   /* 缺组件：登录/开始都禁用（点了也是结构化失败）；刷新保持可用——复查组件并恢复的唯一通道 */
-  $("#btn-login").disabled = S.busy || componentDown;
-  $("#btn-refresh").disabled = S.listState === "loading";
+  $("#btn-login").disabled = S.busy || componentDown || termsGate;
+  $("#btn-refresh").disabled = S.listState === "loading" || termsGate;
   /* 帮助任何状态都可打开；运行中只禁重看引导，原因写在按钮上。 */
   paintReplayButtons();
   const validation = validateSelection();
@@ -1881,7 +1942,7 @@ function updateControls() {
    * checking 必须显式排除：新一轮检查开始时不清旧 result，
    * 不排除的话上次 valid 会放行尚未确认的检查期。 */
   const loginReady = !!S.demo || (!S.login.checking && S.login.result === "valid");
-  const canStart = !S.busy && !S.starting && !componentDown && loginReady && S.selected.size > 0
+  const canStart = !S.busy && !S.starting && !componentDown && !termsGate && loginReady && S.selected.size > 0
     && validation.errors.length === 0 && validation.conflicts.length === 0
     && S.listState === "ready";
   /* 独立北京时间门禁（决策 012）：时钟不可读或不在 ready/holdover 时开始禁用 */
@@ -1905,6 +1966,19 @@ function updateControls() {
 /* ---------------------------------------------------------------- 横幅 */
 function paintBanners() {
   const parts = [];
+  if (S.terms.unknown) {
+    /* 条款状态没读到（bootstrap 失败/缺 terms/版本非法）：停用学校动作并给
+     * 唯一的重试入口；不自动弹窗——用户点开的才是可确认的同意动作 */
+    parts.push('<div class="banner" data-tone="warn" role="alert"><span class="grow"><b>条款状态没能确认。</b>' +
+      "登录、活动列表和报名计划暂时停用；点「查看条款」打开全文并重新确认，确认成功才会恢复。</span>" +
+      '<button class="btn btn-ghost" type="button" data-act="terms-open">查看条款</button></div>');
+  } else if (termsLocked()) {
+    /* 条款未同意：一条横幅说明停用范围，并提供唯一的再同意入口；不强弹 */
+    parts.push('<div class="banner" data-tone="warn" role="alert"><span class="grow"><b>还没有同意使用条款。</b>' +
+      (S.terms.declined ? "登录、活动列表和报名计划保持停用。" : "同意后才能登录、查看活动列表与开始报名计划。") +
+      "</span>" +
+      '<button class="btn btn-ghost" type="button" data-act="terms-open">查看条款</button></div>');
+  }
   if (S.runtime.error) {
     /* 组件问题只挂一条横幅（一个主要提示 + 恢复动作），不在满屏重复 */
     const copy = runtimeErrorCopy();
@@ -1927,6 +2001,11 @@ function paintBanners() {
 /* ---------------------------------------------------------------- 动作 */
 function startPlan() {
   if (S.busy || S.starting) return;
+  /* 条款未同意：报名计划是学校网络动作，拒绝后按钮已禁用，这里只兜底不强弹 */
+  if (termsLocked()) {
+    if (!S.terms.declined && !S.terms.unknown) openTerms();
+    return;
+  }
   const validation = validateSelection();
   if (!S.selected.size) {
     setResult({ ok: false, title: "还没选活动", text: "在时刻表勾选至少一场未报名活动。" });
@@ -1980,6 +2059,11 @@ function startPlan() {
     S.startRequest.state = "settled";
     if (!res || res.ok === false) {
       setBusy(false);
+      /* 后端条款回绝：不按普通业务失败弹结果框，回到条款门禁 */
+      if (res && res.error === "terms_required") {
+        noteTermsRequired(res);
+        return;
+      }
       if (res && res.error && RUNTIME_ERRORS[res.error]) {
         /* FB4：开始计划的组件失败同样只挂横幅与唯一恢复入口，
          * 不生成同义失败结果框；并计入本轮刷新故障累计（迟到成功不得撤） */
@@ -2220,6 +2304,11 @@ function doStopPlan() {
 
 function doLogin() {
   if (S.busy) return;
+  /* 条款未同意：登录是学校网络动作，拒绝后按钮已禁用，这里只兜底不强弹 */
+  if (termsLocked()) {
+    if (!S.terms.declined && !S.terms.unknown) openTerms();
+    return;
+  }
   /* 打开浏览器只是开始登录，不代表登录成功；在 done(login) 到达前保留真实的
    * 失效/未登录结论，避免「取消登录」期间被忙碌态误画成已登录。 */
   S.login.loginPending = true;
@@ -3320,6 +3409,471 @@ function copyLog() {
   }
 }
 
+/* ---------------------------------------------------------------- 条款 */
+/* 决策 013：条款门禁只拦「学校网络动作」——登录、真实校验、活动列表、报名
+ * 计划。帮助、设置、条款本身与离线演示（demo，不碰学校系统）不受限。 */
+function termsAccepted() {
+  return !!S.terms.version && S.terms.acceptedVersion === S.terms.version;
+}
+
+/* 学校动作是否被条款拦下（决策 013 返修）：
+ * - 离线演示（demo）不做学校网络动作，不受限；
+ * - unknown（bootstrap 失败、返回 null、缺 terms、版本为空或结构非法）一律拦，
+ *   没有任何依据可以放行学校动作；
+ * - 有版本但没同意当前版本 → 拦；
+ * - 还没拿到任何条款状态（version 为空且未标 unknown，例如测试桩或桥接未
+ *   就绪）→ 前端没有依据，交给后端门禁兜底，不在此处冒充「已确认未同意」。 */
+function termsLocked() {
+  if (S.demo) return false;
+  if (S.terms.unknown) return true;
+  if (!S.terms.version) return false;
+  return !termsAccepted();
+}
+
+/* 后端明确回绝时的界面收敛：后端是最终防线，前端要把状态跟上——
+ * 有版本就按「未同意当前版本」，没有版本就按未知，两者都不放行学校动作。 */
+function noteTermsRequired(res) {
+  if (res && res.terms && String(res.terms.version || "")) {
+    S.terms.version = String(res.terms.version);
+    S.terms.acceptedVersion = String(res.terms.accepted_version || "");
+    S.terms.unknown = false;
+  } else if (!S.terms.version) {
+    S.terms.unknown = true;
+  }
+  paintTerms();
+  paintBanners();
+  updateControls();
+  if (!S.terms.declined && !S.terms.unknown) openTerms();
+}
+
+/* 条款状态未知：拦住学校动作并挂可重试横幅；没有版本时不强弹条款，
+ * 只保留帮助与横幅里的显式入口（用户自己点才会打开）。 */
+function markTermsUnknown() {
+  S.terms.version = "";
+  S.terms.acceptedVersion = "";
+  S.terms.acceptedAt = "";
+  S.terms.unknown = true;
+  S.terms.declined = false;
+  S.terms.prompted = false;
+  paintTerms();
+  paintBanners();
+  updateControls();
+}
+
+/* bootstrap.terms 的唯一入口：版本、已同意版本与同意时间进会话状态；
+ * 需要强弹的条件 = 未同意 && 本会话没弹过 && 本机没拒绝过这一版
+ * && 真实形态（离线演示不做学校网络动作，不弹条款，决策 013）。 */
+function ingestTerms(terms) {
+  const data = (terms && typeof terms === "object") ? terms : {};
+  const version = String(data.version || "");
+  if (!version) {
+    /* 后端没给条款版本：可能是 bootstrap 失败、terms 缺失、版本为空或结构
+     * 非法。此时不能算「未同意」也不能放行——按未知处理，fail closed。 */
+    markTermsUnknown();
+    return;
+  }
+  S.terms.version = version;
+  S.terms.acceptedVersion = String(data.accepted_version || "");
+  S.terms.acceptedAt = String(data.accepted_at || "");
+  S.terms.unknown = false;
+  /* 重启后把「本版本拒绝过」恢复成会话状态：否则 refresh、F5 和可见性恢复
+   * 会因为 declined=false 又把条款弹一遍（返修缺陷 1）。 */
+  const declinedSaved = String(S.prefs.terms_declined_version || "");
+  if (!termsAccepted() && declinedSaved === version) S.terms.declined = true;
+  paintTerms();
+  if (!termsAccepted() && !S.demo && !S.terms.prompted && !S.terms.declined) {
+    S.terms.prompted = true;
+    openTerms();
+  }
+  paintBanners();
+  updateControls();
+}
+
+function paintTerms() {
+  /* 标题里的程序要求版本：状态未知时写「尚未确认」，不给一个看似确定的
+   * 版本号让用户以为自己在读某一版（设计稿状态矩阵）。 */
+  const version = S.terms.unknown ? "尚未确认" : (S.terms.version || "—");
+  const inDialog = $("#dlg-terms-version");
+  if (inDialog) inDialog.textContent = version;
+  const inHelp = $("#help-terms-version");
+  if (inHelp) inHelp.textContent = version;
+}
+
+/* 条款弹窗：从「要点 + 查看完整条款」开始；帮助里的「查看条款」与横幅
+ * 「查看条款并同意」都走这一个入口，也是拒绝后唯一的再同意通道。 */
+function openTerms(source, focusBack) {
+  const dialog = $("#dlg-terms");
+  /* 已打开时不重置任何状态：后台 refresh→noteTermsRequired 会在保存中/未确认
+   * 期间再次调进来，重置会打断在途保存（modal 打开时用户入口本来也点不到） */
+  if (!dialog || dialog.open) return;
+  /* 每次打开复位交互态：上一轮的保存/未确认/程序性关闭标记都不带进来；
+   * 请求代号 +1 作废在途回执（重新核对期间关窗再开的迟到结果不许覆盖）；
+   * 来源与焦点返回目标按入口记录（自动弹没有入口，关闭时落回 #btn-help）。 */
+  S.terms.saving = false;
+  S.terms.unconfirmed = false;
+  S.terms.closeHandled = false;
+  /* 用例会整体替换 S.terms 为缺字段的普通对象：代号一律从 0 起算，
+   * 避免 undefined+1=NaN 让回执永远对不上号 */
+  S.terms.requestSeq = (S.terms.requestSeq || 0) + 1;
+  S.terms.source = source || "auto";
+  S.terms.focusBack = focusBack || null;
+  /* 任何时刻都不叠两个 open dialog：帮助入口先关帮助（关闭后按来源重开） */
+  const help = $("#help");
+  if (help && help.open) help.close();
+  const full = $("#dlg-terms-full-text");
+  if (full) {
+    full.hidden = true;
+    const btn = $("#btn-terms-full");
+    if (btn) {
+      btn.textContent = "查看完整条款";
+      btn.setAttribute("aria-expanded", "false");
+    }
+    /* 每次打开都回到「要点」视图：工具行标题与正文视图同步复位 */
+    const title = $("#dlg-terms-view-title");
+    if (title) title.textContent = "条款要点";
+  }
+  /* 只读查看：已同意同版只显示「关闭」——不写时间、不写 declined、不刷新 */
+  S.terms.viewOnly = termsAccepted() && !S.terms.unknown;
+  applyTermsFooter();
+  /* 条款状态未知时给出明确说明：弹窗里的全文仍可阅读，同意会按程序当前
+   * 条款版本记录；不让用户在「版本 ——」的情况下猜自己同意了什么。 */
+  if (S.terms.viewOnly) {
+    termsStatus("已同意本版（" + (S.terms.acceptedAt || "同意时间未记录") +
+      "）；条款更新后会再次展示并要求重新同意。", "info");
+  } else {
+    termsStatus(S.terms.unknown
+      ? "本机没读到条款状态，登录、列表和报名计划已停用。下面的完整条款仍可阅读；"
+        + "点「我已阅读并同意」会按程序的当前条款版本记录。"
+      : "");
+  }
+  /* 已有引导遇条款暂时让位：只暂停不跳步，关闭后回到原步骤 */
+  if (tourVisible()) {
+    S.terms.tourYield = true;
+    tourPauseNow();
+  }
+  if (!dialog.open) {
+    dialog.showModal();
+    /* 首次焦点放在可聚焦标题：Tab 从标题开始遍历整段条款（设计稿键盘条） */
+    const heading = $("#dlg-terms-title");
+    if (heading) { try { heading.focus(); } catch (err) { /* 标题不可聚焦就算了 */ } }
+  }
+}
+
+/* 底部操作区按模式收敛：只读只显示关闭；保存中禁三控件并显示「正在保存…」；
+ * 超时未确认禁同意与暂不使用、亮出「重新确认状态」，关闭权限恢复。 */
+function applyTermsFooter() {
+  const dialog = $("#dlg-terms");
+  if (!dialog) return;
+  const accept = $("#btn-terms-accept");
+  const decline = $("#btn-terms-decline");
+  const close = $("#btn-terms-close");
+  const recheck = $("#btn-terms-recheck");
+  const x = dialog.querySelector(".dlg-x");
+  const esc = dialog.querySelector(".help-esc");
+  const saving = !!S.terms.saving;
+  const unconfirmed = !!S.terms.unconfirmed;
+  const viewOnly = !!S.terms.viewOnly;
+  if (close) close.hidden = !viewOnly;
+  if (recheck) {
+    recheck.hidden = !unconfirmed;
+    if (!unconfirmed) {
+      recheck.disabled = false;
+      recheck.textContent = "重新确认状态";
+    }
+  }
+  if (decline) {
+    decline.hidden = viewOnly;
+    decline.disabled = saving || unconfirmed;
+  }
+  if (accept) {
+    accept.hidden = viewOnly;
+    accept.disabled = viewOnly || saving || unconfirmed;
+    accept.textContent = saving ? "正在保存…" : "我已阅读并同意";
+  }
+  if (x) x.disabled = saving;
+  if (esc) {
+    esc.textContent = saving ? "正在保存…"
+      : (viewOnly || unconfirmed) ? "Esc 关闭" : "Esc 暂不使用";
+  }
+}
+
+/* 关闭后按来源恢复焦点：帮助入口重开帮助并聚焦「查看条款」；横幅入口回
+ * 被点的按钮（入口已消失就落回 #btn-help）；自动弹与同意成功回 #btn-help。 */
+function restoreTermsFocus() {
+  const source = S.terms.source;
+  const back = S.terms.focusBack;
+  S.terms.source = "";
+  S.terms.focusBack = null;
+  if (source === "help") {
+    const help = $("#help");
+    if (help && !help.open) help.showModal();
+    const entry = $("#btn-help-terms");
+    if (entry) { try { entry.focus(); } catch (err) { /* 入口不可聚焦就算了 */ } return; }
+  }
+  if (back && document.body && document.body.contains(back)) {
+    try { back.focus(); } catch (err) { /* 落到 #btn-help */ }
+    if (document.activeElement === back) return;
+  }
+  const fallback = $("#btn-help");
+  if (fallback) { try { fallback.focus(); } catch (err) {} }
+}
+
+/* 打开条款时让位的引导：关闭后回到原步骤（step 没被改动）；计划仍在暂停
+ * 引导时不抢着恢复，交给计划结束时的既有恢复路径。 */
+function resumeTermsTour() {
+  if (!S.terms.tourYield) return;
+  S.terms.tourYield = false;
+  if (S.tour.open && S.tour.paused && !S.busy) tourResumeNow();
+}
+
+/* boot 时被条款推迟的首次欢迎/引导：同意后只继续一次，引导适用性再判定
+ * 一次；绝不写 tour_version（不伪造「已看过」）。 */
+function runDeferredIntro() {
+  const deferred = S.terms.deferredIntro;
+  S.terms.deferredIntro = null;
+  if (!deferred || termsLocked()) return;
+  if (deferred.tour && tourShouldAutoStart()) {
+    startTour(0);
+    return;
+  }
+  if (deferred.welcome) showHelp();
+}
+
+function toggleTermsFull() {
+  const full = $("#dlg-terms-full-text");
+  const btn = $("#btn-terms-full");
+  if (!full || !btn) return;
+  full.hidden = !full.hidden;
+  /* 要点⇄全文在同一阅读区切换：按钮文案、aria-expanded、工具行标题三处
+   * 同步；阅读区滚回顶部，焦点留在触发按钮上（切换不抢焦点）。 */
+  btn.textContent = full.hidden ? "查看完整条款" : "返回条款要点";
+  btn.setAttribute("aria-expanded", full.hidden ? "false" : "true");
+  const title = $("#dlg-terms-view-title");
+  if (title) title.textContent = full.hidden ? "条款要点" : "完整条款";
+  const body = $(".terms-body");
+  if (body) body.scrollTop = 0;
+}
+
+/* 条款弹窗里的局部反馈：保存失败只在这里说下一步，不刷大屏 */
+function termsStatus(text, tone) {
+  const box = $("#dlg-terms-status");
+  if (!box) return;
+  if (!text) {
+    box.hidden = true;
+    box.textContent = "";
+    return;
+  }
+  box.hidden = false;
+  box.dataset.tone = tone || "warn";
+  box.textContent = text;
+  /* 反馈与阅读区同在唯一滚动区内：失败/未知/重新确认等非空消息置顶立即可见；
+   * 只归零阅读区自身 scrollTop，不碰焦点、不滚整页，清空分支的提前 return 不受影响。 */
+  const body = $(".terms-body");
+  if (body) body.scrollTop = 0;
+}
+
+/* 同意：后端 accept_terms 经 ui.json 原子事务落盘；成功才关弹窗解锁，
+ * 并补上启动时被条款拦下的首轮加载。失败留在弹窗里给出重试说明。
+ * 回执必须自证：version / accepted_version / accepted_at 三项齐全、
+ * accepted_version 与 version 一致，且 version 与你实际读到的内嵌全文同版；
+ * 任何一项不满足都只提示、不改状态、不清 unknown、不关弹窗、不刷新——
+ * 未知态（bootstrap 失败、缺条款字段）绝不允许本地乐观解锁，也不能用过期
+ * 的条款副本把学校动作放出去（fail closed）。 */
+function acceptTerms() {
+  /* 在途保存、超时未确认、只读查看期间禁止直接再次写同意：先验状态，
+   * 零请求零写入——连续点击只会登记一次在途、发出一次请求。 */
+  if (S.terms.saving || S.terms.unconfirmed || S.terms.viewOnly) return;
+  /* 提交的必须是用户实际读到的那份全文版本（内嵌全文的版本节点），
+   * 不是后端自报的版本——否则旧 HTML 也能给新后端「同意当前版」。
+   * 副本没标版本、或与已知程序版本不一致时先在本地拒绝，零请求零写入；
+   * 状态未知（尚无 S.terms.version）时仍把有效副本交给后端判定。 */
+  const docNode0 = $("#dlg-terms-document-version");
+  const documentVersion = String((docNode0 && docNode0.textContent) || "").trim();
+  if (!documentVersion) {
+    termsStatus("当前副本没有标明版本，无法确认你读的是哪一版；请重新下载完整版本后再确认。", "warn");
+    return;
+  }
+  if (S.terms.version && documentVersion !== S.terms.version) {
+    termsStatus("本份条款（" + documentVersion + "）与程序要求的版本（" +
+      S.terms.version + "）不一致，没有解锁；请重新下载完整版本后再确认。", "warn");
+    return;
+  }
+  /* 同步登记在途再发请求：按钮立即进入保存态（正在保存…、三控件禁用、
+   * Esc/X 被拦）；10 秒没有可确认结果就转「保存结果未确认」——门禁保持、
+   * 关闭权限恢复，原请求代号作废，迟到回执一律丢弃。 */
+  const seq = (S.terms.requestSeq = (S.terms.requestSeq || 0) + 1);
+  S.terms.saving = true;
+  applyTermsFooter();
+  termsStatus("正在保存…", "info");
+  const timer = setTimeout(() => termsSaveTimeout(seq), 10000);
+  const settle = () => {
+    clearTimeout(timer);
+    if (seq === S.terms.requestSeq && S.terms.saving) {
+      S.terms.saving = false;
+      applyTermsFooter();
+    }
+  };
+  api("accept_terms", documentVersion).then((res) => {
+    /* 迟到回执（已超时或新一轮请求已开始）：不关窗、不覆盖新状态、不重复刷新 */
+    if (seq !== S.terms.requestSeq) return;
+    /* 任何明确结果（成功/失败）都收口在途：按钮恢复、状态文案随后覆盖 */
+    settle();
+    if (!res || res.ok !== true) {
+      if (res && res.error === "terms_version_mismatch") {
+        /* 副本与程序不同源：保持门禁，只说本份与程序版本不一致、要重新
+         * 下载完整版本——不建议「重新打开同一份」，那修不了版本差异。 */
+        termsStatus("本份条款（" + (documentVersion || "未标明版本") +
+          "）与程序要求的版本不一致，没有解锁；请重新下载完整版本后再确认。", "warn");
+        return;
+      }
+      termsStatus((res && res.text) || "条款同意状态没有保存成功，请再点一次。", "warn");
+      return;
+    }
+    const terms = (res.terms && typeof res.terms === "object") ? res.terms : {};
+    const version = String(terms.version || "");
+    const acceptedVersion = String(terms.accepted_version || "");
+    const acceptedAt = String(terms.accepted_at || "");
+    if (!version || !acceptedVersion || !acceptedAt || acceptedVersion !== version) {
+      /* 回执不完整/自相矛盾：只能说「保存结果无法确认」——没有证据断言
+       * 后端没写入，也不能在这里擅自解锁或撤销已发出的事务。 */
+      termsStatus("保存结果无法确认（回执缺字段或自相矛盾，版本 " +
+        (version || "缺失") + "）；请点「重新确认状态」核对本机记录。", "warn");
+      return;
+    }
+    /* 用户实际读到的全文版本：取自 index.html 内嵌条款的版本字段。
+     * 空值同样按不可确认处理——没有可比对的副本就不解锁。 */
+    const docNode = $("#dlg-terms-document-version");
+    const docVersion = String((docNode && docNode.textContent) || "").trim();
+    if (docVersion !== version) {
+      termsStatus("当前条款副本不匹配（本份 " + (docVersion || "未标明版本") +
+        "，程序 " + version + "），没有解锁；请重新下载完整版本后再确认。", "warn");
+      return;
+    }
+    /* 显式同意成功收口：清未确认，状态、焦点、引导按成功路径各走一次 */
+    S.terms.unconfirmed = false;
+    S.terms.viewOnly = false;
+    S.terms.version = version;
+    S.terms.acceptedVersion = acceptedVersion;
+    S.terms.acceptedAt = acceptedAt;
+    S.terms.unknown = false;
+    S.terms.declined = false;
+    S.terms.prompted = true;
+    /* 拒绝版本标记失效：立即落盘（不因关窗丢失），条款更新前不会再弹 */
+    savePrefsNow({ terms_declined_version: "" });
+    const dialog = $("#dlg-terms");
+    /* 程序性关闭：跳过 close 监听里的拒绝语义与焦点恢复，改走成功路径 */
+    S.terms.closeHandled = true;
+    if (dialog && dialog.open) dialog.close();
+    paintTerms();
+    paintBanners();
+    updateControls();
+    if (hasBridge()) refresh(true); /* 完整成功最多补加载一次 */
+    const helpBtn = $("#btn-help");
+    if (helpBtn) { try { helpBtn.focus(); } catch (err) { /* 焦点落不下去就算了 */ } }
+    resumeTermsTour(); /* 打开时让位的引导回原步骤 */
+    runDeferredIntro(); /* boot 被条款推迟的首次欢迎/引导只继续一次 */
+  }).catch((err) => {
+    if (seq !== S.terms.requestSeq) return;
+    settle();
+    termsStatus("条款同意状态没有保存成功：" + msg(err) + "；请再点一次。", "warn");
+  });
+}
+
+/* 10 秒没拿到可确认结果：不是失败也不是取消——门禁保持、关闭权限恢复、
+ * 禁止直接再次写同意，改走「重新确认状态」核对本机记录。原请求代号作废，
+ * 迟到回执不许关窗或覆盖这个状态。 */
+function termsSaveTimeout(seq) {
+  if (seq !== S.terms.requestSeq) return;
+  S.terms.requestSeq = (S.terms.requestSeq || 0) + 1;
+  S.terms.saving = false;
+  S.terms.unconfirmed = true;
+  applyTermsFooter();
+  termsStatus("保存结果未确认：没有收到可确认的结果，本机是否已记录同意还不确定；" +
+    "门禁保持关闭。点「重新确认状态」核对本机记录。", "warn");
+}
+
+/* 重新确认状态：只读一次 bootstrap 的条款快照（不调用 boot/refresh/check/
+ * list），不写任何东西——按本机事实收口未确认态。 */
+function recheckTerms() {
+  if (S.terms.saving || !S.terms.unconfirmed) return;
+  const dialog = $("#dlg-terms");
+  if (!dialog || !dialog.open) return;
+  const seq = (S.terms.requestSeq = (S.terms.requestSeq || 0) + 1);
+  const button = $("#btn-terms-recheck");
+  if (button) { button.disabled = true; button.textContent = "正在核对…"; }
+  const resetRecheck = () => {
+    if (button) { button.disabled = false; button.textContent = "重新确认状态"; }
+  };
+  api("bootstrap").then((info) => {
+    /* 关窗或新一轮操作后到达的读取结果一律丢弃：不覆盖、不重复收口 */
+    if (seq !== S.terms.requestSeq || !dialog.open) { resetRecheck(); return; }
+    const data = (info && info.terms && typeof info.terms === "object") ? info.terms : {};
+    const version = String(data.version || "");
+    const acceptedVersion = String(data.accepted_version || "");
+    const acceptedAt = String(data.accepted_at || "");
+    const docNode = $("#dlg-terms-document-version");
+    const docVersion = String((docNode && docNode.textContent) || "").trim();
+    if (version && acceptedVersion === version && acceptedAt && docVersion === version) {
+      /* 明确已同意同版、有时间、且匹配本份：按显式同意成功收口（不再发写请求） */
+      S.terms.version = version;
+      S.terms.acceptedVersion = acceptedVersion;
+      S.terms.acceptedAt = acceptedAt;
+      S.terms.unknown = false;
+      S.terms.declined = false;
+      S.terms.prompted = true;
+      S.terms.unconfirmed = false;
+      savePrefsNow({ terms_declined_version: "" });
+      S.terms.closeHandled = true;
+      if (dialog.open) dialog.close();
+      paintTerms();
+      paintBanners();
+      updateControls();
+      if (hasBridge()) refresh(true);
+      const helpBtn = $("#btn-help");
+      if (helpBtn) { try { helpBtn.focus(); } catch (err) {} }
+      resumeTermsTour();
+      runDeferredIntro();
+      return;
+    }
+    if (version && (!acceptedVersion || acceptedVersion !== version)) {
+      /* 明确未同意：恢复同意按钮，可以重新点一次（仍受本地副本校验） */
+      S.terms.version = version;
+      S.terms.acceptedVersion = acceptedVersion;
+      S.terms.acceptedAt = acceptedAt;
+      S.terms.unknown = false;
+      S.terms.unconfirmed = false;
+      applyTermsFooter();
+      resetRecheck();
+      termsStatus("本机尚未记录同意（要求版本 " + version +
+        "）；可以重新点「我已阅读并同意」。", "warn");
+      return;
+    }
+    /* 读不到版本、回执缺时间、本份不匹配：保留未确认，不改门禁不改状态 */
+    resetRecheck();
+    termsStatus("还是没能确认：本机记录与本份条款对不上或没读到版本；门禁保持关闭。", "warn");
+  }).catch(() => {
+    if (seq !== S.terms.requestSeq || !dialog.open) { resetRecheck(); return; }
+    resetRecheck();
+    termsStatus("没能读到条款状态，仍按未确认处理；门禁保持关闭。", "warn");
+  });
+}
+
+/* 拒绝：不退出、本版本不再强弹；把拒绝版本落盘（跨重启生效，条款版本
+ * 变化时会重新提示）。登录/列表/报名计划保持禁用，横幅与帮助保留入口。 */
+function declineTerms() {
+  if (S.terms.declined) return;
+  /* 保存中/超时未确认/只读查看都不记拒绝：保存中的关闭由 cancel 拦，
+   * 这里再防御一次，避免任何路径把在途保存写成「同意未发生」。 */
+  if (S.terms.saving || S.terms.unconfirmed || S.terms.viewOnly) return;
+  S.terms.declined = true;
+  /* 版本未知时没有可锚定的版本，不写空标记（写了也拦不住下一次成功读取） */
+  if (S.terms.version) savePrefsNow({ terms_declined_version: S.terms.version });
+  const dialog = $("#dlg-terms");
+  if (dialog && dialog.open) dialog.close();
+  paintBanners();
+  updateControls();
+}
+
 function fillHelp(help) {
   const data = help || DEFAULT_HELP;
   $("#help-title").textContent = data.title || DEFAULT_HELP.title;
@@ -4410,11 +4964,48 @@ $("#rows").addEventListener("keydown", (event) => {
 $("#btn-refresh").addEventListener("click", () => refresh(false));
 $("#btn-login").addEventListener("click", doLogin);
 $("#btn-help").addEventListener("click", showHelp);
+/* 条款弹窗：展开完整条款 / 同意 / 暂不使用 / 只读关闭 / 重新确认。未同意时
+ * Esc、右上角 X、暂不使用都算「暂不使用」（close 监听统一收口）；保存中 Esc
+ * 被 cancel 明确拒绝；同意成功由 acceptTerms 自己走程序性关闭，不会到 decline。 */
+$("#btn-terms-full").addEventListener("click", toggleTermsFull);
+$("#btn-terms-accept").addEventListener("click", acceptTerms);
+$("#btn-terms-decline").addEventListener("click", declineTerms);
+$("#btn-help-terms").addEventListener("click", () => openTerms("help"));
+$("#btn-terms-recheck").addEventListener("click", recheckTerms);
+$("#btn-terms-close").addEventListener("click", () => {
+  /* 只读查看的「关闭」：走原生关闭，由下面的 close 监听恢复来源焦点 */
+  const dialog = $("#dlg-terms");
+  if (dialog && dialog.open) dialog.close();
+});
+const termsDialog = $("#dlg-terms");
+if (termsDialog) {
+  /* 保存中的 Esc：cancel 明确拒绝（同意/暂不使用/X 已禁用）；其余按模式关闭 */
+  termsDialog.addEventListener("cancel", (event) => {
+    if (S.terms.saving) { event.preventDefault(); return; }
+  });
+  termsDialog.addEventListener("close", () => {
+    /* 程序性关闭（同意成功/重新确认成功）已在各自路径处理焦点与引导 */
+    if (S.terms.closeHandled) { S.terms.closeHandled = false; return; }
+    /* 防御：保存中的关闭不该发生（cancel 已拦）；发生了也不记拒绝 */
+    if (S.terms.saving) return;
+    if (S.terms.unconfirmed) {
+      /* 超时后关闭 = 离开待确认界面：不记成「同意未发生」，下次按 bootstrap 事实处理 */
+      S.terms.unconfirmed = false;
+      applyTermsFooter();
+    } else if (!termsAccepted() && !S.terms.declined) {
+      declineTerms(); /* 未同意关闭仍按原拒绝语义（Esc / X / 暂不使用按钮） */
+    }
+    restoreTermsFocus();
+    resumeTermsTour();
+  });
+}
 $("#clock").addEventListener("click", (event) => { event.stopPropagation(); toggleClockPop(); });
 document.addEventListener("mousedown", (event) => {
   if (!event.target.closest("#clock-pop") && !event.target.closest("#clock")) closeClockPop(false);
 });
-$("#btn-log-folder").addEventListener("click", () => api("open_data").catch((err) => addLog("[X] 打不开数据目录：" + msg(err))));
+$("#btn-log-folder").addEventListener("click", () => api("open_data")
+  .then((res) => addLog("数据目录：" + ((res && res.path) || "已打开")))
+  .catch((err) => addLog("[X] 打不开数据目录：" + msg(err))));
 $("#btn-log-copy").addEventListener("click", copyLog);
 $("#btn-plan").addEventListener("click", startPlan);
 $("#btn-stop").addEventListener("click", stopPlan);
@@ -4447,6 +5038,12 @@ $("#banners").addEventListener("click", (event) => {
   if (event.target.closest('[data-act="runtime-refresh"]')) {
     /* 横幅上的「重新检查」= 一次完整刷新：check 事件带回组件结论，恢复即撤横幅 */
     refresh(false);
+  }
+  const termsBtn = event.target.closest('[data-act="terms-open"]');
+  if (termsBtn) {
+    /* 条款横幅的「查看条款」：拒绝后的再同意入口，也是唯一入口；记住被点
+     * 的按钮，关闭后焦点回到它（入口被重画消失就落回 #btn-help） */
+    openTerms("banner", termsBtn);
   }
 });
 $("#headed").addEventListener("change", (event) => savePrefs({ headed: event.target.checked }));
@@ -4501,9 +5098,17 @@ $("#btn-help-latest").addEventListener("click", () => {
 });
 $("#btn-help-data").addEventListener("click", () => {
   helpStatus("");
-  api("open_data").catch((err) => {
-    helpStatus("打不开数据目录：" + msg(err) + "。可以先再试一次，或在系统里手动打开本机数据目录。", "bad");
-  });
+  api("open_data")
+    .then((res) => {
+      /* 成功时**不进 help-status**：那块是错误/警告位，塞成功信息会把「出错」的
+         语义冲淡（既有契约也明确要求成功时保持隐藏）。路径写回说明正文里，
+         用户既能看见又能选中复制，下次也不用再点一遍。 */
+      const line = $("#help-data-path");
+      if (line && res && res.path) line.textContent = "数据目录：" + res.path;
+    })
+    .catch((err) => {
+      helpStatus("打不开数据目录：" + msg(err) + "。可以先再试一次，或在系统里手动打开本机数据目录。", "bad");
+    });
 });
 /* 窗口尺寸或内部滚动变化时重新定位高亮与卡片 */
 window.addEventListener("resize", () => { if (S.tour.open && !S.tour.paused) paintTour(); });
@@ -4516,6 +5121,11 @@ $("#empty-action").addEventListener("click", () => {
 });
 
 document.addEventListener("keydown", (event) => {
+  /* 打开的条款弹窗独占键盘——第一道判断，在引导/搜索处理之前：Enter/Esc/
+   * Ctrl+F/`/` 不穿透到背景业务（不开始计划、不清选择、不抢搜索框），Tab、
+   * 按钮激活与正常重载交给浏览器原生；保存中的 Esc 由 dialog 的 cancel 拦。 */
+  const termsDlg = $("#dlg-terms");
+  if (termsDlg && termsDlg.open) return;
   if (event.key === "F5") { event.preventDefault(); refresh(false); return; }
   const typing = event.target.closest && event.target.closest("input, select, textarea");
   /* 引导可见时键盘约束在卡片内：Esc=跳过、Tab 在卡片按钮间循环，
@@ -4578,4 +5188,9 @@ document.addEventListener("visibilitychange", () => {
 });
 
 setInterval(tick, 1000);
-boot().catch((error) => { addLog("[X] 界面初始化失败：" + msg(error)); render(); });
+boot().catch((error) => {
+  /* 启动链路整体失败同样没有条款依据：先按未知拦住学校动作再报错 */
+  markTermsUnknown();
+  addLog("[X] 界面初始化失败：" + msg(error));
+  render();
+});

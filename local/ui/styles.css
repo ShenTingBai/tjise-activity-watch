@@ -369,6 +369,87 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
   .help-section-head .btn { max-width: 190px; height: auto; min-height: 30px; white-space: normal; }
 }
 
+/* 使用条款阅读面板（设计稿 20261027-terms-consent-ui-design：方案 B，同一阅读区切换）。
+   所有规则限定在 .dlg-terms 内，帮助面板不受影响；标题沿用站牌深色与琥珀短线，
+   正文是安静的白色告知纸：不加点阵、渐变、装饰图或连续卡片。
+   标题/工具行/反馈/底部都是固定区，只有 .terms-body 滚动（min-height:0）；
+   display:flex 只挂在 [open] 上，避免关闭的原生 dialog 被 CSS 强制显示。 */
+.dlg-terms { width: min(680px, calc(100vw - 32px)); max-width: calc(100vw - 32px); max-height: calc(100vh - 32px); max-height: calc(100dvh - 32px); overflow: hidden; box-sizing: border-box; min-width: 0; }
+.dlg-terms[open] { display: flex; flex-direction: column; }
+.dlg-terms .terms-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex: none; padding: 18px 22px; background: var(--board); background-image: radial-gradient(rgba(236,239,234,.055) .7px, transparent .9px); background-size: 5px 5px; color: var(--on-board); }
+.dlg-terms .terms-head h2 { flex: 1; min-width: 0; margin: 0; padding-left: 11px; border-left: 3px solid var(--amber); font-size: 20px; line-height: 1.35; }
+.dlg-terms .terms-head h2:focus-visible { outline-color: var(--amber); }
+.dlg-terms .terms-head form { flex: none; }
+.dlg-terms .terms-head .dlg-x { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 36px; height: 36px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--on-board-2); }
+.dlg-terms .terms-head .dlg-x:hover { background: rgba(255,255,255,.09); color: var(--on-board); }
+/* 工具行在唯一滚动区内：常规档 sticky 吸顶，随时可切要点/全文；
+   极窄(≤360px)或极矮(≤420px)取消 sticky——读者滚过工具行，把有限阅读高度交给正文。 */
+.dlg-terms .terms-toolbar { position: sticky; top: 0; z-index: 1; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin: 0 0 12px; padding: 0 0 8px; border-bottom: 1px solid var(--line); background: var(--paper); }
+.dlg-terms .terms-toolbar h3 { margin: 0; font-size: 16px; font-weight: 700; line-height: 1.5; }
+.dlg-terms .terms-toolbar .btn { height: auto; min-height: 36px; flex: none; }
+/* 唯一滚动区：内容层（反馈/版本行/工具行/要点/全文/Esc）全在此流内，禁止另建滚动区 */
+.dlg-terms .terms-body { flex: 1 1 auto; min-height: 0; min-width: 0; overflow-y: auto; padding: 16px 22px 8px; background: var(--paper); }
+/* 版本行原在深色标题区，随重排进正文流：随阅读区换行，不与标题争高 */
+.dlg-terms .terms-body > #dlg-terms-sub { margin: 0 0 12px; max-width: 68ch; color: var(--ink-2); font-size: 13px; line-height: 1.6; }
+.dlg-terms .terms-body > #dlg-terms-sub b { font-family: var(--font-num); font-weight: 600; color: var(--ink); }
+.dlg-terms .terms-points { margin: 0; padding-left: 21px; list-style: disc; }
+.dlg-terms .terms-points li { margin: 0 0 14px; }
+.dlg-terms .terms-points li:last-child { margin-bottom: 0; }
+.dlg-terms .terms-points .t { font-size: 16px; font-weight: 700; line-height: 1.5; }
+.dlg-terms .terms-points .d { margin: 4px 0 0; max-width: 68ch; color: var(--ink-2); font-size: 14px; line-height: 1.75; }
+.dlg-terms .terms-summary .rules { margin: 16px 0 0; max-width: 68ch; border-radius: 8px; font-size: 13px; line-height: 1.7; }
+.dlg-terms .terms-offline { margin: 0 0 6px; color: var(--ink-3); font-size: 12px; line-height: 1.6; }
+.dlg-terms .terms-section { margin: 18px 0 0; }
+.dlg-terms .terms-section h3 { margin: 0 0 6px; font-size: 16px; font-weight: 700; line-height: 1.5; }
+.dlg-terms .terms-section p { margin: 0 0 8px; max-width: 68ch; color: var(--ink); font-size: 14px; line-height: 1.75; text-align: left; overflow-wrap: anywhere; }
+.dlg-terms .terms-section p:last-child { margin-bottom: 0; }
+/* 正文语义结构（ul/ol/li/h4/code）共用阅读基线：全文由 p 扩展为真实列表后，
+   li/h4/code 若不设规则会退回 body 的 13px/1.5 页面小字，偏离规范正文 14px/1.75；
+   代码路径（如 TJISE_DATA_DIR、%LOCALAPPDATA%）没有段落的换行保护，长路径会横向溢出。
+   前缀锁死在 .dlg-terms .terms-document，不触碰要点、帮助、页面列表与滚动布局。 */
+.dlg-terms .terms-document { max-width: 68ch; color: var(--ink); font-size: 14px; line-height: 1.75; text-align: left; overflow-wrap: anywhere; }
+.dlg-terms .terms-document ul, .dlg-terms .terms-document ol { margin: 0 0 8px; padding-inline-start: 22px; }
+.dlg-terms .terms-document ul { list-style-type: disc; }
+.dlg-terms .terms-document ol { list-style-type: decimal; }
+.dlg-terms .terms-document li { margin: 0 0 6px; }
+.dlg-terms .terms-document li:last-child { margin-bottom: 0; }
+.dlg-terms .terms-document li > ul, .dlg-terms .terms-document li > ol { margin-top: 6px; }
+.dlg-terms .terms-document h4 { margin: 12px 0 6px; font-size: 14px; font-weight: 700; line-height: 1.75; }
+.dlg-terms .terms-document code { font-family: var(--font-log); font-size: .95em; white-space: normal; overflow-wrap: anywhere; }
+/* 反馈与 Esc 提示都在唯一阅读区里：长消息随该区滚动，非空反馈置顶由 app.js scrollTop=0 保证 */
+.dlg-terms .terms-feedback { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 12px; }
+.dlg-terms .terms-feedback .help-status { flex: 1 1 auto; min-width: 0; margin: 0; padding: 0; font-size: 13px; line-height: 1.6; }
+.dlg-terms .terms-feedback .help-status[data-tone="info"] { color: var(--ink-2); }
+.dlg-terms .terms-feedback .btn { height: auto; min-height: 36px; }
+.dlg-terms .terms-body > .help-esc { display: block; margin: 10px 0 0; color: var(--ink-3); font-size: 12px; line-height: 1.6; }
+/* 底部只留选择按钮：常规右排可换行，不设最小宽度，窄窗不被单颗按钮撑出 */
+.dlg-terms .terms-foot { flex: none; display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; padding: 10px 22px 14px; border-top: 1px solid var(--line); background: var(--paper); }
+.dlg-terms .terms-foot .btn { height: auto; min-height: 36px; padding: 0 16px; font-size: 14px; }
+/* 窄窗（≤560px，含 320px 压力视口）：按钮换行不撑出，
+   DOM/Tab 顺序不变；要点本就是单列，不缩小点击目标。 */
+@media (max-width: 560px) {
+  .dlg-terms .terms-head, .dlg-terms .terms-body,
+  .dlg-terms .terms-foot { padding-left: 16px; padding-right: 16px; }
+  .dlg-terms .terms-foot { flex-wrap: wrap; row-gap: 8px; }
+  .dlg-terms .terms-foot .btn { flex: 1 1 auto; min-width: 0; min-height: 36px; white-space: normal; }
+}
+/* 极窄（≤360px，含 CSS 160x320）：底部两选择纵排占满行、间距收到 8px 级，
+   工具行取消吸顶把高度让给正文；不靠隐藏按钮或截短文案腾空间。 */
+@media (max-width: 360px) {
+  .dlg-terms .terms-toolbar { position: static; }
+  .dlg-terms .terms-foot { flex-direction: column; align-items: stretch; gap: 8px; padding-top: 8px; padding-bottom: 10px; }
+  .dlg-terms .terms-foot .btn { flex: none; width: 100%; }
+}
+/* 极矮（≤420px 高，含 CSS 340x240/373x256）：视口减 16px、头尾 8px、标题 18px，
+   工具行不吸顶——正文预算优先（≥48px 可用高度为待渲染证实目标，不以本注释冒充达成）。 */
+@media (max-height: 420px) {
+  .dlg-terms { max-height: calc(100vh - 16px); max-height: calc(100dvh - 16px); }
+  .dlg-terms .terms-head { padding-top: 8px; padding-bottom: 8px; }
+  .dlg-terms .terms-head h2 { font-size: 18px; line-height: 1.35; }
+  .dlg-terms .terms-toolbar { position: static; margin-bottom: 8px; }
+  .dlg-terms .terms-foot { padding-top: 8px; padding-bottom: 8px; }
+}
+
 /* 时钟/时间详情浮层：先给当前状态，再按需展开诊断信息。 */
 .pop { position: fixed; z-index: 40; width: 360px; max-width: calc(100vw - 24px); max-height: min(450px, calc(100vh - 76px)); overflow: auto; padding: 14px 15px 10px; border-radius: 10px; background: var(--paper); color: var(--ink); box-shadow: 0 0 0 1px var(--line-2), 0 12px 28px rgba(18,21,19,.2); }
 .pop-head { display: flex; align-items: center; justify-content: space-between; }
@@ -451,6 +532,16 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
   .plan-tasks { max-height: 46px; }
   .row { min-height: 50px; }
   .log { height: 150px; }
+}
+/* 窄窗顶栏（≤560px，含 320px 压力视口）：整行允许换行，品牌独占首行，
+   动作组与其余控件按原序换到下一行（DOM/Tab 顺序不变），控件不设死宽高。
+   放在 720 高档之后，同时压过它把 .top 固定 50px 的级联——换行后必须给两行留高，
+   否则第二行被裁仍算越界。桌面（≥561px）与既有 860 档行为不变。 */
+@media (max-width: 560px) {
+  .top { height: auto; flex-wrap: wrap; align-items: center; row-gap: 8px; padding-top: 8px; padding-bottom: 8px; }
+  .brand { flex: 1 0 100%; }
+  .top-right { flex: 1 0 100%; flex-wrap: wrap; margin-left: 0; }
+  .top-right .btn, .top-right .clock { max-width: 100%; height: auto; min-height: 32px; }
 }
 /* 更窄视口（约 746×512，150% 缩放未换算时）：点阵缩小但仍在标题右边，
    底部操作条换行保留；地点列收起、按钮只剩图标，不出横向滚动 */

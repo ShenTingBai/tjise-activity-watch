@@ -23,16 +23,22 @@
 兼容输入：位置参数 tag 只作校验（必须与 VERSION 推导一致，否则拒绝），
 **不再单独触发发布**——要发布必须显式 --publish。
 
-本机正式资产 = 便携入口 EXE + 完整 ZIP（+manifest 清单）。绿色版/服务器版打包
-（build_portable / zip_portable / zip_server）保留为**另行授权的兼容发行流程**，
-publish 不会隐式触发，也不会隐式同步 local/server 远端分发分支。
+本机正式资产 = 独立 EXE + 完整 ZIP + **安装版安装器**（+manifest 清单），三者由
+同一次 --prepare 里构建的**同一份冻结 EXE** 派生（安装器经 local/build_installer.py
+从该 EXE 生成，独立 EXE 与 ZIP 内 EXE 字节一致；安装器自身不与 EXE 比字节——
+它是自解压容器，可比性在安装后哈希核验，见 specs/versioning-and-release）。
+绿色版/服务器版打包（build_portable / zip_portable / zip_server）保留为**另行授权的
+兼容发行流程**，publish 不会隐式触发，也不会隐式同步 local/server 远端分发分支。
 
 产物（版本号唯一来源是仓库根 VERSION，本工具不再自定版本）：
 
-    dist/release-<tag>/天软活动预报名工具-<tag>-win-x64.zip   完整便携包（推荐下载：独立 EXE + 说明）
-    dist/release-<tag>/天软活动预报名工具-<tag>-win-x64.exe   独立可用单文件（内置 grab-worker）
-    dist/release-<tag>/manifest.json                          版本/完整 HEAD/来源是否干净/每文件 SHA-256
+    dist/release-<tag>/tjise-activity-watch-<tag>-win-x64.zip      完整 ZIP（EXE + 说明 + 协议）
+    dist/release-<tag>/tjise-activity-watch-<tag>-win-x64.exe      独立可用单文件（内置 grab-worker）
+    dist/release-<tag>/tjise-activity-watch-installer-<tag>-win-x64.exe  安装版（Inno Setup，中文向导）
+    dist/release-<tag>/manifest.json                               版本/完整 HEAD/来源是否干净/每文件 SHA-256
 
+@article 安装器产物本地名是中文（天软活动预报名工具-安装版-<版>.exe），上传 GitHub 时
+统一改用 ASCII 资产名（GitHub 会规范化中文前缀，v1.1.0 已人工补救过一次）。
 @author LiXinwen
 """
 from __future__ import annotations
@@ -57,6 +63,23 @@ PROXY = "http://127.0.0.1:7897"     # api.github.com 在本机要走代理，git
 PRODUCT_NAME = "天软活动预报名工具"
 VERSION_FILE = ROOT / "VERSION"
 
+
+def _load_build_installer():
+    """按文件路径加载 local/build_installer.py，不污染 sys.path。
+
+    安装器构建入口必须 import 而非 subprocess：release.py 要把**同一份冻结 EXE**
+    显式传给它（同源约束），命令行拼接做不到这个保证。模块导入无副作用。
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "release_build_installer", ROOT / "local" / "build_installer.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+BUILD_INSTALLER = _load_build_installer()
+
 # 服务器版打包时排除的东西：密钥、运行时数据、产物
 SERVER_EXCLUDE = {"config.json", "data", "dist", "reports",
                   "__pycache__", "node_modules"}
@@ -78,8 +101,9 @@ LAUNCH_NOTE = """{name} v{version}（Windows x64）
 2. 首次打开点右上角「登录」，在弹出的浏览器里完成一次登录；之后重开会自动复用，只有失效才需要重登。
 
 必读：
-- 主 EXE 独立可用：程序组件（grab-worker）已内置，单独拷走 EXE 也能直接用；
-  完整 ZIP 是「EXE + 说明 + 协议」的分发形式，两者内容一致，推荐下载 ZIP。
+- 想像正常软件那样用（开始菜单、控制面板卸载）：下载同版本安装版
+  tjise-activity-watch-installer-<版本>-win-x64.exe；本 zip 是免安装备用形态。
+- 主 EXE 独立可用：程序组件（grab-worker）已内置，单独拷走 EXE 也能直接用。
 - 需要 Windows 10/11 与 WebView2 运行时（一般自带），浏览器用电脑上的 Chrome 或 Edge。
 - 登录态等数据存在本机 %LOCALAPPDATA%\\TianSoftActivityPreRegistration\\data，
   替换新版 EXE 不需要重新登录。
@@ -115,6 +139,11 @@ def exe_asset_name(version: str) -> str:
 
 def zip_asset_name(version: str) -> str:
     return "tjise-activity-watch-v%s-win-x64.zip" % version
+
+
+def installer_asset_name(version: str) -> str:
+    """安装版的 ASCII 资产名：本地 Inno 产物是中文名，上传前统一改名。"""
+    return "tjise-activity-watch-installer-v%s-win-x64.exe" % version
 
 
 def run(cmd: list[str], cwd: Path = ROOT, env: dict | None = None) -> str:
@@ -238,26 +267,47 @@ def stage_local_assets(version: str) -> dict:
 
     exe_path = stage_dir / exe_asset_name(version)
     shutil.copy2(out / "tjise-activity-watch.exe", exe_path)
+
+    # 安装版：从暂存区里**同一份冻结 EXE**（copy2 自 out，与独立 EXE 字节一致）
+    # 派生安装器。喂暂存副本而不是 dist 原件：暂存目录是白名单净地，check_source
+    # 的运行期残留检查不会误伤 build 目录里留给登录迁移的旧 data/。
+    installer_build_dir = stage_dir / ".installer-build"
+    installer_path = stage_dir / installer_asset_name(version)
+    try:
+        built = BUILD_INSTALLER.build(
+            staging / exe_asset_name(version), installer_build_dir, version=version)
+        # 本地 Inno 产物是中文名；上传资产统一 ASCII（GitHub 会规范化中文前缀）
+        shutil.copy2(built, installer_path)
+    finally:
+        shutil.rmtree(installer_build_dir, ignore_errors=True)
     shutil.rmtree(staging, ignore_errors=True)
 
-    manifest = write_manifest(stage_dir, version, tag, [zip_path, exe_path],
+    manifest = write_manifest(stage_dir, version, tag,
+                              [zip_path, exe_path, installer_path],
                               build_state=post)
-    for path in (zip_path, exe_path):
+    for path in (zip_path, exe_path, installer_path):
         print("   %s  %.1f MB" % (path.name, path.stat().st_size / 1024 / 1024))
     print("[prepare] 资产就绪：%s" % stage_dir)
     print("[prepare] 清单：%s（版本/完整 HEAD/来源%s/SHA-256）"
           % (manifest, "脏（仅供预览，不得发布）" if post["dirty"] else "干净"))
-    return {"zip": zip_path, "exe": exe_path, "manifest": manifest}
+    return {"zip": zip_path, "exe": exe_path, "installer": installer_path,
+            "manifest": manifest}
 
 
 def check_only(version: str) -> None:
     """默认阶段：只读检查，输出资产命名、ZIP 白名单与发布门禁预演结果。"""
     tag = tag_of(version)
     print("[check] 版本（VERSION 唯一来源）：%s → tag %s" % (version, tag))
-    print("[check] 资产命名：%s / %s" % (zip_asset_name(version), exe_asset_name(version)))
+    print("[check] 资产命名：%s / %s / %s"
+          % (zip_asset_name(version), exe_asset_name(version),
+             installer_asset_name(version)))
     print("[check] 完整 ZIP 白名单成员：%s"
           % "、".join(exe_asset_name(version) if m == "EXE" else m for m in ZIP_MEMBERS))
-    missing = [str(p) for p in (ROOT / "local" / "build_exe.py", ROOT / "local" / "README.md",
+    missing = [str(p) for p in (ROOT / "local" / "build_exe.py",
+                                ROOT / "local" / "build_installer.py",
+                                ROOT / "local" / "installer" / "ChineseSimplified.isl",
+                                ROOT / "local" / "README.md",
+                                ROOT / "local" / "遇到问题先看我.txt",
                                 ROOT / "LICENSE", VERSION_FILE) if not p.is_file()]
     if missing:
         raise SystemExit("[check] 缺少输入文件：%s" % "、".join(missing))
@@ -437,7 +487,8 @@ def verify_release_assets(version: str) -> dict:
                          % (manifest.get("commit"), state["full"]))
     exe_path = stage_dir / exe_asset_name(version)
     zip_path = stage_dir / zip_asset_name(version)
-    for path in (exe_path, zip_path):
+    installer_path = stage_dir / installer_asset_name(version)
+    for path in (exe_path, zip_path, installer_path):
         if not path.is_file():
             raise SystemExit("[publish] 资产缺失：%s（请重新 --prepare，不要拼接旧产物）" % path)
         meta = (manifest.get("files") or {}).get(path.name)
@@ -460,7 +511,8 @@ def verify_release_assets(version: str) -> dict:
         if hashlib.sha256(inner).hexdigest() != sha256_of(exe_path):
             raise SystemExit("[publish] ZIP 内主 EXE 与单独 EXE 不一致：候选装配损坏，"
                              "请重新 --prepare（不得手工拼包）")
-    return {"stage": stage_dir, "exe": exe_path, "zip": zip_path, "manifest": manifest_path}
+    return {"stage": stage_dir, "exe": exe_path, "zip": zip_path,
+            "installer": installer_path, "manifest": manifest_path}
 
 
 def remote_tag_commit(tag: str) -> str:
@@ -539,8 +591,9 @@ def release_notes(tag: str) -> str:
             buf.append(line)
     body = "\n".join(buf).strip()
     version = tag[1:] if tag.startswith("v") else tag
-    download = ("**下载**：`%s`（单 EXE） · `%s`（完整 ZIP）\n\n---\n\n"
-                % (exe_asset_name(version), zip_asset_name(version)))
+    download = ("**下载**：`%s`（安装版，推荐） · `%s`（单 EXE） · `%s`（完整 ZIP）\n\n---\n\n"
+                % (installer_asset_name(version), exe_asset_name(version),
+                   zip_asset_name(version)))
     return (body or tag) + "\n\n" + download
 
 
@@ -581,14 +634,14 @@ def confirm_publish(tag: str, assume_yes: bool) -> None:
 
 
 def asset_digest(assets: dict) -> dict:
-    """候选资产指纹：EXE/ZIP/manifest 的 SHA-256（确认前后比对用，防等待期被替换）。"""
-    return {key: sha256_of(assets[key]) for key in ("zip", "exe", "manifest")}
+    """候选资产指纹：EXE/ZIP/安装器/manifest 的 SHA-256（确认前后比对用，防等待期被替换）。"""
+    return {key: sha256_of(assets[key]) for key in ("zip", "exe", "installer", "manifest")}
 
 
 def do_publish(tag: str, assume_yes: bool, version: str, clobber: bool = False) -> None:
     """外部发布：门禁 → 资产核验 → 人工确认 → 复核 → tag → 上传，副作用全部在核验之后。
 
-    正式本机资产 = 便携入口 EXE + 完整 ZIP + manifest；publish 不自动构建、
+    正式本机资产 = 独立 EXE + 完整 ZIP + 安装版安装器 + manifest；publish 不自动构建、
     不调用 make_portable/绿色版组包，也不隐式同步 local/server 分发分支
     （兼容发行流程另行授权）。
     人工确认可能等待很久：确认后、第一次 Git 写入前必须重验「同一干净 main、
@@ -624,7 +677,8 @@ def do_publish(tag: str, assume_yes: bool, version: str, clobber: bool = False) 
     if asset_digest(verify_release_assets(version)) != digest_before:
         raise SystemExit("[publish] 上传前发现候选资产被替换（哈希变化）：已中止上传")
     print("[2/2] 上传 Release ...")
-    publish(tag, [assets["zip"], assets["exe"], assets["manifest"]], clobber)
+    publish(tag, [assets["zip"], assets["exe"], assets["installer"],
+                  assets["manifest"]], clobber)
 
     print("\n完成：https://github.com/ShenTingBai/tjise-activity-watch/releases/tag/%s" % tag)
     print("[提示] 绿色版/服务器版打包与 local/server 分发分支同步属兼容发行流程，需另行授权执行。")

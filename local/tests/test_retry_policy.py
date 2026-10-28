@@ -45,6 +45,48 @@ def activity(aid, sign, start, end, sign_end=""):
             "act_start": start, "act_end": end, "signed": False}
 
 
+# ---- 条款同意夹具（计划 repair-terms-test-fixtures）----
+# start_plan、login、check、list 都先过 app._terms_gate，而门禁只读 app.PREFS：
+# 不把偏好钉到临时文件，这些用例就会去读开发者真实的 ui.json，门禁结论随机器上
+# 是否点过同意而漂移。同意状态只写在本轮临时 ui.json 的 terms_version /
+# terms_accepted_at 两个键上，模块跑完即删；未同意状态、旧版本拒绝与 demo 豁免
+# 的专测在 test_terms_consent.py 里照旧构造，不受这里影响。
+_PREFS_PATCHER = None
+_PREFS_TMP = None
+
+
+def setUpModule():
+    """把本模块的偏好文件钉到临时 ui.json，并写入当前版本的条款同意。"""
+    global _PREFS_PATCHER, _PREFS_TMP
+    sys.path.insert(0, str(LOCAL))
+    try:
+        import app as local_app
+    except Exception:
+        # 导入失败时由各用例自己 skipTest，保持原有跳过行为，不替它们下结论
+        return
+    finally:
+        sys.path.pop(0)
+    _PREFS_TMP = tempfile.TemporaryDirectory(prefix="tjise-terms-prefs-")
+    _PREFS_PATCHER = mock.patch.object(local_app, "PREFS",
+                                       Path(_PREFS_TMP.name) / "ui.json")
+    _PREFS_PATCHER.start()
+    if not local_app.update_prefs({"terms_version": local_app.TERMS_VERSION,
+                                   "terms_accepted_at": "2026-10-27 12:00:00"}):
+        tearDownModule()
+        raise RuntimeError("条款同意偏好夹具写入失败")
+
+
+def tearDownModule():
+    """还原真实的 app.PREFS，并删除本轮临时偏好目录。"""
+    global _PREFS_PATCHER, _PREFS_TMP
+    if _PREFS_PATCHER is not None:
+        _PREFS_PATCHER.stop()
+        _PREFS_PATCHER = None
+    if _PREFS_TMP is not None:
+        _PREFS_TMP.cleanup()
+        _PREFS_TMP = None
+
+
 class RetryWindowTests(unittest.TestCase):
     """compute_retry_window：三种起算点与 sign_end 硬上限。"""
 
