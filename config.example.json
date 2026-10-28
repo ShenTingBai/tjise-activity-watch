@@ -1,0 +1,23 @@
+{
+  "notify": {
+    "channel": "webhook",
+    "platform": "feishu",
+    "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/<群自动推送用的自定义机器人 webhook>",
+    "secret": "",
+    "feishu_app": {
+      "app_id": "cli_<owner 私聊应用 App ID>",
+      "app_secret": "<owner 私聊应用 App Secret>",
+      "api_base": "https://open.feishu.cn/open-apis"
+    },
+    "users_file": "bot/data/users.json",
+    "private_chat_id": "oc_<owner 私聊 chat_id，可留空由 users.json 推导>"
+  },
+  "filter": {
+    "keyword_blocklist": []
+  },
+  "watch": {
+    "enabled": true,
+    "day_seconds": 180,
+    "night_seconds": 600
+  }
+}

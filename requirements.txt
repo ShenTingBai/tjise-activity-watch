@@ -1,0 +1,15 @@
+# 服务器端（fetch / run / notify / 探针）只用 Python 标准库，无需安装任何包。
+#
+# 只有「本机手动登录 / 本机抢报名」这类要开浏览器的场景才需要 Playwright：
+#   python -m pip install -r requirements.txt
+#   python -m playwright install chromium
+#
+# 服务器上的无人值守登录用的是 Node 版 playwright（见 deploy/ 与 docs/LOGIN.md），
+# 不依赖本文件。
+playwright>=1.40
+
+# 无人值守登录（deploy/auto_login.py）的验证码识别主引擎，可选但要装：
+# 装上识别率约 95%，没装会静默退回纯 Tesseract（约 70%），表现为「能用，但一夜失手几次」。
+# 纯 CPU 可跑，服务器实测 ddddocr 1.6.1 + onnxruntime 占约 200MB 内存。
+#   python -m pip install ddddocr
+ddddocr>=1.6.1

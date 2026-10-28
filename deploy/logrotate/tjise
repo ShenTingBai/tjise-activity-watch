@@ -1,0 +1,19 @@
+# 校园活动机器人日志轮转（安装到 /etc/logrotate.d/tjise）
+#
+# 为什么用 copytruncate：cron 与常驻服务都是 `>> data/xxx.log` 追加写，
+# 进程不重开文件；默认的"改名 + 新建"会让写端继续往已改名的旧文件里写，
+# 新文件一句都没有。copytruncate 原地截断、inode 不变，追加写自然接上。
+#
+# 为什么要单独配：token_probe 每天 96 行、scan 每天 288 行，
+# 不轮转一年几 MB，且排障时 tail 一个巨大的文件很难受。
+/root/tjise-activity-watch/data/*.log /root/tjise-login/*.log {
+    weekly
+    rotate 8
+    maxsize 5M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
