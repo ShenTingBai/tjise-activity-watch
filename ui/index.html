@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>天软活动预报名工具</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="zd" id="zd">
+    <header class="top">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 28 28" aria-hidden="true"><rect width="28" height="28" rx="7" fill="#121513"/><circle cx="14" cy="9.5" r="2.6" fill="#FFB020"/><circle cx="14" cy="18.5" r="2.6" fill="#FFB020"/></svg>
+        <div class="brand-text"><span class="brand-name"><span class="name-full">天软活动预报名工具</span><span class="name-short">天软预报名工具</span></span><span class="brand-desc">活动查询与报名计划</span></div>
+      </div>
+      <div class="top-right" data-tour-target="login">
+        <button class="clock" id="clock" type="button" aria-haspopup="dialog" aria-controls="clock-pop" aria-expanded="false" aria-label="北京时间，查看时间详情"><span class="clock-label" id="clock-label">北京时间</span><span class="clock-time" id="clock-time">--:--:--</span><span class="state-icon" id="clock-icon" aria-hidden="true"></span></button>
+        <button class="pill" id="pill" type="button" data-state="unknown"><i aria-hidden="true"></i><b id="pill-text">登录状态未知</b><span class="sub" id="pill-sub"></span></button>
+        <span id="status-detail" class="sr-only"></span>
+        <span class="top-sep" aria-hidden="true"></span>
+        <button class="btn btn-ghost" id="btn-help" type="button" aria-label="帮助：使用说明、版本更新与本机数据"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.6 9.4a2.5 2.5 0 1 1 3.6 2.3c-.7.3-1.2.9-1.2 1.6v.5"/><path d="M12 17h.01"/></svg><span class="lbl">帮助</span></button>
+        <button class="btn btn-ghost" id="btn-refresh" type="button" title="刷新登录状态和活动列表（F5）"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg><span class="lbl">刷新</span></button>
+        <button class="btn btn-line" id="btn-login" type="button"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/><path d="M10 16l4-4-4-4"/><path d="M14 12H4"/></svg><span class="lbl" id="btn-login-text">登录</span></button>
+      </div>
+    </header>
+
+    <div class="banners" id="banners"></div>
+
+    <section class="board" id="board" aria-label="报名计划" aria-live="polite">
+      <div class="b-main" data-tour-target="select">
+        <div class="b-tags"><span class="b-tag" id="board-tag" data-tone="amber"><i></i><span id="board-tag-text">报名计划</span></span><span class="b-note" id="rail-message">先选活动，系统会检查举办时间冲突。</span></div>
+        <h2 class="b-title" id="selected">还没选活动</h2>
+        <div class="b-sub" id="selected-meta"></div>
+        <p class="b-text" id="board-text"></p>
+        <div class="b-metrics"><span><b>最近开放</b><strong class="num" id="countdown">待选</strong></span><span><b>列表</b><strong id="metric-total">—</strong></span><span><b>可报名</b><strong id="metric-free">—</strong></span></div>
+        <div id="plan-conflicts" class="plan-conflicts" role="alert" hidden></div>
+        <div id="plan-tasks" class="plan-tasks" aria-live="polite"></div>
+        <p id="result" class="result" role="status" aria-live="assertive" hidden></p>
+      </div>
+      <aside class="b-led" data-tour-target="run">
+        <div class="led-wrap" id="led" data-tone="off" role="img" aria-label="计划点阵屏"></div>
+        <p class="led-label" id="led-label">最近开放 <b id="metric-next">待公布</b></p>
+      </aside>
+      <div class="b-foot">
+        <div class="route-line" id="route-line" hidden>
+          <div class="route-wrap" id="route" aria-label="这次报名的时间点"></div>
+          <button id="btn-stop" class="bb bb-ghost route-stop" type="button" disabled>停止</button>
+        </div>
+        <div class="route-actions" id="route-actions" data-tour-target="start">
+          <div class="b-checks" id="plan-checks" aria-label="加入计划前的检查"></div>
+          <button id="btn-board-login" class="bb bb-primary board-quick" type="button" hidden>登录</button>
+          <button id="btn-board-pick" class="bb bb-ghost board-quick" type="button" hidden>选这一场</button>
+          <span class="grow"></span>
+          <!-- 计划级重试策略：时长 0=直到报名截止；次数 0=不限；报名截止永远是硬上限 -->
+          <label class="policy-select" for="retry-for"><span>尝试时长</span><select id="retry-for" aria-label="尝试时长"><option value="120">2 分钟</option><option value="600">10 分钟</option><option value="1800">30 分钟</option><option value="3600">1 小时</option><option value="0">直到报名截止</option></select></label>
+          <label class="policy-select" for="max-attempts"><span>最多提交次数（0=不限）</span><input id="max-attempts" type="number" min="0" step="1" value="0" aria-label="最多提交次数，0 表示不限次数" title="0 表示不限次数；只统计真正发出去的提交"></label>
+          <label class="tg" id="headed-label" for="headed"><input type="checkbox" id="headed"><span class="box" aria-hidden="true"></span><span>显示浏览器窗口</span></label>
+          <button id="btn-clear-plan" class="bb bb-ghost" type="button">清空选择</button>
+          <button id="btn-plan" class="bb bb-primary" type="button" disabled>开始报名计划</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="table" aria-label="活动时刻表">
+      <div class="filters" data-tour-target="filters">
+        <label class="search"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input id="q" type="search" placeholder="搜活动名或地点" autocomplete="off" aria-label="搜活动名或地点"></label>
+        <div class="seg" id="chips" role="group" aria-label="报名状态"><button class="chip" type="button" data-status="free" aria-pressed="false">可报名</button><button class="chip" type="button" data-status="signed" aria-pressed="false">已报名</button><button class="chip" type="button" data-status="all" aria-pressed="true">全部</button></div>
+        <label class="filter-select"><span>开放</span><select id="time" aria-label="开放时间"><option value="all">不限</option><option value="today">今天</option><option value="week">7 天内</option></select></label>
+        <label class="filter-select"><span>排序</span><select id="sort" aria-label="排序方式"><option value="open">按开放时间</option><option value="name">按活动名</option></select></label>
+        <label class="filter-select"><span>签到</span><select id="checkin" aria-label="签到要求"><option value="all">全部</option><option value="yes">需要</option><option value="no">无需</option></select></label>
+        <label class="filter-select"><span>签退</span><select id="checkout" aria-label="签退要求"><option value="all">全部</option><option value="yes">需要</option><option value="no">无需</option></select></label>
+        <span class="meta" id="count">—</span>
+      </div>
+      <div class="list" id="list" tabindex="0" aria-label="活动列表" data-tour-target="list">
+        <div class="colhead" aria-hidden="true"><span class="h-sel">选</span><span class="h-time">开放时间</span><span>活动</span><span class="h-place">地点</span><span class="h-left">距开放</span></div>
+        <div id="rows"></div>
+        <div id="empty" class="empty" hidden><svg class="empty-art" viewBox="0 0 76 52" aria-hidden="true"><rect x="2" y="2" width="72" height="36" rx="6" fill="none" stroke="currentColor" stroke-width="2"/><g fill="currentColor"><circle cx="16" cy="20" r="2.2"/><circle cx="23" cy="20" r="2.2"/><circle cx="34" cy="16" r="2"/><circle cx="34" cy="24" r="2"/><circle cx="45" cy="20" r="2.2"/><circle cx="52" cy="20" r="2.2"/><circle cx="60" cy="20" r="2.2"/></g><path d="M38 38v10M26 49h24" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><p id="empty-title">这里还没有活动</p><p id="empty-text">点「刷新」加载活动；需要登录时，顶部会提示下一步。</p><button id="empty-action" class="btn btn-line btn-mini" type="button" hidden>刷新</button></div>
+      </div>
+    </section>
+
+    <footer class="logbar log-card" id="logbar" data-open="false">
+      <div class="logbar-head"><span class="logbar-title">运行记录</span><span class="logbar-last" id="log-last">还没有记录</span><div class="logbar-tools"><button class="btn btn-ghost when-open" type="button" id="btn-log-copy"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>复制</button><button class="btn btn-ghost when-open" type="button" id="btn-log-clear"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>清空</button><button class="btn btn-ghost when-open" type="button" id="btn-log-folder" title="grab.log、登录态都存在数据目录里"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>打开数据目录</button><button class="btn btn-ghost" type="button" id="btn-log-toggle" aria-expanded="false" aria-controls="log">展开</button></div></div>
+      <div class="logbody log" id="log" role="log" aria-label="运行记录"></div>
+    </footer>
+  </div>
+
+  <!-- 使用条款与隐私告知：首次需要学校网络动作前完整展示；「暂不使用」不退出程序，
+       但登录、活动列表与报名计划保持停用，直到通过横幅或帮助里的入口重新同意。 -->
+  <dialog class="dlg dlg-terms" id="dlg-terms" aria-labelledby="dlg-terms-title" aria-describedby="dlg-terms-sub">
+    <div class="dlg-head terms-head">
+      <h2 id="dlg-terms-title" tabindex="-1">使用条款与隐私告知</h2>
+      <form method="dialog"><button class="dlg-x" type="submit" aria-label="暂不使用并关闭条款"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button></form>
+    </div>
+    <div class="dlg-body terms-body">
+      <div class="terms-feedback">
+        <p class="help-status" id="dlg-terms-status" role="status" aria-live="polite" hidden></p>
+        <button class="btn btn-line" id="btn-terms-recheck" type="button" hidden>重新确认状态</button>
+      </div>
+      <p id="dlg-terms-sub">本份条款 <b id="dlg-terms-document-version">2026-10-27-r2</b>；程序要求版本 <b id="dlg-terms-version">—</b>。同意后才能登录、查看活动列表与开始报名计划。</p>
+      <div class="terms-toolbar">
+        <h3 id="dlg-terms-view-title">条款要点</h3>
+        <button class="btn btn-line" id="btn-terms-full" type="button" aria-controls="dlg-terms-full-text" aria-expanded="false">查看完整条款</button>
+      </div>
+      <section class="terms-summary" id="dlg-terms-summary" aria-labelledby="dlg-terms-view-title">
+        <ul class="terms-points">
+          <li><div class="t">非官方个人作品</div><div class="d">本工具与学校、学校系统运营方及飞书均无隶属、合作或授权关系，按「现状」免费提供，不承诺无缺陷或报名成功。</div></li>
+          <li><div class="t">数据与对外通信</div><div class="d">登录凭据、活动缓存与设置只存在这台电脑的数据目录；学校访问（同意后含周期刷新）、校时和手动更新会联网，没有云端备份。</div></li>
+          <li><div class="t">只做重复操作自动化</div><div class="d">同意后会自动校验登录态并周期刷新活动列表，这些学校访问不限于你手动点击的那一次；名额与结果始终由学校系统决定。</div></li>
+          <li><div class="t">你的义务</div><div class="d">只用本人账号，遵守学校规章制度；不得干扰学校系统、牟利或代他人报名。</div></li>
+          <li><div class="t">责任限制</div><div class="d">在法律允许范围内不对未报上名、账号受限等损失承担责任；法律强制不得排除的责任（含故意或重大过失）不在此列。</div></li>
+        </ul>
+        <p class="rules" id="dlg-terms-gate-note">暂不使用后，登录、活动列表与报名计划保持停用；你仍可查看帮助，之后也能回来同意。</p>
+        <p class="terms-offline">本份条款可离线阅读：全文就在本窗口内，不依赖网络或仓库文档。</p>
+      </section>
+      <section class="terms-document" id="dlg-terms-full-text" hidden aria-label="完整条款">
+        <div class="terms-section terms-preamble"><h3>使用条款与隐私告知</h3><p>版本：<strong>2026-10-27-r2</strong>（程序内条款弹窗与此文件使用同一版本号；条款内容更新后版本号随之更新，程序会请你再次点击同意）</p><p>产品：天软活动预报名工具（本机版 / 服务器版）</p><p>开发者：个人开发者（LiXinwen），非商业、非官方作品</p><p><strong>重要提示</strong>：请完整阅读本条款，特别是第 5 条（使用提醒）、第 6 条（个人信息与对外通信）与第 7 条（责任限制）——这些条款与你存在重大利害关系。若你不同意本条款，可以继续使用帮助、设置与离线演示，但登录、活动列表和报名计划会保持停用。本文件是产品使用说明与隐私告知，不是法律意见；有具体法律疑问请咨询执业律师。</p></div>
+        <div class="terms-section"><h3>1. 定义</h3><ul>
+          <li><strong>本工具</strong>：天软活动预报名工具，含本机版（Windows 图形界面程序）与服务器版（自部署脚本与机器人）。</li>
+          <li><strong>开发者</strong>：编写并公开本工具源码的个人，仅通过 GitHub 与电子邮件与使用者沟通。</li>
+          <li><strong>使用者（你）</strong>：下载、运行或部署本工具的人。</li>
+          <li><strong>学校系统</strong>：你所在学校运营的学生端活动报名平台（含其 App 与网页）。本工具与该系统的运营方不存在任何隶属、合作或授权关系。</li>
+          <li><strong>飞书</strong>：服务器版用来推送消息的第三方即时通讯服务。</li>
+          <li><strong>学校动作</strong>：登录、登录态校验、活动列表拉取、报名提交与报名计划这些会访问学校系统的操作；校时、更新检查、帮助、设置与离线演示不属于学校动作。</li>
+        </ul></div>
+        <div class="terms-section"><h3>2. 条款的接受与生效</h3><ul>
+          <li>本条款在程序首次需要执行学校动作之前完整展示，你点击「我已阅读并同意」后才开始执行学校动作；</li>
+          <li>你选择「暂不使用」时程序<strong>不会退出</strong>：帮助、设置、条款全文与离线演示照常可用，登录、活动列表和报名计划保持停用，并通过横幅与帮助保留重新同意的入口；</li>
+          <li>同一版本在你选择「暂不使用」后不再反复弹窗，但停用状态不变，直到你主动同意；</li>
+          <li><strong>条款版本变化后，程序会再次展示条款并要求你重新点击同意</strong>；此前任何一次的同意都不会自动延伸到新版本；</li>
+          <li>本条款可随时在程序「帮助 → 使用条款与隐私」内与随源码分发的本文件中查阅。</li>
+        </ul></div>
+        <div class="terms-section"><h3>3. 软件性质</h3><ul>
+          <li>本工具是个人开发的辅助工具，<strong>非官方作品</strong>，与学校、学校系统运营方及飞书均无隶属、合作或授权关系；</li>
+          <li>免费开源，代码按 MIT 许可分发（见随包 LICENSE），不含收费项目、广告与商业推广；</li>
+          <li>按「现状」与「现有」提供，不承诺无缺陷、运行不中断或与任意环境兼容；</li>
+          <li>本工具只把「刷新活动列表、到点打开页面并提交报名」这类重复操作自动化；<strong>它不构成报名代理，不承诺报名成功，名额与结果始终由学校系统决定</strong>。</li>
+        </ul></div>
+        <div class="terms-section"><h3>4. 授权范围</h3><ul>
+          <li>代码授权以仓库中的 <strong>LICENSE（MIT）为准</strong>：MIT 授予的权利就是本工具的权利，本条款不新增 LICENSE 之外的分发或使用禁止；</li>
+          <li>MIT 本身要求保留版权与许可声明：再次分发代码或衍生作品时请连同 LICENSE 一起保留，这是许可的条件，不是本工具额外加的限制；</li>
+          <li>使用提醒（不是许可限制）：本工具是个人自用的辅助工具，<strong>请只用于你本人的账号与场景</strong>；若要把它以服务形式提供给他人，相关责任与合规义务由你自行承担。</li>
+        </ul></div>
+        <div class="terms-section"><h3>5. 使用提醒</h3><p>以下不是许可证条款，而是避免把工具用坏的提醒：</p><ul>
+          <li>仅使用你本人的合法账号；</li>
+          <li>遵守学校规章制度与学校系统的用户协议，并自行确认你的使用方式不违反上述规定；</li>
+          <li>不要利用本工具干扰学校系统的正常运行，也不要以本工具对外承揽报名业务；</li>
+          <li>妥善保管你的电脑与账号，设备被他人使用产生的后果由你承担；</li>
+          <li>未满 18 周岁的使用者建议在监护人知情并同意后使用本工具。</li>
+        </ul></div>
+        <div class="terms-section"><h3>6. 个人信息与对外通信</h3><h4>6.1 本机版（Windows 图形界面程序）</h4><ul>
+          <li><strong>处理者</strong>：本工具只在你自己的电脑上运行。开发者不接触、不收集、不存储、不传输你的任何个人信息；</li>
+          <li><strong>信息种类</strong>：登录凭据（Cookie/会话令牌）、活动列表缓存、界面偏好与运行记录；</li>
+          <li><strong>存储位置</strong>：仅本机数据目录——冻结程序为 <code>%LOCALAPPDATA%\TianSoftActivityPreRegistration\data</code>，源码与开发形态为程序目录旁的 <code>local/data/</code>；环境变量 <code>TJISE_DATA_DIR</code> 可以覆盖这个位置（对源码态与冻结 EXE 都生效，相对路径按当前工作目录解析），指定后程序读写的、以及界面「打开数据目录」打开的都是覆盖后的目录；</li>
+          <li><strong>旧数据迁移</strong>：冻结程序第一次使用新数据根时，会把旧版 EXE 旁边的 <code>data/</code> 里的登录态与偏好<strong>复制</strong>到统一数据目录，只补缺失、不覆盖目标已有文件，<strong>源文件保留在原处不删除</strong>；迁移完成后旧 EXE 旁那份副本依然存在，是否删除由你自行确认；</li>
+          <li><strong>保存与删除</strong>：保存到你删除该目录为止。删除某个目录只删除<strong>该目录里</strong>的内容。卸载向导里「是否一并删除登录数据」的确认<strong>只针对默认数据目录</strong> <code>%LOCALAPPDATA%\TianSoftActivityPreRegistration</code>：默认停在「否」，静默卸载一律保留；<code>TJISE_DATA_DIR</code> 指定的目录与旧 EXE 旁的迁移源副本都不在卸载的删除范围内，需要你自行确认路径后逐一清理。<strong>本机是否还存在其他副本（备份、同步盘、系统还原点）不在删除动作的控制范围内</strong>，需要你自行确认。程序不设云端备份，也不向开发者上传任何内容；</li>
+          <li><strong>对外通信（实际会发生的三类）</strong>：<ol>
+            <li><strong>学校系统</strong>：登录、登录态校验、活动列表、报名提交与计划执行——其中登录态校验与活动列表在你同意条款后会按界面操作与周期刷新发生，不限于你手动点击的那一次；</li>
+            <li><strong>网络授时（NTP / 公共 HTTP 时间源）</strong>：程序启动与运行期间会为「独立北京时间」校时，这是时间服务，不携带账号或活动信息；</li>
+            <li><strong>GitHub 发布页</strong>：只有你点「检查更新」或「前往下载页」时才会访问，用于比较版本号，不自动下载、不自动安装；</li>
+          </ol></li>
+          <li>除以上三类，程序不向其他第三方发送数据；<strong>它不内置任何开发者侧的遥测或统计</strong>；</li>
+          <li><strong>你的权利</strong>：查阅与备份（打开数据目录即可）、更正（界面设置）、删除（删除数据目录）、撤回同意（停止使用并删除数据；未同意条款时学校动作本就保持停用）。</li>
+        </ul><h4>6.2 服务器版（自行部署者适用）</h4><ul>
+          <li>部署服务器版的你才是<strong>个人信息处理者</strong>：服务器上的会话文件、活动缓存与推送记录都在你的服务器上，由你负责保管、权限设置与删除；</li>
+          <li>服务器只使用<strong>部署者本人</strong>的学校会话查询活动字段；<strong>群成员不需要、也不要向机器人提供学校账号或密码</strong>（这一点请在群内自行说明）；</li>
+          <li>群机器人只读：向群里推送公开活动信息、回答查询；不替群成员执行任何报名动作；</li>
+          <li>私聊机器人仅服务于部署者本人（owner）的预报名与结果通知；</li>
+          <li><strong>飞书侧接收与保存的数据</strong>：飞书开放平台会把消息与卡片交互事件发到你的服务，其中包含发送者的 <code>open_id</code>、会话 <code>chat_id</code>、消息内容与卡片交互字段；这些数据的保存期限、删除与权限由你决定并负责；</li>
+          <li>凭证（飞书应用凭据、学校会话文件）保存在服务器上，权限应设为仅部署者可读，且不得提交到任何代码仓库。</li>
+        </ul><h4>6.3 日志风险</h4><ul>
+          <li>运行日志不记录账号、密码、验证码、令牌、姓名与学号；</li>
+          <li>但日志可能包含活动名称、时间与你操作的时间线；向外发送日志前请自行核对并脱敏，<strong>不要</strong>把 <code>session.json</code>、<code>storage_state.json</code> 或未脱敏的运行日志发给任何人（包括开发者）。</li>
+        </ul></div>
+        <div class="terms-section"><h3>7. 责任限制</h3><p>在适用法律允许的最大范围内：</p><ul>
+          <li>开发者不对使用或无法使用本工具造成的任何直接或间接损失承担责任，包括未报上名、错过报名、账号被学校限制、数据丢失；</li>
+          <li>因学校系统升级、接口变更或风控策略调整导致功能失效，开发者无义务修复或维持可用；</li>
+          <li>因不可抗力、网络故障或设备故障导致的中断，开发者不承担责任；</li>
+          <li><strong>上述限制不适用于法律不允许排除的情形</strong>，包括但不限于：因故意或者重大过失造成财产损失的责任、造成人身损害的责任，以及法律强制性规定不得排除的其他责任。</li>
+        </ul></div>
+        <div class="terms-section"><h3>8. 知识产权</h3><ul>
+          <li>本工具代码依 MIT 许可证分发；文档与名称的权利归其权利人；</li>
+          <li>学校系统及其页面内容的权利归学校及相关权利人；飞书及其界面的权利归其运营方。</li>
+        </ul></div>
+        <div class="terms-section"><h3>9. 条款变更与终止</h3><ul>
+          <li>条款变更后在程序内与代码仓库中公示，并显示新的版本号；</li>
+          <li><strong>版本变化后必须由你再次点击同意，学校动作才会恢复</strong>；不同意时可以继续使用帮助、设置与离线演示，也可以停止使用并删除数据目录；</li>
+          <li>开发者可随时停止维护或将发布页下架，且不因此承担责任。</li>
+        </ul></div>
+        <div class="terms-section"><h3>10. 法律适用与争议</h3><p>本条款适用中华人民共和国法律。因本工具产生的争议先协商解决；协商不成，向开发者所在地有管辖权的人民法院提起诉讼。</p></div>
+        <div class="terms-section"><h3>11. 联系方式</h3><ul>
+          <li>GitHub Issues：<code>https://github.com/ShenTingBai/tjise-activity-watch/issues</code></li>
+          <li>电子邮件：<code>feng.ye147800@gmail.com</code></li>
+        </ul>
+        <p>反馈问题时请附脱敏截图与文字描述（含版本号）；<strong>不要</strong>发送登录文件或未脱敏的运行日志。</p></div>
+      </section>
+      <span class="help-esc">Esc 暂不使用</span>
+    </div>
+    <div class="dlg-foot terms-foot"><button class="btn btn-line" id="btn-terms-close" type="button" hidden>关闭</button><button class="btn btn-line" id="btn-terms-decline" type="button" title="保持停用登录、活动列表与报名计划，可随时回来重新同意">暂不使用</button><button class="btn btn-blue" id="btn-terms-accept" type="button" title="同意当前版本的使用条款与隐私告知，之后才能登录和报名">我已阅读并同意</button></div>
+  </dialog>
+  <!-- 一个帮助面板承载使用与辅助操作；报名状态与更新状态彼此独立。 -->
+  <dialog class="dlg dlg-help" id="help" aria-labelledby="help-title">
+    <div class="dlg-head help-head">
+      <div><h2 id="help-title">使用帮助</h2><p id="help-sub">使用说明、版本更新与本机数据</p></div>
+      <form method="dialog"><button class="dlg-x" type="submit" aria-label="关闭帮助"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button></form>
+    </div>
+    <div class="dlg-body">
+      <section class="help-guide" aria-labelledby="help-guide-title">
+        <div class="help-section-head"><h3 id="help-guide-title">三步使用说明</h3><button class="btn btn-line" id="btn-help-tour" type="button" title="重新看一遍六步引导">重看引导</button></div>
+        <ol class="steps" id="help-steps"></ol>
+        <p class="rules" id="help-note"></p>
+      </section>
+      <section class="help-tools" aria-label="版本与本机数据">
+        <div class="help-tool-row">
+          <div class="help-tool-text"><h3>版本与更新 <span class="help-current">当前 <b id="help-version">—</b></span></h3><p id="update-status" role="status" aria-live="polite">尚未检查</p><p class="help-checked" id="update-checked-at" hidden></p></div>
+          <div class="help-actions"><button class="btn btn-line" id="btn-update-check" type="button">检查更新</button><button class="btn btn-line" id="btn-help-latest" type="button">前往下载页</button></div>
+        </div>
+        <div class="help-tool-row">
+          <div class="help-tool-text"><h3>本机数据</h3><p id="help-data-path">登录信息、工具设置和运行记录保存在这台电脑。</p></div>
+          <button class="btn btn-line" id="btn-help-data" type="button">打开数据目录</button>
+        </div>
+        <div class="help-tool-row">
+          <div class="help-tool-text"><h3>使用条款与隐私</h3><p>当前条款版本 <b id="help-terms-version">—</b>；同意记录保存在本机设置里。</p></div>
+          <div class="help-actions"><button class="btn btn-line" id="btn-help-terms" type="button">查看条款</button></div>
+        </div>
+        <p class="help-status" id="help-status" role="status" hidden></p>
+      </section>
+    </div>
+    <div class="dlg-foot"><span class="help-esc">Esc 关闭</span><span class="grow"></span><form method="dialog"><button class="btn btn-solid" type="submit">关闭</button></form></div>
+  </dialog>
+  <!-- 六步可重播引导：中性遮罩 + 琥珀高亮框 + 说明卡片；Esc=跳过；窄窗或目标缺失退回底部说明条 -->
+  <div class="tour" id="tour" hidden>
+    <div class="tour-mask" aria-hidden="true"></div>
+    <div class="tour-spot" id="tour-spot" aria-hidden="true"></div>
+    <div class="tour-card" id="tour-card" role="dialog" aria-modal="true" aria-labelledby="tour-title" tabindex="-1">
+      <div class="tour-head"><span class="tour-step" id="tour-step">第 1/6 步</span><span class="tour-dots" id="tour-dots" aria-hidden="true"></span></div>
+      <h3 id="tour-title"></h3>
+      <p id="tour-text"></p>
+      <div class="tour-foot">
+        <button class="btn btn-line" id="tour-skip" type="button">跳过引导</button>
+        <span class="grow"></span>
+        <button class="btn btn-line" id="tour-prev" type="button">上一步</button>
+        <button class="btn btn-solid" id="tour-next" type="button">下一步</button>
+      </div>
+    </div>
+  </div>
+  <!-- 时间详情浮层：一个入口承载当前时间、状态、误差与重新校准 -->
+  <div class="pop" id="clock-pop" role="dialog" aria-label="北京时间详情" hidden></div>
+  <!-- 停止计划二次确认：Esc / 继续计划 都不会触发停止 -->
+  <dialog class="dlg dlg-sm" id="dlg-stop" aria-labelledby="dlg-stop-title">
+    <div class="dlg-head"><h2 id="dlg-stop-title">停止报名计划？</h2><p id="dlg-stop-body">工具将停止后续尝试。已提交的请求仍可能成功，停止计划不会取消已成功的报名。</p></div>
+    <div class="dlg-foot"><form method="dialog"><button class="btn btn-line" type="submit" value="no">继续计划</button><button class="btn btn-solid btn-stop-confirm" type="submit" value="yes">停止计划</button></form></div>
+  </dialog>
+  <script src="led.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
