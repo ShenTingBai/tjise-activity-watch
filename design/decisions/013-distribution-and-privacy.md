@@ -2,8 +2,7 @@
 
 - **状态**：implemented（源码与文档随计划 20261027-distribution-contract-release 落地，
   20261027-distribution-contract-repair 返修后端门禁、卸载安全与条款 r1）；
-  安装后哈希探针、三资产正式构建与发布、真实学校窗口验收**待授权/待用户验收**——
-  **安装版目前仍是未发布候选，不得写成已发布资产**。
+  v1.1.1 的三资产已完成同源构建并发布；真实学校窗口仍属于用户验收范围。
 - **日期**：2026-10-27（当日返修）
 - **上游**：[决策 008](008-lifecycle-version-release.md)（发布门禁与资产绑定）、
   [决策 010](010-standalone-exe-and-settings.md)（独立 EXE）、
@@ -24,7 +23,7 @@ README 却让用户任选三种——其中一种在最新 Release 里不存在�
 
 | 形态 | 地位 | 数据位置 |
 |---|---|---|
-| **安装版**（Inno Setup，中文向导） | **未发布候选**：脚本与清单已就绪，正式发布须在干净 main 重新构建并逐项授权核验 | `%LOCALAPPDATA%\TianSoftActivityPreRegistration\data` |
+| **安装版**（Inno Setup，中文向导） | **已随 v1.1.1 正式发布**：与独立 EXE、完整 ZIP 来自同一冻结 EXE | `%LOCALAPPDATA%\TianSoftActivityPreRegistration\data` |
 | **独立 EXE** | 已发布正式资产 | 同上 |
 | **完整 ZIP**（四成员） | 已发布正式资产，免安装 | 同上 |
 | 绿色版 `tjise-grab-portable-*.zip` | **历史形态**（v1.0.2 及以前，停止新增发布） | 程序旁 `data/`（历史口径） |

@@ -55,7 +55,7 @@
 - `tjise-activity-watch-vX.Y.Z-win-x64.zip`（**完整 ZIP，免安装**）：独立 EXE、README 和启动说明都在里面，解压双击主 EXE 即用；
 - `tjise-activity-watch-vX.Y.Z-win-x64.exe`：**独立可用单文件**——程序组件（grab-worker）已内置，拷到任何空目录双击即可。
 
-> **安装版目前是候选，还没发布**：`tjise-activity-watch-installer-vX.Y.Z-win-x64.exe`
+> **安装版已随正式 Release 提供**：`tjise-activity-watch-installer-vX.Y.Z-win-x64.exe`
 > 的构建脚本与文件清单已经就绪（`local/build_installer.py`），会随下一个正式版本并列发布；
 > 在那之前发布页上不会有这个附件，也请不要把它当作已发布资产去找。候选阶段只能
 > 自己在干净工作区构建试用。
@@ -67,7 +67,7 @@
 > 下载名固定用 ASCII 基名：GitHub 会把中文前缀规范化，v1.1.0 上传时就靠人工改过一次名
 > （见 `tools/release.py` 的 `exe_asset_name`）。中文产品名只出现在 Release 标题和包里说明。
 > 独立 EXE 与四成员 ZIP 形态自 v1.1.0 起生效并**已于 2026-10-26 发布**；当前工作区版本
-> 1.1.1 仍是尚未上传的补丁候选（真实学校窗口仍待用户真机验收）。
+> 当前正式版本为 1.1.1；真实学校窗口仍属于使用者自己的验收范围，软件不对学校平台结果作保证。
 
 右上角 **「帮助」** 集中三步使用说明、重看六步引导、当前版本和本机数据目录。点「检查更新」才会查询 GitHub 最新正式版并比较版本；失败会显示原因与重试入口，当前候选比正式版新时明确提示「当前为预览版本」。检查结果附检查时间，不自动下载或安装；「查看发布页」用系统浏览器打开 [最新发布](https://github.com/ShenTingBai/tjise-activity-watch/releases/latest)。当前版本以 [VERSION](VERSION) 为准。
 
