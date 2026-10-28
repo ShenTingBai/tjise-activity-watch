@@ -1079,6 +1079,85 @@ class RetryPolicyContractTests(unittest.TestCase):
         self.assertEqual(final["sign_end"], "2026-10-24 10:00:00")
 
 
+class BurstPolicyFreezeTests(unittest.TestCase):
+    """黄金风暴自适应扩窗不得改写计划冻结字段（R04/R10 边界）。"""
+
+    def test_task_spec_frozen_fields_survive_adaptive_extension(self):
+        """retry_started_at/retry_for_s/sign_end/max_attempts 接纳时冻结，扩窗不改写。"""
+        now = datetime.now().replace(microsecond=0)
+        at = (now - timedelta(seconds=5)).strftime("%Y-%m-%d %H:%M:%S")
+        spec = TaskSpec("task-a", "a", "a", at, "2026-10-23 12:00:00",
+                        "2026-10-23 13:00:00",
+                        sign_end="2026-10-24 10:00:00", retry_for_s=600,
+                        max_attempts=3)
+        events = []
+
+        def emit(kind, payload):
+            events.append((kind, payload))
+
+        def runner(spec, cancel_event, status):
+            # 模拟 worker 上报自适应扩窗后的更大 retry_deadline
+            status("submitting", {"attempts": 1,
+                                  "retry_deadline": "1792900500",
+                                  "last_reason": "404 接口未就绪/限流"})
+            return {"status": "failed", "code": 2,
+                    "stop_reason": "retry_duration", "attempts": 1,
+                    "retry_deadline": "1792900500", "sign_end": spec.sign_end}
+
+        coordinator = PlanCoordinator("plan-freeze", [spec], runner, emit)
+        snap = coordinator.snapshot()
+        frozen = snap["tasks"][0]
+        self.assertEqual(frozen["retry_for_s"], 600)
+        self.assertEqual(frozen["max_attempts"], 3)
+        self.assertEqual(frozen["sign_end"], "2026-10-24 10:00:00")
+
+        coordinator.start()
+        coordinator._thread.join(2)
+        self.assertFalse(coordinator._thread.is_alive())
+
+        # 扩窗只改运行时 detail，不改快照冻结字段
+        final_snap = coordinator.snapshot()["tasks"][0]
+        self.assertEqual(final_snap["retry_for_s"], 600,
+                         "自适应扩窗不得改写计划冻结的 retry_for_s")
+        self.assertEqual(final_snap["max_attempts"], 3,
+                         "自适应扩窗不得改写计划冻结的 max_attempts")
+        self.assertEqual(final_snap["sign_end"], "2026-10-24 10:00:00",
+                         "自适应扩窗不得改写计划冻结的 sign_end")
+
+    def test_retry_deadline_can_grow_but_not_shrink(self):
+        """扩窗允许 deadline 变大；迟到/重放的更小值不得改小。"""
+        now = datetime.now().replace(microsecond=0)
+        at = (now - timedelta(seconds=5)).strftime("%Y-%m-%d %H:%M:%S")
+        spec = TaskSpec("task-b", "b", "b", at, "2026-10-23 12:00:00",
+                        "2026-10-23 13:00:00",
+                        sign_end="2026-10-24 10:00:00", retry_for_s=600,
+                        max_attempts=0)
+        events = []
+
+        def emit(kind, payload):
+            events.append((kind, payload))
+
+        def runner(spec, cancel_event, status):
+            status("submitting", {"attempts": 1, "retry_deadline": "1792900000"})
+            # 自适应扩窗：deadline 变大（允许）
+            status("submitting", {"attempts": 2, "retry_deadline": "1792900500"})
+            # 迟到/重放的更小值（拒绝）
+            status("submitting", {"attempts": 3, "retry_deadline": "1792899900"})
+            return {"status": "failed", "code": 2,
+                    "stop_reason": "retry_duration", "attempts": 3,
+                    "retry_deadline": "1792899900"}
+
+        coordinator = PlanCoordinator("plan-grow", [spec], runner, emit)
+        coordinator.start()
+        coordinator._thread.join(2)
+        self.assertFalse(coordinator._thread.is_alive())
+
+        task_events = [p for kind, p in events if kind == "task"]
+        final = task_events[-1]
+        self.assertEqual(str(final.get("retry_deadline")), "1792900500",
+                         "deadline 只能单调变大，迟到的更小值不得改小")
+
+
 class PlanAdmissionTests(unittest.TestCase):
     """R05/R11：计划接纳只信本进程缓存，并且同一 request_id 只接纳一次。"""
 

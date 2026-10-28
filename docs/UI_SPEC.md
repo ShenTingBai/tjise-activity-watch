@@ -236,8 +236,8 @@
 2. **有效截止**：`effective_deadline = min(起算点 + retry_for_s, sign_end)`；未来活动从 `sign_start` 起算，已开放活动从启动计划起算；`retry_for_s=0`（直到截止）但 `sign_end` 缺失时回退 120 秒，绝不无限运行。
 3. **载荷链路**：`start_plan(items, headed, retry_policy)` → `TaskSpec(sign_end, retry_for_s, max_attempts)`（计划快照携带，重载不丢）→ worker `--sign-end / --retry-for / --max-attempts`；脏策略值在后端回落默认（120 / 0）。
 4. **attempts 计数**（验收条款）：只有真正发起 `signUp` 请求的点击计数（worker 输出「第 N 次提交：原因」行）；页面刷新、等待与 `is_joined` 查询一律不计，也不得把刷新/查询次数显示成提交次数。界面显示「第 N 次提交 / 最近原因 / 重试截止 / 报名截止」，不显示虚构的 N/N 总数。
-5. **可重试原因**：报名人数已满、未开放、无响应、网络错误按可重试处理；**提交失败后的下一轮提交间隔从 2 秒起按 1.5 倍退避、8 秒封顶**（页面刷新同样 2→8 秒），每次等待受重试时长与 `sign_end` 共同钳制。「登录失效」「已报名」「成功」「结果未确认」是立即终态，不因重试策略继续点击。
-6. **终态与停止原因**：任务终态携带 `stop_reason ∈ {success, already_signed, login_invalid, max_attempts, retry_duration, sign_end, user_stopped, process_error}`；失败终态保留最后一个学校原话并追加到达的停止条件（达到最大提交次数 / 重试时长到了 / 报名已截止）。worker 结构化行 `[retry] attempts=N stop_reason=X retry_deadline=<epoch> sign_end=<epoch> last_reason=<原文>` 是 telemetry 唯一来源。
+5. **可重试原因与提交节奏**（2026-10-28 修订）：报名人数已满、未开放、无响应、网络错误按可重试处理；提交节奏由黄金风暴状态机驱动——**开放瞬间 0~1.6 秒最多 10 轮、间隔 90ms（黄金风暴）；随后每 180ms 一轮（常规全速）；连续 3 次 HTTP 404 视为接口未就绪/限流，进入 1.6 倍指数退避（上限 3 秒）并把有效窗口自动扩到起点起 25 分钟，收到任何非 404 真实应答立即切回全速**。每次等待受重试时长与 `sign_end` 共同钳制；`sign_end` 永远硬截止，扩窗不得越过。「登录失效」「已报名」「成功」是立即终态；「结果未确认」在停止时如实保留未决笔数，不伪造成失败。多笔未决合法：应答可乱序结算，每笔有唯一 `request_id`，不隐藏重复提交。
+6. **终态与停止原因**：任务终态携带 `stop_reason ∈ {success, already_signed, login_invalid, max_attempts, retry_duration, sign_end, user_stopped, process_error}`；失败终态保留最后一个学校原话并追加到达的停止条件（达到最大提交次数 / 重试时长到了 / 报名已截止）。worker 结构化行 `[retry] kind=done attempts=N stop_reason=X retry_deadline=<epoch> sign_end=<epoch> last_reason=<原文> pending=N streak_404=N phase=<阶段>` 是 telemetry 唯一来源；进度行 `[retry] kind=submit` 带 `request_id` 与 `phase`，`kind=not_ready` 带 `streak_404`。界面显示「第 N 次提交 / 最近原因 / 重试截止 / 报名截止」以及当前阶段（黄金风暴 / 常规全速 / 404 自适应），不显示虚构的 N/N 总数。
 7. **路线图**：时间线同时保留学校原定开放时间和本次实际执行时间：`本次启动`、`活动页已打开`、`盯按钮` 使用 worker 真实事件时间，`原定开放` 使用活动的 `sign_start`（已过去的时间显示完整日期），最后一站使用 telemetry 的真实重试截止（策略时长或报名截止截断后的值），不再用 `sign_start + 120` 冒充。
 
 ### 5.9 登录态持久化与启动校验（验收条款）

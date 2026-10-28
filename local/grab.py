@@ -1043,6 +1043,224 @@ def wait_before_next_submit(budget, gap: float) -> float:
     return next_submit_gap(gap)
 
 
+# ---------------------------------------------------------------------------
+# 黄金风暴 / 常规全速 / 404 自适应（2026-10-28 用户确认方案）
+#
+# 开放瞬间 0~1.6 秒内最多 10 轮、最小间隔 90ms；随后 180ms 常规全速；
+# 连续 3 次 404 视为接口未就绪/限流，1.6 倍指数退避、上限 3 秒，并把有效
+# 窗口自动扩到起点起 25 分钟；收到非 404 真实响应立即切回全速。
+# sign_end 永远是硬截止，扩窗不得越过它。
+#
+# 旧 RC-05（2 秒起、1.5 倍、8 秒封顶）纯函数保留在上方不动：test_retry_policy
+# 直接锁定它们的数值契约，本文件外的测试不可在本轮改动范围内。
+# ---------------------------------------------------------------------------
+
+GOLDEN_WINDOW_S = 1.6            # 开放后黄金窗口
+GOLDEN_INTERVAL_S = 0.09         # 黄金阶段最小间隔（90ms）
+GOLDEN_ROUNDS = 10               # 黄金阶段最多轮次
+FULL_SPEED_INTERVAL_S = 0.18     # 常规全速最小间隔（180ms）
+NOT_READY_404_LIMIT = 3          # 连续 404 视为接口未就绪
+BACKOFF_FACTOR = 1.6             # 自适应退避倍率
+BACKOFF_MAX_S = 3.0              # 自适应退避上限
+ADAPTIVE_WINDOW_S = 1500.0       # 自适应扩窗上限（25 分钟）
+
+
+class BurstPolicy:
+    """黄金风暴/常规全速/404 自适应的显式状态机与真实请求记账。
+
+    纯调度与记账，不做任何 I/O：时间读数全部走注入的 clock（单测里是虚拟
+    时钟，绝不真实 sleep 1.6 秒）。四个阶段 golden / full_speed /
+    adaptive_backoff / terminal 的转移规则见类常量上方注释。
+
+    不变量：
+    * attempts 只数真正发出过的 signUp 请求，单调递增；
+    * pending 里每笔都有唯一 request_id，响应按归属结算，乱序合法；
+    * 同一 request 重复通知只算一次；别家响应不改本场结论；
+    * effective_deadline 只会因自适应扩窗变大，且永不越过 sign_end；
+    * hard_deadline 一旦冻结就不再改写，sign_end 截止永远优先于扩窗；
+    * 进入 terminal 后拒绝再发起任何动作（用户停止同此）。
+    """
+
+    PHASE_GOLDEN = "golden"
+    PHASE_FULL_SPEED = "full_speed"
+    PHASE_ADAPTIVE = "adaptive_backoff"
+    PHASE_TERMINAL = "terminal"
+
+    def __init__(self, open_ts, base_deadline, sign_end_ts=None,
+                 max_attempts=0, clock=None, retry_start=None):
+        self._clock = clock
+        self.open_ts = float(open_ts)
+        self.retry_start = float(retry_start if retry_start is not None else open_ts)
+        self.sign_end_ts = float(sign_end_ts) if sign_end_ts else None
+        self.max_attempts = int(max_attempts or 0)
+        self.hard_deadline = float(base_deadline)
+        if self.sign_end_ts:
+            self.hard_deadline = min(self.hard_deadline, self.sign_end_ts)
+        self.effective_deadline = self.hard_deadline
+        self.attempts = 0
+        self.streak_404 = 0
+        self.golden_rounds = 0
+        self._phase = self.PHASE_GOLDEN
+        self._backoff_s = FULL_SPEED_INTERVAL_S
+        self._requests = {}
+        self._seq = 0
+        self._stopped = False
+
+    # -- 时间读数 ---------------------------------------------------------
+    def _now(self):
+        if self._clock is None:
+            import time as _time
+            return _time.monotonic()
+        return float(self._clock.monotonic() if hasattr(self._clock, "monotonic")
+                     else self._clock())
+
+    def _wall_now(self):
+        if self._clock is None:
+            import time as _time
+            return _time.time()
+        return float(self._clock.time() if hasattr(self._clock, "time")
+                     else self._clock())
+
+    # -- 阶段与调度 -------------------------------------------------------
+    @property
+    def phase(self):
+        self._refresh_phase()
+        return self._phase
+
+    def _refresh_phase(self):
+        """按已观察事实刷新阶段；非 404 响应会让黄金/退避立即退位。"""
+        if self._phase == self.PHASE_TERMINAL:
+            return
+        if self._phase == self.PHASE_GOLDEN:
+            now = self._wall_now()
+            if self.golden_rounds >= GOLDEN_ROUNDS or now >= self.open_ts + GOLDEN_WINDOW_S:
+                self._phase = self.PHASE_FULL_SPEED
+                self._backoff_s = FULL_SPEED_INTERVAL_S
+            return
+        if self._phase == self.PHASE_ADAPTIVE and self.streak_404 < NOT_READY_404_LIMIT:
+            self._phase = self.PHASE_FULL_SPEED
+            self._backoff_s = FULL_SPEED_INTERVAL_S
+
+    def interval_s(self):
+        """下一次尝试前必须等待的最小间隔。"""
+        self._refresh_phase()
+        if self._phase == self.PHASE_GOLDEN:
+            return GOLDEN_INTERVAL_S
+        if self._phase == self.PHASE_ADAPTIVE:
+            return min(BACKOFF_MAX_S, max(FULL_SPEED_INTERVAL_S, self._backoff_s))
+        return FULL_SPEED_INTERVAL_S
+
+    def next_interval_after_wait(self):
+        """等待完本次间隔后推进退避计数，返回下一轮间隔。"""
+        if self._phase == self.PHASE_ADAPTIVE:
+            self._backoff_s = min(BACKOFF_MAX_S,
+                                  max(FULL_SPEED_INTERVAL_S, self._backoff_s) * BACKOFF_FACTOR)
+        return self.interval_s()
+
+    def can_attempt(self):
+        """是否还允许发起新的一次提交（次数/截止/停止都算）。"""
+        if self._stopped or self._phase == self.PHASE_TERMINAL:
+            return False
+        if self.attempts >= self.max_attempts > 0:
+            return False
+        if self._wall_now() >= self.effective_deadline:
+            return False
+        return True
+
+    def extend_deadline_for_adaptive(self):
+        """404 连击触发自适应扩窗：有效截止拉到起点起 25 分钟，sign_end 仍硬截。"""
+        target = self.retry_start + ADAPTIVE_WINDOW_S
+        if self.sign_end_ts:
+            target = min(target, self.sign_end_ts)
+        if target > self.effective_deadline:
+            self.effective_deadline = target
+        return self.effective_deadline
+
+    # -- 请求记账 ---------------------------------------------------------
+    def register_request(self):
+        """为一笔真实发出的 signUp 请求分配唯一 ID 并入账。"""
+        self._seq += 1
+        request_id = "req-%d" % self._seq
+        self._requests[request_id] = {"status": "pending", "kind": None,
+                                      "attempt_no": self.attempts + 1}
+        self.attempts += 1
+        if self._phase == self.PHASE_GOLDEN:
+            self.golden_rounds += 1
+        return request_id
+
+    def settle(self, request_id, kind):
+        """结算一笔请求的响应归属；kind ∈ {404, real, lost}。
+
+        乱序合法：响应可以按任意顺序回来；重复结算同一笔只认第一次。
+        404 会加连击并可能进退避；real 清连击并退出退避/黄金。
+        lost（响应体丢失/读不出）不结算：请求保持未决，终态如实报「未确认」。
+        """
+        record = self._requests.get(request_id)
+        if record is None or record["status"] == "settled":
+            return None
+        if kind == "lost":
+            record["kind"] = "lost"
+            return record          # 不改 status，仍是 pending
+        record["status"] = "settled"
+        record["kind"] = kind
+        if kind == "404":
+            self.streak_404 += 1
+            if self.streak_404 >= NOT_READY_404_LIMIT:
+                if self._phase != self.PHASE_TERMINAL:
+                    self._phase = self.PHASE_ADAPTIVE
+                    self._backoff_s = min(BACKOFF_MAX_S,
+                                          FULL_SPEED_INTERVAL_S * BACKOFF_FACTOR)
+                self.extend_deadline_for_adaptive()
+        elif kind == "real":
+            self.streak_404 = 0
+            if self._phase == self.PHASE_GOLDEN:
+                self._phase = self.PHASE_FULL_SPEED
+                self._backoff_s = FULL_SPEED_INTERVAL_S
+            elif self._phase == self.PHASE_ADAPTIVE:
+                self._phase = self.PHASE_FULL_SPEED
+                self._backoff_s = FULL_SPEED_INTERVAL_S
+        return record
+
+    def pending_ids(self):
+        return [rid for rid, rec in self._requests.items()
+                if rec["status"] == "pending"]
+
+    def pending_count(self):
+        return len(self.pending_ids())
+
+    def settled_kind(self, request_id):
+        rec = self._requests.get(request_id)
+        return rec["kind"] if rec and rec["status"] == "settled" else None
+
+    # -- 终态 -------------------------------------------------------------
+    def stop(self, reason):
+        """进入终态；之后 can_attempt() 恒 False，不再发起本场任何动作。"""
+        self._stopped = True
+        self._phase = self.PHASE_TERMINAL
+        self.stop_reason = reason
+        return reason
+
+    @property
+    def stopped(self):
+        return self._stopped
+
+
+def _classify_response(response):
+    """把一次 signUp 响应归类为 404 / real；没有响应体也按 real 结算。
+
+    HTTP 404 明确是「接口未就绪/限流」；其余 HTTP 状态（含 200+JSON、
+    5xx）都算真实响应，必须结束黄金阶段。响应体丢失时不能挂成 404。
+    """
+    if response is None:
+        return "lost"
+    status = getattr(response, "status", 200)
+    try:
+        status_code = int(status)
+    except (TypeError, ValueError):
+        status_code = 200
+    return "404" if status_code == 404 else "real"
+
+
 def _ts_text(ts) -> str:
     """秒级时间戳 → 学校时区的完整时间文本；None 显示 '-'（结构化日志用）。"""
     if not ts:
@@ -1164,7 +1382,7 @@ def cmd_grab(args):
     display = getattr(args, "name", "") or "这一场活动"
     # 已观察事实：attempts 只数真实请求；pending 是「已发出但还没有确定结果」的请求数
     state = {"attempts": 0, "pending": 0, "last_reason": "", "resp_ok": False,
-             "joined_by_check": False, "deadline": 0.0, "binding": ""}
+             "login_invalid": False, "deadline": 0.0, "binding": ""}
     done = {"value": False}
 
     def terminal(stop_reason):
@@ -1173,8 +1391,11 @@ def cmd_grab(args):
             return 2
         done["value"] = True
         log("[retry] kind=done attempts=%d stop_reason=%s retry_deadline=%d sign_end=%d "
-            "last_reason=%s" % (state["attempts"], stop_reason, int(state["deadline"]),
-                                int(sign_end_ts or 0), (state["last_reason"] or "")[:40]))
+            "last_reason=%s pending=%d streak_404=%d phase=%s"
+            % (state["attempts"], stop_reason, int(state["deadline"]),
+               int(sign_end_ts or 0), (state["last_reason"] or "")[:40],
+               state.get("pending", 0), state.get("streak_404", 0),
+               state.get("phase", "")))
         attempts, last = state["attempts"], state["last_reason"]
         if stop_reason == "success":
             log("[OK] 报名成功（尝试 %d 次）" % attempts)
@@ -1359,6 +1580,9 @@ def cmd_grab(args):
     try:
         with sync_playwright() as pw:
             browser = launch_browser(pw, headless=not args.headed)
+            # 监听容器先于 try 建立：finally 里停用监听不会因未定义而失败
+            armed = {"on": False, "dead": False}
+            listeners = []
             try:
                 ctx = new_context(browser)
                 page = ctx.new_page()
@@ -1401,22 +1625,41 @@ def cmd_grab(args):
                         wait_until(at_ts - POLL_LEAD, budget)
 
                 reload_gap = 2.0
-                submit_gap = SUBMIT_BACKOFF_START_S
                 last_reload = 0.0
                 stop_reason = ""
-                # 受控提交窗口：只承认「我方点击/确认期间」发出的 signUp 请求。
+                # 黄金风暴状态机：开放时刻进入 10 轮 90ms，随后 180ms 全速；
+                # 404 连击进退避并扩窗，非 404 立即回全速（2026-10-28 方案）
+                burst = BurstPolicy(
+                    open_ts=at_ts,
+                    base_deadline=state["deadline"] or _policy_window(
+                        frozen, sign_end_ts, retry_for)[0],
+                    sign_end_ts=sign_end_ts,
+                    max_attempts=args.max_attempts,
+                    clock=clock,
+                    retry_start=frozen or at_ts,
+                )
+                # 受控提交窗口：只承认本场盯按钮期间发出的 signUp 请求。
                 # 学校真实接口是 GET signUp/<opaque-hash>，hash 不含活动 ID，
-                # 因此不能再用「URL 里有 id」来认领（C01）。
-                armed = {"on": False}
+                # 因此不能再用「URL 里有 id」来认领（C01）。请求事件的派发可能
+                # 晚于网络发起，窗口覆盖整个提交阶段才不会漏计真实请求；
+                # 页面加载阶段的别家请求在监听注册之前，天然不入账。
                 admitted_ids = set()
                 seen_ids = set()
                 admitted_all = []
+                request_to_bid = {}
+                response_queue = []
 
                 def _is_signup_url(url_text):
                     return url_text.startswith(BASE) and "/rjyHdCyr/signUp/" in url_text
 
+                def _sync_pending():
+                    state["pending"] = burst.pending_count()
+                    state["attempts"] = burst.attempts
+                    state["streak_404"] = burst.streak_404
+                    state["phase"] = burst.phase
+
                 def on_request(request):
-                    if not armed["on"]:
+                    if armed["dead"] or not armed["on"]:
                         return
                     try:
                         url_text = str(request.url)
@@ -1430,36 +1673,148 @@ def cmd_grab(args):
                     admitted_ids.add(ident)
                     seen_ids.add(ident)
                     admitted_all.append(request)
-                    state["attempts"] += 1
-                    state["pending"] += 1
+                    bid = burst.register_request()
+                    request_to_bid[ident] = bid
+                    _sync_pending()
                     state["last_reason"] = "已发起，等响应"
                     # 请求发起即上报，不等响应回来才让界面知道已提交
                     log("[i] 第 %d 次提交：已发起" % state["attempts"])
-                    _retry_event(kind="submit", attempts=state["attempts"])
+                    _retry_event(kind="submit", attempts=state["attempts"],
+                                 request_id=bid, phase=burst.phase)
 
+                def on_response(response):
+                    # 回调只入队：结算统一走主循环的事件泵，不在回调里做 I/O
+                    if armed["dead"]:
+                        return
+                    try:
+                        url_text = str(response.url)
+                    except Exception:
+                        return
+                    if not _is_signup_url(url_text):
+                        return
+                    response_queue.append(response)
+
+                def _settle_one(response):
+                    """按 request_id 结算一笔在途响应；乱序合法，别家响应不改本场结论。"""
+                    nonlocal budget
+                    resp_request = getattr(response, "request", None)
+                    bid = None
+                    if resp_request is not None:
+                        bid = request_to_bid.get(id(resp_request))
+                    elif burst.pending_count() == 1:
+                        # 替身/旧驱动可能不给 response.request：只在唯一未决时认领
+                        bid = burst.pending_ids()[0]
+                    if bid is None:
+                        state["last_reason"] = "收到其他请求的响应，本场结论未变"
+                        return
+                    raw_kind = _classify_response(response)
+                    payload = None
+                    if raw_kind == "real":
+                        try:
+                            payload = response.json()
+                        except Exception:
+                            raw_kind = "lost"   # 响应体读不出：保持未决，不假造结论
+                    burst.settle(bid, raw_kind)
+                    if raw_kind == "lost":
+                        state["last_reason"] = "响应读取失败，请求仍未决"
+                    elif raw_kind == "404":
+                        state["last_reason"] = "404 接口未就绪/限流"
+                        _retry_event(kind="not_ready", request_id=bid,
+                                     streak_404=burst.streak_404,
+                                     phase=burst.phase,
+                                     retry_deadline=int(burst.effective_deadline))
+                        # 自适应扩窗可能拉长有效截止：重建预算，sign_end 仍硬截
+                        if burst.effective_deadline > getattr(budget, "deadline_epoch", 0):
+                            budget = RetryBudget(burst.effective_deadline,
+                                                 business_clock=clock)
+                            state["deadline"] = burst.effective_deadline
+                            _retry_event(kind="window_extended",
+                                         retry_deadline=int(burst.effective_deadline),
+                                         sign_end=int(sign_end_ts or 0))
+                    else:
+                        code = payload.get("code") if isinstance(payload, dict) else None
+                        message = ""
+                        if isinstance(payload, dict):
+                            message = str(payload.get("message") or "")
+                        state["last_reason"] = "code:%s %s" % (code, message[:30])
+                        # 成功结论粘性：只要有一笔 code=1 就是成功，后续失败响应不改写
+                        if code == 1:
+                            state["resp_ok"] = True
+                        code_text = "" if code is None else str(code)
+                        if (code_text == "4001" or "4001" in message
+                                or "登录" in message or "身份验证" in message):
+                            state["login_invalid"] = True
+                    _sync_pending()
+                    log("[i] 第 %d 次提交：%s" % (state["attempts"], state["last_reason"]))
+
+                def _settle_pending():
+                    while response_queue:
+                        _settle_one(response_queue.pop(0))
+                    _sync_pending()
+
+                def _pump_wait(seconds):
+                    """短事件泵：按预算截断等待，同时派发并结算在途响应。
+
+                    Playwright 同步 API 在等待里派发事件回调；成功/登录失效
+                    立即返回，让调度循环收成唯一终态。等待按整毫秒推进，
+                    不让浮点截断把 90ms 间隔悄悄吃短。
+                    """
+                    remain = budget.remaining_s()
+                    wait_s = max(0.0, min(float(seconds), remain))
+                    # 请求了等待就必须有推进：亚毫秒余量取 1ms，否则边界泵会空转
+                    wait_ms = int(round(wait_s * 1000)) if wait_s > 0 else 0
+                    if wait_s > 0:
+                        wait_ms = max(1, wait_ms)
+                    deadline_ms = int(round(time.monotonic() * 1000)) + wait_ms
+                    while True:
+                        left_ms = deadline_ms - int(round(time.monotonic() * 1000))
+                        if left_ms <= 0:
+                            break
+                        try:
+                            page.wait_for_timeout(min(left_ms, 50))  # 50ms 一片
+                        except Exception:
+                            break
+                        _settle_pending()
+                        if state["resp_ok"] or state["login_invalid"]:
+                            return
+
+                listeners.append(("request", on_request))
+                listeners.append(("response", on_response))
                 page.on("request", on_request)
+                page.on("response", on_response)
+                armed["on"] = True    # 整个提交阶段受控：在途响应按 request_id 结算
                 _checkpoint_event("watch_started")
                 log("[i] 开始盯按钮")
 
                 while not budget.expired():
+                    # 先结算在途响应：成功/登录失效立即收口，绝不为下一笔再等
+                    _settle_pending()
+                    if state["resp_ok"]:
+                        break
+                    if state["login_invalid"]:
+                        stop_reason = "login_invalid"
+                        break
+
                     btn = page.locator("uni-button").filter(has_text="立即报名")
                     if not btn.count():
                         if time.monotonic() - last_reload >= reload_gap:
                             page.reload(wait_until="domcontentloaded",
                                         timeout=budget.timeout_ms(60000))
-                            budget.sleep(0.25)
+                            _pump_wait(0.25)
                             last_reload = time.monotonic()
                             reload_gap = min(8.0, reload_gap * 1.5)
                         else:
-                            budget.sleep(0.3)
+                            _pump_wait(0.3)
                         continue
 
-                    # 次数上限先于点击检查；已发出的未决请求也不再重发（C03）
-                    if state["pending"] > 0:
-                        stop_reason = "pending_result"
-                        break
-                    if not attempts_allowed(state["attempts"], args.max_attempts):
-                        stop_reason = "max_attempts"
+                    # 多笔未决合法：黄金风暴允许并发在途请求，不因 pending 停手（C03 升级）
+                    if not burst.can_attempt():
+                        if state["attempts"] >= args.max_attempts > 0:
+                            stop_reason = "max_attempts"
+                        else:
+                            stop_reason = ("sign_end" if (sign_end_ts and
+                                           burst.effective_deadline >= sign_end_ts)
+                                           else "retry_duration")
                         break
 
                     # 按钮提前可见也不能提前发请求：业务下界 >= 开放时刻才动手，
@@ -1474,120 +1829,88 @@ def cmd_grab(args):
                             state["last_reason"] = "北京时间暂不可用"
                         break
                     if now_upper < at_ts:
-                        budget.sleep(min(0.25, at_ts - now_upper))
+                        _pump_wait(min(0.25, at_ts - now_upper))
                         continue
                     if now_lower < at_ts:
-                        budget.sleep(min(0.25, at_ts - now_lower))
+                        _pump_wait(min(0.25, at_ts - now_lower))
                         continue
                     if budget.expired():
                         break
 
+                    # 非阻塞提交：点完「确定」立刻回调度循环，不逐笔等响应（黄金风暴时序）
                     round_start = len(admitted_all)
-                    payload, response = None, None
                     aborted = False
-                    armed["on"] = True
                     try:
-                        with page.expect_response(
-                                lambda r: _is_signup_url(str(r.url)),
-                                timeout=budget.timeout_ms(12000)) as info:
-                            btn.first.click(timeout=budget.timeout_ms(3000))
-                            # 打开确认框之后、点「确定」之前再核一次：
-                            # 到期/次数到/还没开放都绝不确认（C02）
-                            if budget.expired():
-                                raise _SubmitAborted("确认前重试窗口已到点")
-                            if not attempts_allowed(state["attempts"], args.max_attempts):
-                                raise _SubmitAborted("确认前已达最大提交次数")
-                            if business_now() < at_ts:
-                                raise _SubmitAborted("确认前还没到开放时间")
-                            page.get_by_text("确定", exact=True).first.click(
-                                timeout=budget.timeout_ms(3000))
-                        response = info.value
-                        payload = response.json()
+                        btn.first.click(timeout=budget.timeout_ms(3000))
+                        # 打开确认框之后、点「确定」之前再核一次：
+                        # 到期/次数到/还没开放都绝不确认（C02）
+                        if budget.expired():
+                            raise _SubmitAborted("确认前重试窗口已到点")
+                        if not burst.can_attempt():
+                            raise _SubmitAborted("确认前已达最大提交次数或窗口关闭")
+                        if business_now() < at_ts:
+                            raise _SubmitAborted("确认前还没到开放时间")
+                        page.get_by_text("确定", exact=True).first.click(
+                            timeout=budget.timeout_ms(3000))
+                    except ClockUnavailable:
+                        raise           # 校时失效不是点击失败：交统一收尾
                     except _SubmitAborted as exc:
                         aborted = True
                         state["last_reason"] = str(exc)
-                    except PlaywrightTimeoutError as exc:
-                        state["last_reason"] = ("响应读取超时" if admitted_all[round_start:]
+                    except PlaywrightTimeoutError:
+                        state["last_reason"] = ("点击确认超时" if admitted_all[round_start:]
                                                 else "点击后没发出提交请求")
                     except Exception as exc:
-                        state["last_reason"] = ("响应读取失败：%s" % type(exc).__name__
+                        state["last_reason"] = ("点击确认失败：%s" % type(exc).__name__
                                                 if admitted_all[round_start:]
                                                 else type(exc).__name__)
-                    finally:
-                        armed["on"] = False
 
                     round_requests = admitted_all[round_start:]
-
-                    # 响应必须对得上本轮承认过的请求，别家活动的响应不得改本场结论
-                    matched = None
-                    if response is not None:
-                        resp_request = getattr(response, "request", None)
-                        if resp_request is not None and id(resp_request) in admitted_ids:
-                            matched = resp_request
-                        elif resp_request is None and round_requests:
-                            # 替身/旧驱动可能不给 response.request：只在唯一请求时认领
-                            matched = round_requests[0] if len(round_requests) == 1 else None
-
-                    if isinstance(payload, dict) and matched is not None:
-                        code = payload.get("code")
-                        state["last_reason"] = "code:%s %s" % (
-                            code, str(payload.get("message") or "")[:30])
-                        state["pending"] = max(0, state["pending"] - 1)
-                        state["resp_ok"] = (code == 1)
-                    elif response is not None and matched is None:
-                        state["last_reason"] = "收到其他请求的响应，本场结论未变"
-
-                    if round_requests:
-                        log("[i] 第 %d 次提交：%s" % (state["attempts"], state["last_reason"]))
-                    elif not aborted:
+                    # 已到响应立即结算；迟到的由下一片事件泵接管
+                    _settle_pending()
+                    if not round_requests and not aborted:
                         log("[i] 本次点击没有发出提交：%s"
                             % (state["last_reason"] or "未点开确认框"))
 
                     if state["resp_ok"]:
                         break
                     if len(round_requests) > 1:
-                        # 页面一次动作真的发了多次：按真实次数记账后停手，不藏成 1 次；
-                        # 未拿到确定结果的那一笔留在 pending，终态会如实说「未确认」
+                        # 页面一次动作真的发了多次：按真实次数记账后继续，不藏成 1 次；
+                        # 未拿到确定结果的那些留在 pending，终态会如实说「未确认」
                         state["last_reason"] = "一次动作发出 %d 次提交" % len(round_requests)
-                        break
-                    if state["pending"] > 0:
-                        # 上一次请求还没有确定结果：不再自动重发
-                        stop_reason = "pending_result"
-                        break
                     # 登录失效是终态：继续刷新只会白跑
-                    if "4001" in state["last_reason"] or "登录" in state["last_reason"] \
-                            or "身份验证" in state["last_reason"]:
+                    if state["login_invalid"]:
                         stop_reason = "login_invalid"
                         break
-                    # 服务端已回成功但页面状态可能滞后：只补 2~3 次轻量确认
-                    for _ in range(3):
-                        if budget.expired():
-                            break
-                        budget.sleep(0.6)
-                        joined_now = is_joined(target["id"], budget=budget)
-                        if joined_now is True:
-                            state["resp_ok"] = state["joined_by_check"] = True
-                            break
-                    if state["resp_ok"]:
+                    if not burst.can_attempt():
+                        if state["attempts"] >= args.max_attempts > 0:
+                            stop_reason = "max_attempts"
+                        else:
+                            stop_reason = ("sign_end" if (sign_end_ts and
+                                           burst.effective_deadline >= sign_end_ts)
+                                           else "retry_duration")
                         break
-                    if budget.expired():
-                        break
-                    # 提交失败后的下一轮节奏：2 秒起、1.5 倍退避、8 秒封顶。
-                    # 等待受 RetryBudget 与 sign_end 共同钳制：窗口剩 1 秒就只等 1 秒。
-                    # 名额已满时不在这段等待里再点，避免 33 次高频连打（RC-05）。
-                    submit_gap = wait_before_next_submit(budget, submit_gap)
-                    if budget.expired():
-                        break
-                    try:
-                        page.reload(wait_until="domcontentloaded",
-                                    timeout=budget.timeout_ms(60000))
-                        budget.sleep(0.3)
-                    except Exception:
-                        state["last_reason"] = state["last_reason"] or "刷新失败"
-                        stop_reason = "process_error"
-                        break
+                    # 下一轮节奏由状态机统一提供：黄金 90ms / 全速 180ms /
+                    # 404 自适应退避 1.6 倍上限 3 秒。等待走短事件泵，
+                    # 响应未到也能继续发下一笔。
+                    gap = burst.interval_s()
+                    _pump_wait(min(max(0.0, gap), max(0.0, budget.remaining_s())))
+                    burst.next_interval_after_wait()
 
-                if state["resp_ok"] or state["joined_by_check"]:
+                # 有界收尾：给在途响应一个短暂结算窗口（最长 1 秒且不越预算），
+                # 成功响应不因刚到停止点就漏掉；到点仍无定论就如实报未确认
+                if state["pending"] > 0 and not budget.expired():
+                    tail_deadline = (time.monotonic()
+                                     + min(1.0, max(0.0, budget.remaining_s())))
+                    while (time.monotonic() < tail_deadline
+                           and state["pending"] > 0
+                           and not state["resp_ok"]
+                           and not state["login_invalid"]):
+                        _pump_wait(0.05)
+
+                if state["login_invalid"]:
+                    stop_reason = "login_invalid"
+                if state["resp_ok"]:
                     return terminal("success")
 
                 # 收尾查询：有剩余预算才查；查询不到不等于没报名
@@ -1598,12 +1921,18 @@ def cmd_grab(args):
                     return terminal("success")
                 if state["pending"] > 0:
                     return terminal("unconfirmed")
-                if stop_reason == "pending_result":
-                    return terminal("unconfirmed")
                 if stop_reason:
                     return terminal(stop_reason)
                 return terminal("sign_end" if state["binding"] == "sign_end" else "retry_duration")
             finally:
+                # 停止/异常路径统一解除监听并失活回调：不留跨计划的残留监听
+                armed["on"] = False
+                armed["dead"] = True
+                for event_name, handler in listeners:
+                    try:
+                        page.remove_listener(event_name, handler)
+                    except Exception:
+                        pass
                 try:
                     browser.close()
                 except Exception:

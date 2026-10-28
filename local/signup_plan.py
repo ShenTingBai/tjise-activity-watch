@@ -37,7 +37,11 @@ SIGNUP_MODES = ("pre_register", "instant_signup", "closed")
 
 # 一次性运行时 checkpoint：第一次写入后固定，迟到/重放事件不得改写；
 # attempts/last_reason 是进度字段，跟随最新一次提交。
-CHECKPOINT_FIELDS = ("run_started_at", "page_opened_at", "watch_started_at", "retry_deadline")
+# retry_deadline 允许单调变大（黄金风暴 404 自适应扩窗只改 worker 有效截止），
+# 但不允许被迟到/重放事件改小——计划快照的 retry_for_s/sign_end/max_attempts
+# 永远冻结在接纳时刻，扩窗绝不改写它们。
+CHECKPOINT_FIELDS = ("run_started_at", "page_opened_at", "watch_started_at")
+GROWABLE_FIELDS = ("retry_deadline",)
 
 
 def parse_timestamp(value: object) -> datetime | None:
@@ -82,6 +86,9 @@ class TaskSpec:
 
     sign_end / retry_for_s / max_attempts 是计划级重试策略：
     同一计划里每场共用策略，sign_end 仍按活动各自的截止时间截断。
+    这四个字段（含 retry_started_at）在接纳时刻冻结，重载不丢、批间不改；
+    黄金风暴 404 自适应扩窗只放宽当前 worker 的有效 deadline，绝不回写
+    本快照、不改计划批次、不越过 sign_end 硬截止，也不改变用户停止语义。
     """
 
     task_id: str
@@ -545,6 +552,13 @@ class PlanCoordinator:
                 if key in CHECKPOINT_FIELDS and (value in (None, "", 0, False)
                                                  or merged.get(key) is not None):
                     continue
+                if key in GROWABLE_FIELDS:
+                    # 自适应扩窗只允许有效截止变大：迟到/重放的更小值不得改小
+                    existing = merged.get(key)
+                    if value in (None, "", 0, False):
+                        continue
+                    if existing is not None and float(value) < float(existing):
+                        continue
                 merged[key] = value
             payload = {
                 "plan_id": self.plan_id,
