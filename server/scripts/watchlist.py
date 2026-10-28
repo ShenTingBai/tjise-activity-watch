@@ -9,6 +9,11 @@ watchlist.json 记的是「人的意愿」。两者的生命周期和回滚方�
     python3 scripts/watchlist.py remove --id <活动id>
     python3 scripts/watchlist.py list
 
+add 时传入的 open_at / lead / window / sign_end 是 runner 的冻结策略起点：
+存下之后不再改写，watchlist_runner 原样交给 grab_signup，25 分钟自适应扩窗
+（黄金风暴 / 404 退避那套 retry 策略）只发生在那一场的执行过程里，不会回写
+清单。sign_end 可选，给了就是报名截止硬上限（grab_signup 的扩窗绝不越过它）。
+
 状态流转：queued（排队）→ running（已拉起抓取）→ done / failed / missed。
 """
 from __future__ import annotations
@@ -106,9 +111,16 @@ def _refresh_card() -> None:
 
 
 def add(activity_id: str, name: str, open_at: str,
-        lead: float = DEFAULT_LEAD, window: float = DEFAULT_WINDOW) -> dict:
+        lead: float = DEFAULT_LEAD, window: float = DEFAULT_WINDOW,
+        sign_end: str = "") -> dict:
     """同一活动重复点「预报名」按覆盖处理，不叠出两条。"""
     start = parse_at(open_at)          # 先校验，避免把写坏的时间存进去
+    end_ts = None
+    if str(sign_end or "").strip():
+        end_ts = parse_at(str(sign_end).strip())
+        # 截止早于开放等于一开跑就过期：拒绝写入，不让清单带着坏策略排班
+        if end_ts <= start:
+            raise RuntimeError("报名截止（sign_end）不能早于开放时间：%s" % sign_end)
     # 老卡片留到第二天再点的情况：窗口已经过去了，排进去只会在下一分钟被标「错过」，
     # 还会给用户发一条莫名其妙的失败提醒。直接拒绝，并说清原因。
     if datetime.now() > start + timedelta(seconds=float(window)):
@@ -124,6 +136,8 @@ def add(activity_id: str, name: str, open_at: str,
             "open_at": open_at,
             "lead": float(lead),
             "window": float(window),
+            # 可选硬截止：空串表示学校没给，grab_signup 按窗口 + 自适应扩窗执行
+            "sign_end": str(sign_end or "").strip(),
             "status": "queued",
             "result": "",
             "started_at": "",
@@ -172,6 +186,8 @@ def main(argv=None) -> int:
     p_add.add_argument("--at", required=True, help="报名开放时间 YYYY-MM-DD HH:MM:SS")
     p_add.add_argument("--lead", type=float, default=DEFAULT_LEAD)
     p_add.add_argument("--window", type=float, default=DEFAULT_WINDOW)
+    p_add.add_argument("--sign-end", default="",
+                       help="可选：报名截止时间（硬上限）YYYY-MM-DD HH:MM:SS")
 
     for name in ("remove", "cancel"):
         p_rm = sub.add_parser(name, help="取消预报名")
@@ -185,7 +201,8 @@ def main(argv=None) -> int:
 
     if args.cmd == "add":
         try:
-            entry = add(args.id, args.name, args.at, args.lead, args.window)
+            entry = add(args.id, args.name, args.at, args.lead, args.window,
+                        args.sign_end)
         except (ValueError, RuntimeError) as exc:
             print("[x] %s" % exc)
             return 1

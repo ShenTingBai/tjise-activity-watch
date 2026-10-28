@@ -19,7 +19,7 @@
 | 群里 @ 查询 | 飞书群 @机器人（同一自建应用，`BOT_ROLE=combined`） | 只读：待开放 / 报名已开放 / 全部，卡片回复，没有任何个人动作 |
 | 私人提醒 | cron 07:05 | 只发 owner 私聊：今天要参加的活动 |
 | 预报名 | owner 私聊卡片按钮（同一自建应用，`BOT_ROLE=combined`） | 点一下排队，可再点取消；群里点会被拒绝 |
-| 到点自动报名 | watchlist_runner（每分钟） | **只执行 owner 自己清单里的场次**，开放时刻点「立即报名」，结果私聊回报 |
+| 到点自动报名 | watchlist_runner（每分钟） | **只执行 owner 自己清单里的场次**，黄金风暴（90ms×10）→ 全速 180ms → 404 自适应抢「立即报名」，结果私聊回报 |
 | 登录态续期 | `tjise-login` 守护进程 | 每 2 小时校验，成功即刷新会话文件 |
 | 失效重登 | `tjise-autologin.timer`（每 5 分钟） | 探针判失效才动作；用满 8h 主动换新；验证码 OCR（ddddocr 主 + Tesseract 兜底），最多 5 次、间隔 30 秒 |
 | 监控告警 | token 探针 / 出网自检 | 连续 2 次失败才私聊告警，同一周期只提醒一次 |
@@ -50,6 +50,16 @@ server/
 - **预报名清单是并发安全的**：`scripts/watchlist.py` 的 `add` / `remove` / `mark` 都走
   `watchlist.lock` 的读改写事务（POSIX `flock`，Windows `msvcrt`），runner 每分钟对齐时
   也按同一把锁写状态；清单 JSON 解析失败会明确报错，不会用空清单覆盖。
+- **抢报名策略与本机同契约**：`deploy/grab_signup.py` 的提交节奏是黄金风暴（开放后
+  0~1.6 秒内 90ms×10）→ 常规全速 180ms → 连续 3 次 404 后 1.6 倍退避（上限 3 秒，
+  自适应扩窗最长到起点起 25 分钟），传入 `--sign-end` 时报名截止是硬上限、扩窗绝不
+  越过。每笔 signUp 请求分配唯一 request_id 并如实计次（点按钮/刷新/查询不计数），
+  响应按 request 归属结算，乱序合法；请求发出拿不到确定应答算「未决」，停止时
+  私聊如实报「结果未确认，请到活动页核对」，不伪造成失败。用户停止（进程被中断）
+  立即收口，已发出的请求不撤回、次数保留。这套策略只作用于 owner 私聊预报名的
+  runner；群查询与 Webhook 推送不受黄金风暴影响，也不携带个人报名状态。
+  清单里 add 时传入的 `open_at/lead/window/sign_end` 是 runner 的冻结策略起点，
+  原样传给抓取脚本；同一 activity-id 单飞，unit 存活时不重复拉起。
 - **unit 名不截断 activity_id**：`watchlist_runner` 用「安全编码 + 完整 id 的 SHA-256 前 8 位」
   生成 systemd unit 与状态文件名，前 8 位相同的两场活动不再串号。
 - **服务器 ZIP 带 provenance**：`tools/release.py` 的 `zip_server()` 会生成

@@ -69,7 +69,13 @@ def unit_active(unit: str) -> bool:
 
 
 def launch(entry: dict, dry: bool) -> bool:
-    """把这一场交给 systemd；退出码写进状态文件，供下一轮判定成败。"""
+    """把这一场交给 systemd；退出码写进状态文件，供下一轮判定成败。
+
+    启动参数是清单里冻结的策略字段（open_at/lead/window/sign_end），
+    原样传给 grab_signup；黄金风暴 / 404 退避的自适应扩窗（retry_deadline
+    最长到起点起 25 分钟）发生在抓取进程内部，不回写清单、也不会让 runner
+    再拉起同一个 activity-id。
+    """
     unit = unit_name(entry)
     code_path = status_file(entry)
     log_path = STATUS_DIR / "grab_signup.log"
@@ -78,13 +84,15 @@ def launch(entry: dict, dry: bool) -> bool:
     except FileNotFoundError:
         pass
 
+    sign_end = str(entry.get("sign_end") or "").strip()
     inner = ("%s %s --activity-id %s --at %s --name %s --lead %s --window %s "
-             ">> %s 2>&1; echo $? > %s"
+             "%s>> %s 2>&1; echo $? > %s"
              % (shlex.quote(PYTHON), shlex.quote(GRAB), shlex.quote(str(entry["id"])),
                 shlex.quote(str(entry.get("open_at") or "")),
                 shlex.quote(str(entry.get("name") or "活动")),
                 shlex.quote(str(entry.get("lead") or wl.DEFAULT_LEAD)),
                 shlex.quote(str(entry.get("window") or wl.DEFAULT_WINDOW)),
+                ("--sign-end %s " % shlex.quote(sign_end)) if sign_end else "",
                 shlex.quote(str(log_path)), shlex.quote(str(code_path))))
 
     if dry:
@@ -129,7 +137,13 @@ def main(argv=None) -> int:
         now = datetime.now()
         entries = wl.load()
         changed = False          # 有状态变化才刷新卡片，别每分钟 PATCH 一次
+        seen_ids = set()         # 同一 activity-id 一轮只执行一次（单飞）
         for e in entries:
+            if e["id"] in seen_ids:
+                # 清单损坏/手改才会出现重复 id：跳过而不是再拉起一个同名 unit
+                print("[!] 清单里 activity-id 重复，跳过重复条目：%s" % e["id"])
+                continue
+            seen_ids.add(e["id"])
             status = e.get("status")
             if status == "queued":
                 try:
@@ -155,6 +169,15 @@ def main(argv=None) -> int:
 
                 if args.dry_run:
                     launch(e, True)
+                    continue
+
+                # 单飞：同名 unit 还活着就绝不重复拉起（runner 重启后清单
+                # 可能还停在 queued）。收编为 running，等它自己写退出码。
+                if unit_active(unit_name(e)):
+                    wl.mark(e["id"], status="running", started_at=wl.now_str(),
+                            attempts=int(e.get("attempts") or 0) + 1)
+                    print("[i] %s 已有存活抓取进程，跳过重复拉起"
+                          % (e.get("name") or e["id"]))
                     continue
 
                 wl.mark(e["id"], status="running", started_at=wl.now_str(),
