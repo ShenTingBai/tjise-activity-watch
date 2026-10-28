@@ -1,12 +1,14 @@
 /**
- * 飞书机器人：一个进程只扮演一种角色，角色由 BOT_ROLE 显式声明。
+ * 飞书机器人：唯一有效角色 combined，一个长连接进程同时服务群查询与 owner 私聊。
  *
- *   BOT_ROLE=group_query   —— 群里被 @ 时只读查询公开清单，任何个人动作一律拒绝
- *   BOT_ROLE=private_owner —— 只服务 PRIVATE_OWNER_OPEN_ID 本人的私聊，才允许预报名/报名动作
+ *   BOT_ROLE=combined —— 按 chat_type 分流两个入口：
+ *     群消息：必须被 @，只走公开 view 查询，个人动作（mine / g: / u:）一律拒绝；
+ *     私聊消息：先过 PRIVATE_OWNER_OPEN_ID 与 owner chat_id 校验，才允许个人查询/报名。
  *
- * 为什么必须显式声明：以前一个进程同时拥有「群查询」和「owner 私聊」两条权限，
- * 靠一条 chat_type 判断分流。任何一次判断写漏（字段改名、事件结构变化、新入口）
- * 都会把个人权限漏给公共群。现在缺 BOT_ROLE 直接拒绝启动，
+ * 为什么只有一个有效角色：同一个飞书自建应用的 App ID/Secret 只能维持一条长连接，
+ * 拆成 group_query / private_owner 两个进程会互相抢事件。权限边界不靠进程分离，
+ * 靠会话类型、@ 状态、sender open_id 与 owner chat_id 分层把关——任何一层写漏，
+ * fail-closed 都指向「拒绝」而不是「放行」。缺 BOT_ROLE 直接拒绝启动，
  * 「少一个环境变量就少一个权限」，而不是「少一个环境变量就多一份权限」。
  *
  * 走「长连接」模式，不需要公网域名和证书。
@@ -24,12 +26,14 @@ const APP_DIR = process.env.APP_DIR || '/root/tjise-activity-watch';
 const PY = process.env.PY_BIN || '/usr/bin/python3';
 const USERS_FILE = path.join(__dirname, 'data', 'users.json');
 
-// 两个入口角色。名字会写进文档与 systemd 单元，改动要同步 docs/FEISHU_BOT.md。
-const ROLE_GROUP = 'group_query';
-const ROLE_OWNER = 'private_owner';
-const ROLES = [ROLE_GROUP, ROLE_OWNER];
+// 唯一有效角色。名字会写进文档与 systemd 单元，改动要同步 docs/FEISHU_BOT.md。
+const ROLE_COMBINED = 'combined';
+const ROLES = [ROLE_COMBINED];
 const BOT_ROLE = String(process.env.BOT_ROLE || '').trim();
 const ROLE_OK = ROLES.includes(BOT_ROLE);
+// 过渡期旧值：曾把同一应用拆成两个长连接角色，同 App 双进程会互相抢事件。
+// 旧值不再启动，只提示改用 combined；其它非法值走下面的通用拒绝。
+const LEGACY_ROLES = ['group_query', 'private_owner'];
 
 if (!APP_ID || !APP_SECRET) {
   console.error('缺少 FEISHU_APP_ID / FEISHU_APP_SECRET');
@@ -39,8 +43,13 @@ if (!APP_ID || !APP_SECRET) {
 if (!ROLE_OK) {
   // fail-closed：不猜、不默认、不「先跑起来再说」。
   // 一个拥有报名权限的机器人因为少写一行环境变量而静默上线，是最坏的一种事故。
-  console.error('BOT_ROLE 缺失或非法：当前 ' + JSON.stringify(BOT_ROLE)
-    + '，必须是 ' + ROLES.join(' | ') + '；拒绝启动');
+  if (LEGACY_ROLES.includes(BOT_ROLE)) {
+    console.error('BOT_ROLE=' + BOT_ROLE + ' 是拆分后的旧值：同一个飞书应用只保留一个长连接进程，'
+      + '群查询与 owner 私聊已合并，改用 BOT_ROLE=combined；拒绝启动');
+  } else {
+    console.error('BOT_ROLE 缺失或非法：当前 ' + JSON.stringify(BOT_ROLE)
+      + '，必须是 ' + ROLES.join(' | ') + '；拒绝启动');
+  }
   process.exit(1);
 }
 
@@ -461,11 +470,12 @@ function isAddressedToBot(msg, chatType, botOpenId) {
   });
 }
 
-/** 角色能接的会话类型：群入口只接群，owner 入口只接私聊。
- *  这条判断放在最外层，任何一类会话进错进程都在读消息之前就被挡住，
+/** combined 角色能接的会话类型：群与私聊都由同一个长连接分流，
+ *  除此之外的会话类型（事件结构变化、模拟事件）一律拒绝。
+ *  这条判断放在最外层，非群/私聊事件在读消息之前就被挡住，
  *  不需要依赖后面的 view 分支去兜底。 */
 function roleAcceptsChat(chatType) {
-  return BOT_ROLE === ROLE_GROUP ? chatType === 'group' : chatType === 'p2p';
+  return chatType === 'group' || chatType === 'p2p';
 }
 
 /** owner 私聊会话是否已记录、是否与当前会话一致。
@@ -492,19 +502,21 @@ function ownerCardActionAllowed(data) {
   return !!owner && operator === owner && chat.known && chat.match;
 }
 
-/** 卡片动作允许的视图：群入口没有 mine，个人视图只存在于 owner 私聊。 */
-function allowedViews() {
-  return BOT_ROLE === ROLE_GROUP
-    ? ['pending', 'open', 'all', 'menu']
-    : ['pending', 'open', 'all', 'menu', 'mine'];
+/** 卡片动作允许的视图按会话类型分流：个人视图 mine 只存在于 owner 私聊，
+ *  群会话与会话类型未知的场合只有公开视图（fail-closed 指向拒绝）。 */
+function allowedViews(chatType) {
+  return chatType === 'p2p'
+    ? ['pending', 'open', 'all', 'menu', 'mine']
+    : ['pending', 'open', 'all', 'menu'];
 }
 
 /** 卡片按钮点击：按 value 重新查一次，就地更新卡片。
  *
- *  两种角色共用这一个回调，但门禁完全不同：
- *  - group_query：v:* 可以，g:/u: 一律拒绝（群里没有个人动作）；
- *  - private_owner：先过三重一致（点击人=owner、会话=已记录的 owner 私聊），
- *    通过后才区分 v:* 与 g:/u:*。
+ *  combined 的一个回调按 chat_type 分层设门：
+ *  - 非 owner 私聊（群或会话类型未知）：g:/u: 压根不进 handleGrabAction，
+ *    v:mine 不在视图集里（群里没有个人动作）；v:* 公开视图放行；
+ *  - owner 私聊：先过三重一致（点击人=owner、会话=已记录的 owner 私聊），
+ *    通过后才区分 v:* 与 g:/u:*，g:/u: 进 handleGrabAction 还会再校验一次。
  */
 async function handleCardAction(data) {
   try {
@@ -517,14 +529,18 @@ async function handleCardAction(data) {
       text = text.slice(1, -1).trim();
     }
     const isGrab = text.startsWith('g:') || text.startsWith('u:');
+    // 卡片落在哪种会话里由飞书回调的 chat_type 决定；缺失时按非私聊处理，
+    // 个人动作因此默认被拒（fail-closed），公开视图不受影响。
+    const chatType = String(((data && data.context) || {}).chat_type || '');
+    const isOwnerP2p = chatType === 'p2p';
 
-    if (BOT_ROLE === ROLE_GROUP && isGrab) {
-      // 群入口永远不进 handleGrabAction：不是「校验后拒绝」，是压根不进去
-      log('grab action denied: group_query role');
+    if (isGrab && !isOwnerP2p) {
+      // 群（或会话类型未知）永远不进 handleGrabAction：不是「校验后拒绝」，是压根不进去
+      log('grab action denied: grab requires owner p2p chat');
       return { toast: { type: 'error', content: GRAB_GROUP_DENIED } };
     }
 
-    if (BOT_ROLE === ROLE_OWNER && !ownerCardActionAllowed(data)) {
+    if (isOwnerP2p && !ownerCardActionAllowed(data)) {
       // 卡片可以被转发，别人点到「报名中」也不该拿到 owner 的会话上下文
       log('card action denied: operator or chat is not the configured owner');
       return { toast: { type: 'error', content: GRAB_DENIED } };
@@ -533,15 +549,15 @@ async function handleCardAction(data) {
     const m = text.match(/v:([A-Za-z]+)/);
     const view = m ? m[1].toLowerCase() : 'pending';
     log('card action:', JSON.stringify(raw), '-> text:', text, '-> view:', view,
-      '-> role:', BOT_ROLE);
+      '-> chat:', chatType || 'unknown', '-> role:', BOT_ROLE);
 
     // 预报名 / 取消预报名：value 是 g:<base64> 或 u:<活动id>，
-    // 只有 private_owner 角色能走到这里，handleGrabAction 里还会再校验一次。
+    // 只可能是 owner 私聊（上面已挡掉其它场合），handleGrabAction 里还会再校验一次。
     if (isGrab) {
       return await handleGrabAction(data, text);
     }
 
-    if (!allowedViews().includes(view)) {
+    if (!allowedViews(chatType).includes(view)) {
       return { toast: { type: 'info', content: '这个按钮暂时没做' } };
     }
 
@@ -583,11 +599,11 @@ async function handleMessage(data) {
     ? data.sender.sender_id.open_id
     : '';
 
-  // 角色门禁：群查询进程只处理群消息；owner 进程只处理 owner 本人的私聊。
-  // 放在最前面，后面所有分支都可以假定「会话类型已经被角色确认过」。
+  // 会话类型门禁：combined 只受理群与私聊，其它类型在读内容之前就挡掉。
+  // 放在最前面，后面所有分支都可以假定「会话类型已经确认过」。
   if (!roleAcceptsChat(chatType)) {
     log('skip message: chat type not allowed for role', BOT_ROLE, chatType);
-    // 不回复，但记为「处理过」：飞书重投同一条不属于本角色的消息没有意义，
+    // 不回复，但记为「处理过」：飞书重投同一条不受理的消息没有意义，
     // 让它反复重投只会在日志里刷屏。
     return true;
   }
@@ -599,7 +615,7 @@ async function handleMessage(data) {
 
   const { view, type } = parseIntent(text);
 
-  if (BOT_ROLE === ROLE_GROUP) {
+  if (chatType === 'group') {
     // 群入口：不写 users.json（那是私聊收件人表），不查任何个人视图。
     log('query:', view, type || '-', '| group |', senderOpenId || 'no-openid',
       '| raw:', text.slice(0, 30));
@@ -613,7 +629,7 @@ async function handleMessage(data) {
     return await answer(chatId, view, type);
   }
 
-  // owner 私聊入口
+  // owner 私聊入口（roleAcceptsChat 已确认 chatType 只可能是 p2p）
   const ownerId = String(process.env.PRIVATE_OWNER_OPEN_ID || '').trim();
   if (!isPrivateOwner(chatType, senderOpenId, ownerId)) {
     log('private message denied: sender is not the configured owner');
@@ -641,8 +657,8 @@ async function handleMessage(data) {
   return await answer(chatId, effectiveView, type);
 }
 
-/** 查询并回复（卡片优先、纯文本兜底）。两个角色共用，保证同一批数据两类会话
- *  看到的版式一致；角色差异只体现在「能查哪些视图」，不体现在渲染上。 */
+/** 查询并回复（卡片优先、纯文本兜底）。两个入口共用，保证同一批数据两类会话
+ *  看到的版式一致；入口差异只体现在「能查哪些视图」，不体现在渲染上。 */
 async function answer(chatId, view, type) {
   // 先用卡片，失败再退回纯文本
   if (view !== 'types') {
@@ -689,7 +705,7 @@ const dispatcher = new lark.EventDispatcher({}).register({
       return;
     }
 
-    // 会话类型门禁在「读内容」之前：进错进程的消息连日志正文都不会被解析
+    // 会话类型门禁在「读内容」之前：非群/私聊事件连日志正文都不会被解析
     const chatType = msg.chat_type || 'group';
     if (!roleAcceptsChat(chatType)) {
       log('skip message: chat type not allowed for role', BOT_ROLE, chatType);
@@ -735,22 +751,20 @@ if (!ROLE_OK) {
   (async () => {
     let failed = 0;
     console.log('== 角色门禁（BOT_ROLE=' + BOT_ROLE + '）==');
-    console.log('  允许的会话：' + (BOT_ROLE === ROLE_GROUP ? 'group（必须 @ 我）' : 'p2p（只认 owner）'));
-    console.log('  允许的视图：' + allowedViews().join(', '));
+    console.log('  允许的会话：group（必须 @ 我）与 p2p（只认 owner）');
+    console.log('  允许的视图：群 [' + allowedViews('group').join(', ')
+      + ']｜owner 私聊 [' + allowedViews('p2p').join(', ') + ']');
 
     const roleCases = [
-      ['group', ROLE_GROUP, true],
-      ['p2p', ROLE_GROUP, false],
-      ['group', ROLE_OWNER, false],
-      ['p2p', ROLE_OWNER, true],
+      ['group', true],
+      ['p2p', true],
+      ['channel', false],   // 未知会话类型 fail-closed
+      ['', false],
     ];
-    for (const [chatType, role, want] of roleCases) {
-      // 用真实判断函数 + 当前进程角色比对，角色不符的用例只报告不判失败
+    for (const [chatType, want] of roleCases) {
       const got = roleAcceptsChat(chatType);
-      const expect = role === BOT_ROLE ? want : null;
-      console.log('  ' + chatType + ' 在 ' + role + ' 下 -> ' + got
-        + (expect === null ? '（非当前角色，仅展示）' : '（期望 ' + expect + '）'));
-      if (expect !== null && got !== expect) failed++;
+      console.log('  ' + JSON.stringify(chatType) + ' -> ' + got + '（期望 ' + want + '）');
+      if (got !== want) failed++;
     }
 
     console.log('== parseIntent ==');
@@ -794,41 +808,68 @@ if (!ROLE_OK) {
     }
 
     console.log('== 卡片按钮回调（模拟）==');
-    // owner 角色要先有「已记录的 owner 私聊会话」才可能通过门禁；
-    // 群查询角色不需要任何个人数据，所以两边共用一份模拟数据即可。
-    const canDriveCards = BOT_ROLE === ROLE_GROUP || !!ownerP2pChatId();
-    if (!canDriveCards) {
-      console.log('  （没有 owner 私聊记录，跳过 v:* 实测；这是首次启动的正常状态）');
+    const btnSamples = ['v:pending', 'v:open', 'v:all', 'v:menu', '"v:open"', ' v:all ',
+      'v:mine', 'v:unknown', ''];
+    // 群会话面：不需要任何个人数据，公开视图可用、mine 一律没有
+    for (const v of btnSamples) {
+      const r = await handleCardAction({
+        action: { value: v },
+        context: { chat_type: 'group', open_chat_id: 'oc_group_selftest' },
+        operator: { open_id: 'ou_any_member' },
+      });
+      const hasCard = !!(r && r.card && r.card.data);
+      const title = hasCard ? r.card.data.header.title.content : '-';
+      console.log('  [group] ' + JSON.stringify(v) + ' -> 卡片=' + hasCard
+        + ' 标题=' + title + ' toast=' + (r.toast ? r.toast.content : '-'));
+      // 带引号/空格的值也必须解析出正确视图
+      const wantOpen = /open/.test(v);
+      const wantAll = /all/.test(v);
+      if (wantOpen && !/报名已开放/.test(title)) failed++;
+      if (wantAll && !/报名已开放/.test(title)) failed++;
+      if (v === 'v:mine' && hasCard) failed++;   // 群会话没有个人视图
+    }
+    // owner 私聊会话面：要先有「已记录的 owner 私聊会话」才可能通过门禁；
+    // 首次启动还没有记录，跳过属正常状态。
+    const ownerP2p = ownerP2pChatId();
+    if (!ownerP2p) {
+      console.log('  （没有 owner 私聊记录，跳过私聊面 v:* 实测；这是首次启动的正常状态）');
     } else {
-      const btnSamples = ['v:pending', 'v:open', 'v:all', 'v:menu', '"v:open"', ' v:all ',
-        'v:mine', 'v:unknown', ''];
       for (const v of btnSamples) {
         const r = await handleCardAction({
           action: { value: v },
-          context: { open_chat_id: BOT_ROLE === ROLE_GROUP ? 'oc_group_selftest' : ownerP2pChatId() },
+          context: { chat_type: 'p2p', open_chat_id: ownerP2p },
           operator: { open_id: String(process.env.PRIVATE_OWNER_OPEN_ID || 'ou_selftest') },
         });
         const hasCard = !!(r && r.card && r.card.data);
         const title = hasCard ? r.card.data.header.title.content : '-';
-        console.log('  ' + JSON.stringify(v) + ' -> 卡片=' + hasCard
+        console.log('  [p2p] ' + JSON.stringify(v) + ' -> 卡片=' + hasCard
           + ' 标题=' + title + ' toast=' + (r.toast ? r.toast.content : '-'));
-        // 带引号/空格的值也必须解析出正确视图
         const wantOpen = /open/.test(v);
         const wantAll = /all/.test(v);
         if (wantOpen && !/报名已开放/.test(title)) failed++;
         if (wantAll && !/报名已开放/.test(title)) failed++;
-        // 群查询角色没有 mine；owner 角色才有
-        if (v === 'v:mine' && BOT_ROLE === ROLE_GROUP && hasCard) failed++;
-        if (v === 'v:mine' && BOT_ROLE === ROLE_OWNER && !hasCard) failed++;
+        // 私聊面 mine：owner 已配置且会话已记录时必须出卡片
+        if (v === 'v:mine' && !hasCard) failed++;
       }
     }
 
     console.log('== 个人动作门禁 ==');
     const grabValue = 'g:' + Buffer.from(JSON.stringify({ i: 'evt_selftest', n: 'x', t: '2026-10-30 12:00:00' }))
       .toString('base64').replace(/=+$/, '');
+    // 群会话：压根不进 handleGrabAction，报「群里只提供查询」
+    const grabGroup = await handleCardAction({
+      action: { value: grabValue },
+      context: { chat_type: 'group', open_chat_id: 'oc_group_selftest' },
+      operator: { open_id: 'ou_not_owner' },
+    });
+    const groupDenied = !!(grabGroup && grabGroup.toast && grabGroup.toast.type === 'error');
+    console.log('  群会话点预报名按钮 -> 拒绝=' + groupDenied
+      + ' toast=' + (grabGroup && grabGroup.toast ? grabGroup.toast.content : '-'));
+    if (!groupDenied) failed++;
+    // 私聊会话但点击人不是 owner：三重校验拒绝
     const grabRes = await handleCardAction({
       action: { value: grabValue },
-      context: { open_chat_id: 'oc_selftest' },
+      context: { chat_type: 'p2p', open_chat_id: 'oc_not_owner_chat' },
       operator: { open_id: 'ou_not_owner' },
     });
     const grabDenied = !!(grabRes && grabRes.toast && grabRes.toast.type === 'error');
@@ -874,17 +915,16 @@ if (!ROLE_OK) {
       process.exit(1);
       return;
     }
-    // owner 入口没有 owner 身份就等于「谁都能用的报名机器人」，直接不起来。
-    if (BOT_ROLE === ROLE_OWNER
-      && !String(process.env.PRIVATE_OWNER_OPEN_ID || '').trim()) {
-      log('[bot] private_owner 角色缺少 PRIVATE_OWNER_OPEN_ID，拒绝启动');
-      process.exit(1);
-      return;
+    // combined 同时服务群与 owner 私聊：没有 owner 身份时私聊入口整体 fail-closed
+    // （isPrivateOwner / ownerCardActionAllowed 对空 ownerId 一律拒绝），
+    // 群查询不受影响，所以只告警不退出——但绝不能静默，否则私聊「坏了」没人知道。
+    if (!String(process.env.PRIVATE_OWNER_OPEN_ID || '').trim()) {
+      log('[bot] combined 未配置 PRIVATE_OWNER_OPEN_ID：群查询可用，owner 私聊全部拒绝');
     }
     try {
       await ws.start({ eventDispatcher: dispatcher });
       log('[bot] 长连接已启动', APP_ID, '｜角色', BOT_ROLE,
-        BOT_ROLE === ROLE_GROUP ? '｜群里只在被 @ 时回答查询' : '｜只服务 owner 私聊');
+        '｜群里只在被 @ 时回答查询，owner 私聊才允许个人动作');
     } catch (e) {
       log('[bot] 启动失败：', e && e.message ? e.message : e);
       process.exit(1);

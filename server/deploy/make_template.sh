@@ -48,8 +48,8 @@ cat > "$STAGE/config.json" <<'JSON'
     "webhook_url": "<你的飞书群自定义机器人 Webhook 地址>",
     "secret": "",
     "feishu_app": {
-      "app_id": "<owner 私聊应用的 App ID>",
-      "app_secret": "<owner 私聊应用的 App Secret>"
+      "app_id": "<同一个自建应用的 App ID：群查询与 owner 私聊共用>",
+      "app_secret": "<同一个自建应用的 App Secret>"
     },
     "users_file": "/root/tjise-bot/data/users.json",
     "private_chat_id": ""
@@ -62,43 +62,24 @@ cat > "$STAGE/config.json" <<'JSON'
 }
 JSON
 
-# 三个机器人，三个角色单元。**不再提供**没有 BOT_ROLE 的单服务模板：
-# 新版 bot.js 缺角色会直接拒绝启动，留一个「看起来能跑」的旧单元只会浪费时间。
-cat > "$STAGE/deploy/tjise-bot-group.service" <<'UNIT'
+# 一个 combined 长连接单元。**不再提供**没有 BOT_ROLE 的旧单元，也**不提供**
+# group_query / private_owner 拆分单元：同一个 App ID/Secret 只能跑一条长连接，
+# 双单元会互相抢事件，而且新版 bot.js 会把这两个旧值直接拒绝启动。
+cat > "$STAGE/deploy/tjise-bot.service" <<'UNIT'
 [Unit]
-Description=Campus activity Feishu bot (group query, read-only)
+Description=Campus activity Feishu bot (combined: group query + owner private chat)
 After=network.target
 
 [Service]
 Type=simple
 WorkingDirectory=/root/tjise-bot
-# 群查询角色：只回答被 @ 的群消息，任何预报名/报名动作一律拒绝
-Environment=BOT_ROLE=group_query
-Environment=FEISHU_APP_ID=<群查询应用的 App ID>
-Environment=FEISHU_APP_SECRET=<群查询应用的 App Secret>
-Environment=APP_DIR=/root/tjise-activity-watch
-ExecStart=/usr/bin/node bot.js
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-cat > "$STAGE/deploy/tjise-bot-owner.service" <<'UNIT'
-[Unit]
-Description=Campus activity Feishu bot (owner private chat)
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/root/tjise-bot
-# owner 私聊角色：只处理 PRIVATE_OWNER_OPEN_ID 本人的私聊，才有预报名/报名动作
-Environment=BOT_ROLE=private_owner
-Environment=FEISHU_APP_ID=<owner 私聊应用的 App ID>
-Environment=FEISHU_APP_SECRET=<owner 私聊应用的 App Secret>
+# combined：同一个自建应用，一个长连接进程按 chat_type 分流两个入口——
+# 群里必须 @ 才回答公开查询（只读）；owner 私聊才允许个人查询与预报名/报名动作。
+Environment=BOT_ROLE=combined
+Environment=FEISHU_APP_ID=<同一个自建应用的 App ID>
+Environment=FEISHU_APP_SECRET=<同一个自建应用的 App Secret>
 # 私人查询的主人（飞书 open_id）。它和 BOT_OPEN_ID 是两个不同的值；
-# 不填 = 该实例直接拒绝启动（不会退化成「谁都能报名」）。
+# 不填 = 群查询可用但 owner 私聊整体拒绝（不会退化成「谁都能报名」）。
 Environment=PRIVATE_OWNER_OPEN_ID=<你的 open_id>
 Environment=APP_DIR=/root/tjise-activity-watch
 ExecStart=/usr/bin/node bot.js
@@ -129,10 +110,11 @@ cat > "$STAGE/README.md" <<'MD'
 ## 关键约定
 
 - 所有 `<占位符>` 都必须换成你自己的
-- **三个机器人，三条权限边界**：群自定义机器人（Webhook）只推送；
-  `tjise-bot-group`（`BOT_ROLE=group_query`）只读群查询；
-  `tjise-bot-owner`（`BOT_ROLE=private_owner`）只服务 owner 私聊。
-  旧版单实例 `tjise-bot.service` 没有 `BOT_ROLE`，新版会直接拒绝启动，别再沿用。
+- **三个业务入口，两个通道**：群自定义机器人（Webhook）只推送，收不到任何事件；
+  自建应用 + `tjise-bot.service`（`BOT_ROLE=combined`）一个进程承载两个入口——
+  群 @ 只读查询，owner 私聊才允许个人查询与报名动作。
+  同一个 App ID/Secret 只能跑一条长连接，**不要**再拆
+  `group_query` / `private_owner` 两个单元（旧值会被拒绝启动）。
 - `PRIVATE_OWNER_OPEN_ID` 是「唯一的主人」，和 `BOT_OPEN_ID`（机器人自己）不是一回事；
   07:05 的私人提醒 cron 也要注入同一个值，否则会出现「群里不回答但每天照样私发」的半开状态
 - 动态监测 `scripts/activity_watch.py` 由 cron 每分钟唤醒，自己按

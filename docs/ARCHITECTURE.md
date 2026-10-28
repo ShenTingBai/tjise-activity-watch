@@ -1,10 +1,11 @@
 # 架构与数据流
 
-服务器上一共五个 systemd 服务（含两个机器人角色实例）、一个 timer、十一条 cron。所有脚本都跑在 `/root/tjise-activity-watch`，
+服务器上一共四个 systemd 服务（含一个飞书机器人进程，单应用 combined 双入口）、一个 timer、十一条 cron。所有脚本都跑在 `/root/tjise-activity-watch`，
 只有登录态文件放在 `/root/tjise-login`，机器人跑在 `/root/tjise-bot`。
 
-三个机器人角色对应三条权限边界：**自动推送只发消息、群查询只回答问题、owner 私聊才动手**。
-它们共用同一份「学校公开活动」数据，但不共享任何个人执行状态。
+三个业务入口对应三条权限边界：**自动推送只发消息、群查询只回答问题、owner 私聊才动手**。
+其中群 @ 查询与 owner 私聊由**同一个飞书自建应用**承载，`BOT_ROLE=combined` 的单个长连接进程按
+`chat_type` 分流；三个入口共用同一份「学校公开活动」数据，但不共享任何个人执行状态。
 
 ## 认证边界（谁登录、谁能做什么）
 
@@ -14,8 +15,7 @@
 |---|---|---|---|---|
 | 本机版 GUI/CLI | 使用者本人手动登录（浏览器输入，密码不落盘） | 本人账号的活动与报名状态 | 本人账号的报名计划 | 代他人报名、批量提交 |
 | 群 webhook 推送 | 服务器上的部署者会话 | 公开活动字段 | 只发消息 | 任何报名动作 |
-| 群 @ 查询机器人 | 服务器上的部署者会话 | 公开活动字段 | 只读回答 | 任何报名动作、收集成员凭证 |
-| owner 私聊机器人 | 服务器上的部署者会话 | 部署者本人的预报名清单 | 部署者本人的报名与取消 | 替群成员报名 |
+| 自建应用机器人（combined） | 服务器上的部署者会话 | 群事件：公开活动字段；owner p2p：本人清单 | 群 @ 只读回答；p2p 本人报名与取消 | 群内任何报名动作、替群成员报名 |
 
 要点：**群成员不登录学校系统、也不向机器人提供任何学校凭证**；服务器仍需部署者会话才能
 查询公开活动。群查询不是"匿名访问学校接口"，而是部署者会话的只读代答。私聊动作只认
@@ -47,8 +47,8 @@
     activity_watch.py ──► run.send_watch_events ──► 群卡片   │
     scan.py（临近提醒）─────────────────┘                    │
                          │                                   │
-    bot.js（group_query，只读）── 群 @ 查询 ──► query.py ─────┘
-    bot.js（private_owner）── owner 私聊/按钮 ──► watchlist.py ──► watchlist_runner.py
+    bot.js（combined，单进程）── 群 @ 只读查询 ──► query.py ─────┘
+                              └── owner p2p 按钮 ──► watchlist.py ──► watchlist_runner.py
                                                                         │
                                                           到点 systemd-run grab_signup.py
                                                                         │
@@ -79,7 +79,7 @@
 | `server/deploy/auto_login.py` | 失效时无人值守重登：验证码 OCR + 页面提交 + 原子写会话 | timer（5 分钟） |
 | `server/deploy/grab_signup.py` | 到点进详情页点「立即报名」，结果私聊回报 | watchlist_runner |
 | `server/deploy/set_credentials.py` | 交互写入 `credentials.json`（唯一放账号密码的地方） | 人工一次 |
-| `server/bot/bot.js` | 飞书长连接：`BOT_ROLE=group_query` 群只读查询 / `BOT_ROLE=private_owner` owner 私聊动作 | systemd（两个实例） |
+| `server/bot/bot.js` | 飞书长连接：`BOT_ROLE=combined` 单进程按 `chat_type` 分流——群 @ 只读查询 / owner p2p 个人动作 | systemd（一个实例） |
 
 ## 接口清单
 

@@ -10,15 +10,15 @@
 
 ## 它做什么
 
-三个机器人，三条权限边界：**自动推送只发消息、群查询只回答问题、owner 私聊才动手**。
+三个业务入口，两条通道：**自动推送只发消息、群查询只回答问题、owner 私聊才动手**。群查询与 owner 私聊由**同一个飞书自建应用**、一个长连接进程分流（见 [docs/FEISHU_BOT.md](../docs/FEISHU_BOT.md)）。
 
 | 能力 | 触发 | 说明 |
 |------|------|------|
 | 定时日报 | cron 07:00 / 10:30 / 16:30 / 21:30 | 群卡片 + 给 owner 私发带「预报名」按钮的卡片 |
 | 动态发现 | cron 每分钟唤醒，自行控频 | `activity_watch.py`：新发布 / 转开放 / 改期才发一条；不报名、不碰个人清单 |
-| 群里 @ 查询 | 飞书群 @机器人（`BOT_ROLE=group_query`） | 只读：待开放 / 报名已开放 / 全部，卡片回复，没有任何个人动作 |
+| 群里 @ 查询 | 飞书群 @机器人（同一自建应用，`BOT_ROLE=combined`） | 只读：待开放 / 报名已开放 / 全部，卡片回复，没有任何个人动作 |
 | 私人提醒 | cron 07:05 | 只发 owner 私聊：今天要参加的活动 |
-| 预报名 | owner 私聊卡片按钮（`BOT_ROLE=private_owner`） | 点一下排队，可再点取消；群里点会被拒绝 |
+| 预报名 | owner 私聊卡片按钮（同一自建应用，`BOT_ROLE=combined`） | 点一下排队，可再点取消；群里点会被拒绝 |
 | 到点自动报名 | watchlist_runner（每分钟） | **只执行 owner 自己清单里的场次**，开放时刻点「立即报名」，结果私聊回报 |
 | 登录态续期 | `tjise-login` 守护进程 | 每 2 小时校验，成功即刷新会话文件 |
 | 失效重登 | `tjise-autologin.timer`（每 5 分钟） | 探针判失效才动作；用满 8h 主动换新；验证码 OCR（ddddocr 主 + Tesseract 兜底），最多 5 次、间隔 30 秒 |
@@ -87,8 +87,8 @@ python3 scripts/watchlist.py list            # 看预报名清单
 python3 scripts/selfcheck.py                 # 运行时自检
 python3 tests/test_endpoints.py              # 站点地址测试（离线）
 python3 -m unittest tests.test_activity_watch -v   # 动态发现边界测试（离线）
-node bot/test_bot_runtime.js                 # 机器人角色门禁测试（离线）
-BOT_ROLE=group_query node bot/bot.js --selftest    # 打印该角色允许/拒绝的事件类型
+node bot/test_bot_runtime.js                 # 机器人 combined 双入口测试（离线）
+BOT_ROLE=combined node bot/bot.js --selftest      # 打印允许/拒绝的事件类型
 ```
 
 ## 配置
@@ -97,7 +97,7 @@ BOT_ROLE=group_query node bot/bot.js --selftest    # 打印该角色允许/拒�
 字段含义、默认值、环境变量与三套可抄示例见 [docs/CONFIG.md](../docs/CONFIG.md)；
 飞书应用怎么建、开哪些权限、订阅什么事件见 [docs/FEISHU_BOT.md](../docs/FEISHU_BOT.md)。
 
-`PRIVATE_OWNER_OPEN_ID` 决定私聊只发给谁，必须与 `bot/data/users.json` 里那条 p2p 记录对得上，否则私聊通道静默关闭。
+`PRIVATE_OWNER_OPEN_ID` 决定私聊只认谁，必须与 `bot/data/users.json` 里那条 p2p 记录对得上，否则 owner 私聊整体拒绝（群查询不受影响）。
 
 ## 文档
 

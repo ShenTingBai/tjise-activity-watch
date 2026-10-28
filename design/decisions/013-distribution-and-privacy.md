@@ -61,6 +61,19 @@ CHANGELOG 与配图不入包。
 部署者本人。完整表格见 [ARCHITECTURE.md](../../docs/ARCHITECTURE.md) 与
 [FEISHU_BOT.md](../../docs/FEISHU_BOT.md)。
 
+### 4.1 纠正：三个业务入口 ≠ 三个飞书应用（2026-10-28，计划 20261028-feishu-single-app-dual-entry）
+
+- **单一自建应用承载群查询与 owner 私聊**：群 @ 查询与私聊动作同属一个飞书自建应用，
+  `BOT_ROLE=combined` 一个长连接进程按 `chat_type` 分流；Webhook 自定义机器人仍只是
+  单向推送通道，无入站事件。三个业务入口由两条通道承载，不是三个应用。
+- **同一 App 只能一条长连接**：同 App ID/Secret 开两个长连接进程会互相抢事件（同一件事
+  被各答一次，或一边永远收不到），所以拆分期的 `group_query` / `private_owner` 双实例是
+  错误形态；旧值现在拒绝启动并提示改用 `combined`。
+- **安全边界不靠进程隔离**：群事件必须被 @ 且 `chat_type=group` 才回公开查询、不写
+  `users.json`、卡片无个人视图；owner p2p 才过 `isPrivateOwner` /
+  `ownerCardActionAllowed` / `handleGrabAction` 三重校验；非 owner p2p 固定拒绝。
+  数据边界与披露不变。
+
 ### 5. 条款同意策略（本机版）
 
 - 首次需要学校动作（登录/校验/列表/报名）且未同意时，弹《使用条款与隐私告知》；
