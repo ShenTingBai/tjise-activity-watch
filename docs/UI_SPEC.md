@@ -544,6 +544,47 @@
    **不得** `setBusy(true)`、不得把任务从终态回写成旧 running/queued 进度——此时没有
    第二个 `plan_done` 会再来解锁；「提交中早到事件 + ack」的忙态路径保持不变。
 
+### 5.18 完整安装器更新七态（现行验收契约，2026-10-28）
+
+帮助「版本与更新」区在 §5.15 的手动检查之上，增加**完整安装器下载并安装**流程。七态
+（检查 / 可用 / 确认 / 下载 / 校验 / 安装 / 失败）是验收口径，**不是**把「打开发布页」
+说成自动更新成功——发布页按钮仍是打开固定网页，永不等于已更新。
+
+1. **状态集与唯一动作**：`idle → checking →（current | preview | unavailable | error |
+   available | no_installer）`；有安装器时 `available → confirm → downloading → verifying →
+   ready_to_install → launching`，任一步可 `failed`。每个状态**只留一个可做的动作**：
+   `available`/`failed` 出「下载并安装」，`confirm` 出「确认下载」+「取消」，`downloading`
+   出「取消」，`ready_to_install` 出「启动安装程序」，`checking/downloading/verifying/launching`
+   禁用「检查更新」。按钮多于一个可点即不合格。
+2. **检查不自动下载**：只有用户点「下载并安装」**再点「确认下载」**才发 `update_download`；
+   启动、打开帮助、F5、重开帮助都不下载、不安装、不启动安装向导。
+3. **可用分两种**：`available` 表示 Release 里有可校验的安装包（名字、HTTPS Release 资产地址、
+   `manifest.json` 的字节数与 SHA-256 全部对齐）；`no_installer` 表示没有安装包或清单对不上，
+   此时只提示「前往下载页手动下载」并只保留发布页按钮——**绝不**给出无法校验的下载。
+   草稿、预发布、非法版本、超大响应仍按 §5.15 归入 `error`，不进下载流程。
+4. **下载与校验**：`update_download(request_id)` 单飞后台执行；HTTPS、超时、大小上限、
+   流式写 `D:/@Temp` 临时目录的 `.part` 半成品、边下边算 SHA-256。进度按 1 MiB 步进回推
+   （`downloading` 显示「已下载 X / Y（N%）」，数字只来自后端回推，不用估计值）；
+   `verifying` 显示「正在比对大小与 SHA-256…」。大小不符、哈希不符、断流、超限、取消
+   一律**删除半成品**并保留旧程序与用户数据。
+5. **取消**：`confirm` 阶段取消直接回 `available`；`downloading` 阶段取消调 `update_cancel`，
+   后端置取消标记，下载线程在下一块之间停下、清理后回 `available`（`error_code=cancelled`），
+   **不是**失败态，不显示红色错误。
+6. **启动是最后一个用户确认**：`ready_to_install` 才出「启动安装程序」；`update_launch`
+   先回推 `launching`（「正在启动安装程序…」）再启动。**工具不自动退出、不自动重启**——
+   关闭主程序由用户自己控制，提示文案必须写清「请先关闭本工具，再按向导完成安装」。
+   启动器失败归 `failed`（`error_code=launch_failed`），旧程序与用户数据不变。
+7. **局部归属与单飞**：更新状态只写帮助更新行（`#update-status` / `#update-progress` /
+   `#update-flow`），不写登录态、组件故障、报名结果或运行记录。检查、下载共用一个单飞槽位，
+   互斥不重入；`bootstrap.update_check` 用 `checking`（任一更新动作在途）+ `result` +
+   `installer_path` 恢复在途与最近结论，新实例初始未检查。桥接拒绝、异常、丢事件都结束
+   进行中状态（检查兜底 15 秒、下载/校验 60 秒续期看门狗），不冒充成功。
+8. **数据与程序边界**：更新流程只写 `D:/@Temp` 临时目录；程序目录、`session.json`、
+   `storage_state.json`、`ui.json` 全程不被读写。下载路径由检查阶段选定并由后端保管，
+   启动只接受临时目录里已校验的产物，拒绝任意路径。
+9. **首版范围**：只支持完整安装器；差分补丁、静默安装（`/VERYSILENT` 一类）、自动重启
+   都不在本期。完整 ZIP 与独立 EXE 继续只提供发布页手动下载。
+
 ## 6. 文案要求
 
 - 中文、第二人称、短句；不用「请」「您」这类客套，不用感叹号堆情绪。

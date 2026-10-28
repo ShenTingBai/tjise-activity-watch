@@ -3992,57 +3992,116 @@ function paintReplayButtons() {
   });
 }
 
+function fmtBytes(n) {
+  const bytes = Number(n) || 0;
+  if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + " MB";
+  if (bytes >= 1024) return (bytes / 1024).toFixed(0) + " KB";
+  return bytes + " B";
+}
+
+/* 更新七态（检查/可用/确认/下载/校验/安装/失败）+ 无安装器退回发布页：
+   每个状态只留该状态唯一可做的动作，检查从不自动下载。 */
 function paintUpdate() {
   const box = $("#update-status");
   const button = $("#btn-update-check");
   const state = S.update.state;
+  const result = S.update.result || {};
   box.dataset.state = state;
-  button.disabled = state === "checking";
-  button.textContent = state === "checking" ? "检查中…" : state === "error" ? "重试检查" : "检查更新";
+  const inFlight = ["checking", "downloading", "verifying", "launching"].indexOf(state) >= 0;
+  button.disabled = inFlight;
+  button.textContent = state === "checking" ? "检查中…" : (state === "error" || state === "failed") ? "重试检查" : "检查更新";
   const copy = { idle: "尚未检查", checking: "正在检查…", current: "当前为最新正式版",
-    available: "发现新版本 " + (S.update.result && S.update.result.latest_version || ""),
-    preview: "当前为预览版本，最新正式版 " + (S.update.result && S.update.result.latest_version || ""),
-    unavailable: "暂无正式发布" };
-  box.textContent = state === "error" ? "暂时无法检查更新。" + (S.update.result && S.update.result.text || "请重试或前往下载页。") : copy[state] || copy.idle;
+    available: "发现新版本 " + (result.latest_version || ""),
+    no_installer: result.text || "发现新版本，请前往下载页手动下载。",
+    preview: "当前为预览版本，最新正式版 " + (result.latest_version || ""),
+    unavailable: "暂无正式发布",
+    confirm: "确认下载并安装 " + (result.latest_version || "") + "？",
+    downloading: "正在下载安装包…",
+    verifying: "正在校验安装包…",
+    ready_to_install: "安装包已校验通过，可以启动安装程序。",
+    launching: result.text || "正在启动安装程序…" };
+  box.textContent = state === "error" ? "暂时无法检查更新。" + (result.text || "请重试或前往下载页。")
+    : state === "failed" ? (result.text || "更新没能完成，请重试。")
+    : copy[state] || copy.idle;
   /* 手动检查的结论带发生时间，避免把很久以前的结果误当成实时状态。 */
   const checked = $("#update-checked-at");
-  const at = S.update.result && Date.parse(S.update.result.checked_at);
+  const at = result && Date.parse(result.checked_at);
   checked.hidden = state === "checking" || !Number.isFinite(at);
   checked.textContent = checked.hidden ? "" : "检查时间 " + new Date(at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  /* 进度行只在下载/校验/就绪阶段出现，数字一律来自后端回推，不用估计值。 */
+  const progress = $("#update-progress");
+  let progressText = "";
+  if (state === "downloading") {
+    const done = Number(result.downloaded) || 0;
+    const total = Number(result.total_bytes) || 0;
+    progressText = "已下载 " + fmtBytes(done) + " / " + fmtBytes(total) + "（" + (total > 0 ? Math.floor(done / total * 100) : 0) + "%）";
+  } else if (state === "verifying") {
+    progressText = "正在比对大小与 SHA-256…";
+  } else if (state === "ready_to_install") {
+    progressText = "已通过大小与 SHA-256 校验";
+  }
+  progress.hidden = !progressText;
+  progress.textContent = progressText;
+  const install = $("#btn-update-install");
+  const confirm = $("#btn-update-confirm");
+  const launch = $("#btn-update-launch");
+  const cancel = $("#btn-update-cancel");
+  const hasInstaller = !!(result.installer && result.installer.url);
+  const showInstall = (state === "available" || state === "failed") && hasInstaller;
+  const showConfirm = state === "confirm";
+  const showLaunch = state === "ready_to_install";
+  const showCancel = state === "confirm" || state === "downloading";
+  install.hidden = !showInstall;
+  confirm.hidden = !showConfirm;
+  launch.hidden = !showLaunch;
+  cancel.hidden = !showCancel;
+  $("#update-flow").hidden = !(showInstall || showConfirm || showLaunch || showCancel);
 }
 
-function watchUpdate(requestId) {
+function watchUpdate(requestId, ms) {
   clearTimeout(S.update.timer);
-  /* 后端请求有8秒网络超时；桥接丢事件也不能让按钮永久停在检查中。 */
+  /* 后端请求有8秒网络超时；桥接丢事件也不能让按钮永久停在进行中。 */
   S.update.timer = setTimeout(() => {
-    if (S.update.state === "checking" && S.update.requestId === requestId) {
-      receiveUpdate({ request_id: requestId, state: "error", text: "没有收到检查结果，请重试。" });
-    }
-  }, 15000);
+    if (S.update.requestId !== requestId) return;
+    const stalled = S.update.state;
+    if (["checking", "downloading", "verifying"].indexOf(stalled) < 0) return;
+    receiveUpdate({ request_id: requestId, state: stalled === "checking" ? "error" : "failed",
+      text: "没有收到更新结果，请重试。", error_code: "timeout" });
+  }, ms || 15000);
 }
 
 function receiveUpdate(payload) {
   const data = payload || {};
   if (!data.request_id || data.request_id !== S.update.requestId) return;
   clearTimeout(S.update.timer);
-  S.update.result = data;
-  S.update.state = ["available", "current", "preview", "unavailable", "error"].indexOf(data.state) >= 0 ? data.state : "error";
+  /* 合并而非替换：下载进度事件不一定带安装器信息，要保住检查阶段选好的那份。 */
+  S.update.result = Object.assign({}, S.update.result || {}, data);
+  const known = ["available", "no_installer", "current", "preview", "unavailable", "error",
+    "confirm", "downloading", "verifying", "ready_to_install", "launching", "failed"];
+  S.update.state = known.indexOf(data.state) >= 0 ? data.state : "error";
   paintUpdate();
+  /* 下载/校验是长动作，每次进度都续上看门狗；终态不再计时。 */
+  if (S.update.state === "downloading" || S.update.state === "verifying") {
+    watchUpdate(S.update.requestId, 60000);
+  }
   revealHelpStatus($("#update-status").parentElement);
 }
 
 function restoreUpdate(snapshot) {
   if (!snapshot || !snapshot.request_id) { paintUpdate(); return; }
   S.update.requestId = String(snapshot.request_id);
+  /* checking 表示「任一更新动作在途」（检查或下载）；具体阶段只认 result.state。 */
   if (snapshot.checking) {
-    S.update.state = "checking";
-    watchUpdate(S.update.requestId);
+    const prior = snapshot.result || {};
+    S.update.result = prior;
+    S.update.state = ["checking", "downloading", "verifying", "launching"].indexOf(prior.state) >= 0 ? prior.state : "checking";
+    watchUpdate(S.update.requestId, S.update.state === "checking" ? 15000 : 60000);
   } else if (snapshot.result) receiveUpdate(snapshot.result);
   paintUpdate();
 }
 
 function checkUpdate() {
-  if (S.update.state === "checking") return;
+  if (["checking", "downloading", "verifying", "launching"].indexOf(S.update.state) >= 0) return;
   const requestId = "update-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
   S.update.requestId = requestId;
   S.update.state = "checking";
@@ -4066,6 +4125,73 @@ function checkUpdate() {
   }).catch((err) => {
     if (S.update.requestId === requestId && S.update.state === "checking") {
       receiveUpdate({ request_id: requestId, state: "error", text: msg(err) });
+    }
+  });
+}
+
+/* 「下载并安装」先进确认态：下载必须是用户显式确认后的动作，检查从不自动下载。 */
+function startDownload() {
+  const result = S.update.result;
+  if (S.update.state !== "available" && S.update.state !== "failed") return;
+  if (!result || !result.installer || !result.installer.url) return;
+  S.update.state = "confirm";
+  paintUpdate();
+}
+
+function confirmDownload() {
+  if (S.update.state !== "confirm") return;
+  const result = S.update.result || {};
+  const installer = result.installer;
+  if (!installer || !installer.url) {
+    receiveUpdate({ request_id: S.update.requestId, state: "failed",
+      text: "没有可下载的安装包，请前往下载页。", error_code: "no_installer" });
+    return;
+  }
+  const requestId = "dl-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+  S.update.requestId = requestId;
+  S.update.state = "downloading";
+  watchUpdate(requestId, 60000);
+  paintUpdate();
+  api("update_download", requestId).then((res) => {
+    if (S.update.requestId !== requestId || S.update.state !== "downloading") return;
+    if (!res || res.ok === false || res.queued === false) {
+      receiveUpdate({ request_id: requestId, state: "failed",
+        text: res && res.text || "下载没能启动，请重试。", error_code: "start_failed" });
+    }
+  }).catch((err) => {
+    if (S.update.requestId === requestId && S.update.state === "downloading") {
+      receiveUpdate({ request_id: requestId, state: "failed", text: msg(err), error_code: "start_failed" });
+    }
+  });
+}
+
+/* 取消只停本次下载：后端清理半成品并回推可用态，不动旧程序和用户数据。 */
+function cancelDownload() {
+  if (S.update.state === "confirm") {
+    S.update.state = (S.update.result && S.update.result.installer && S.update.result.installer.url) ? "available" : "no_installer";
+    paintUpdate();
+    return;
+  }
+  if (S.update.state !== "downloading") return;
+  api("update_cancel").then(() => {}).catch(() => {});
+}
+
+/* 启动安装器是最后一个用户确认动作；关闭主程序由用户自己控制，不自动退出或重启。 */
+function launchInstaller() {
+  if (S.update.state !== "ready_to_install") return;
+  const requestId = "launch-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+  S.update.requestId = requestId;
+  S.update.state = "launching";
+  paintUpdate();
+  api("update_launch", requestId).then((res) => {
+    if (S.update.requestId !== requestId) return;
+    if (!res || res.ok === false) {
+      receiveUpdate({ request_id: requestId, state: "failed",
+        text: res && res.text || "安装程序没能启动，请重试。", error_code: "launch_failed" });
+    }
+  }).catch((err) => {
+    if (S.update.requestId === requestId) {
+      receiveUpdate({ request_id: requestId, state: "failed", text: msg(err), error_code: "launch_failed" });
     }
   });
 }
@@ -5133,6 +5259,10 @@ $("#tour-next").addEventListener("click", () => {
  * 计划运行中禁用重播（不打断计划），弹窗本身任何状态都能打开。 */
 $("#btn-help-tour").addEventListener("click", () => replayTourFrom("#help", "#btn-help"));
 $("#btn-update-check").addEventListener("click", checkUpdate);
+$("#btn-update-install").addEventListener("click", startDownload);
+$("#btn-update-confirm").addEventListener("click", confirmDownload);
+$("#btn-update-launch").addEventListener("click", launchInstaller);
+$("#btn-update-cancel").addEventListener("click", cancelDownload);
 $("#btn-help-latest").addEventListener("click", () => {
   /* 用户点击才打开外链：后端用系统默认浏览器打开固定的 releases/latest 地址；
    * 打不开时把地址摆成可选文本（局部反馈），不在 WebView 里跳转 */

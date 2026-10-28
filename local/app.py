@@ -45,6 +45,7 @@ from signup_plan import PlanCoordinator, TaskSpec, classify_signup_mode, validat
 from business_clock import BusinessClock, ClockUnavailable
 from time_contract import school_epoch, school_time_text, configure_time_source
 from update_check import check_latest_release
+import updater
 
 # 登录态/偏好统一数据根：开发用 local/data，冻结 EXE 用 %LOCALAPPDATA%
 # （TJISE_DATA_DIR 可覆盖），与 grab-worker 解析出同一份登录文件
@@ -895,9 +896,15 @@ class Api:
         # 最近一次 check 的四态结论：start_plan 的放行/拒绝只信它
         self._last_check: dict = {}
         # 更新检查独立于登录/报名，只由帮助按钮触发；页面重载复用内存中的在途请求。
+        # _updating 表示「任一更新动作在途」（检查或下载），单飞共用一个槽位；
+        # _update_installer 是检查阶段选好的安装器资产（URL/大小/哈希），
+        # 下载只信它，不收界面传来的地址；_update_installer_path 是校验通过后的本地产物。
         self._updating = False
         self._update_request_id = ""
         self._update_result: dict | None = None
+        self._update_installer: dict | None = None
+        self._update_installer_path = ""
+        self._update_cancelled = False
         # 开始请求登记（R11）：request_id → {state, plan_id, result}。
         # 只留最近有限条，活跃请求不驱逐；不存凭证、不写外部数据。
         self._start_requests: dict[str, dict] = {}
@@ -1080,7 +1087,8 @@ class Api:
             payload["busy"] = busy
             payload["update_check"] = {"checking": self._updating,
                                        "request_id": self._update_request_id,
-                                       "result": self._update_result}
+                                       "result": self._update_result,
+                                       "installer_path": self._update_installer_path}
             generation = self._plan_generation
         if snapshot is not None:
             # 页面重载会丢掉 plan/task 事件：把计划快照一并交给 bootstrap，
@@ -1178,7 +1186,8 @@ class Api:
     def _do_check_update(self, request_id: str) -> None:
         result = {"state": "error", "current_version": APP_VERSION,
                   "latest_version": None, "url": RELEASES_LATEST_URL,
-                  "text": "检查没能完成，请重试。", "error_code": "unexpected_error"}
+                  "text": "检查没能完成，请重试。", "error_code": "unexpected_error",
+                  "installer": None}
         try:
             checked = check_latest_release(APP_VERSION)
             if isinstance(checked, dict):
@@ -1188,12 +1197,137 @@ class Api:
             pass
         finally:
             result = dict(result, request_id=request_id)
+            installer = result.get("installer")
             with self._lock:
                 self._update_result = result
+                self._update_installer = installer if isinstance(installer, dict) else None
+                # 新一轮检查结论取代旧产物：之前校验过的安装器不再对应当前结论
+                self._update_installer_path = ""
+                self._update_cancelled = False
                 self._updating = False
                 closing = self._closing
             if not closing:
                 self._emit("update", result)
+
+    def _publish_update(self, payload: dict, finished: bool) -> None:
+        """把更新状态推给界面并留档；finished 才释放单飞槽位。"""
+        with self._lock:
+            self._update_result = payload
+            if finished:
+                self._updating = False
+            closing = self._closing
+        if not closing:
+            self._emit("update", payload)
+
+    def update_download(self, request_id: str) -> dict:
+        """用户确认后启动安装器下载：单飞后台流式下载并校验，事件回推进度与结论。"""
+        if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", request_id):
+            return {"ok": False, "queued": False, "text": "更新请求无效，请重试。"}
+        with self._lock:
+            if self._closing:
+                return {"ok": False, "queued": False, "text": "程序正在关闭。"}
+            if self._updating:
+                return {"ok": True, "queued": True, "skipped": True,
+                        "request_id": self._update_request_id}
+            installer = self._update_installer
+            if not isinstance(installer, dict) or not installer.get("url"):
+                return {"ok": False, "queued": False,
+                        "text": "当前没有可下载的安装包，请前往下载页。"}
+            self._updating = True
+            self._update_request_id = request_id
+            self._update_cancelled = False
+        try:
+            threading.Thread(target=self._do_update_download,
+                             args=(request_id, installer), daemon=True).start()
+        except Exception:
+            with self._lock:
+                self._updating = False
+            return {"ok": False, "queued": False, "text": "下载没能启动，请重试。"}
+        return {"ok": True, "queued": True, "request_id": request_id}
+
+    def _do_update_download(self, request_id: str, installer: dict) -> None:
+        # 下载结论继承最近一次检查的上下文（版本/发布页/安装器），界面不必再拼
+        base = dict(self._update_result or {})
+        base.update({"request_id": request_id, "current_version": APP_VERSION,
+                     "url": RELEASES_LATEST_URL, "installer": installer,
+                     "error_code": ""})
+        total = installer.get("bytes") if isinstance(installer.get("bytes"), int) else 0
+        step = 1024 * 1024
+        last_sent = [0]
+
+        def progress(done: int, expect: int) -> None:
+            # 进度按 1 MiB 步进回推：64 KiB 一块全部回推会把界面打满
+            if done == expect or done - last_sent[0] >= step:
+                last_sent[0] = done
+                self._publish_update(dict(base, state="downloading",
+                                          text="正在下载安装包…",
+                                          downloaded=done, total_bytes=total), False)
+
+        self._publish_update(dict(base, state="downloading", text="正在下载安装包…",
+                                  downloaded=0, total_bytes=total), False)
+        try:
+            got = updater.download_installer(
+                installer["url"], name=installer["name"],
+                expect_bytes=installer.get("bytes") or 0,
+                expect_sha256=installer.get("sha256") or "",
+                cancel=lambda: self._update_cancelled or self._closing,
+                progress=progress)
+        except Exception:
+            # 只兜未预期异常；可预期失败由下载器分类返回，不在这层吞掉
+            got = {"ok": False, "error_code": "unexpected_error",
+                   "text": "下载没能完成，请重试。"}
+        if got.get("ok"):
+            path = str(got.get("path") or "")
+            with self._lock:
+                self._update_installer_path = path
+            self._publish_update(dict(base, state="ready_to_install",
+                                      text="安装包已下载并校验通过，可以启动安装程序。",
+                                      installer_path=path), True)
+            return
+        code = str(got.get("error_code") or "unexpected_error")
+        if code == "cancelled":
+            self._publish_update(dict(base, state="available", error_code=code,
+                                      text="已取消下载，可重新下载。"), True)
+        else:
+            self._publish_update(dict(base, state="failed", error_code=code,
+                                      text=str(got.get("text") or "下载没能完成，请重试。")), True)
+
+    def update_cancel(self) -> dict:
+        """用户取消下载：只置取消标记，下载线程在下一块之间停下并清理半成品。"""
+        with self._lock:
+            self._update_cancelled = True
+        return {"ok": True}
+
+    def update_launch(self, request_id: str) -> dict:
+        """用户确认后启动已校验的安装器；启动前先回推 launching 状态。
+
+        关闭主程序由调用方控制：这里不退出、不自动重启，失败不改会话和偏好。
+        """
+        if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", request_id):
+            return {"ok": False, "text": "更新请求无效，请重试。"}
+        with self._lock:
+            if self._closing:
+                return {"ok": False, "text": "程序正在关闭。"}
+            path = self._update_installer_path
+            base = dict(self._update_result or {})
+        if not path:
+            return {"ok": False, "text": "还没有已校验的安装包，请先下载。"}
+        # 安装器启动前先回推状态：界面能看到「正在启动安装程序…」
+        self._publish_update(dict(base, request_id=request_id, state="launching",
+                                  text="正在启动安装程序…", installer_path=path,
+                                  error_code=""), False)
+        got = updater.launch_installer(path)
+        if got.get("ok"):
+            text = "安装程序已启动。请先关闭本工具，再按向导完成安装。"
+            self._publish_update(dict(base, request_id=request_id, state="launching",
+                                      text=text, installer_path=path, error_code=""), False)
+            return {"ok": True, "path": path, "text": text}
+        text = str(got.get("text") or "安装程序没能启动，请重试。")
+        self._publish_update(dict(base, request_id=request_id, state="failed",
+                                  text=text, installer_path=path,
+                                  error_code=str(got.get("error_code") or "launch_failed")), False)
+        return {"ok": False, "text": text}
+
 
     def check(self, request_id: str = "") -> dict:
         # js_api 的处理跑在 UI 线程上：一旦在这里跑 subprocess，
