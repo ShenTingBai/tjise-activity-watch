@@ -566,6 +566,53 @@ test('combined 拒绝 owner 在错误会话里点卡片', async () => {
   });
 });
 
+test('combined 卡片回调缺 chat_type 时按点击会话识别 owner 私聊', async () => {
+  // 线上飞书回调不一定带 chat_type；缺省时用「点击会话 == 已记录的 owner 私聊」
+  // 兜底，否则 owner 在私聊里点「我的报名」会被误判成群会话。
+  await withHarness({}, async (state) => {
+    await deliver(state, messagePayload({ message: { message_id: 'om_owner_learn' } }));
+    const res = await cardAction(state, {
+      action: { value: 'v:mine' },
+      context: { open_chat_id: OWNER_CHAT },
+      operator: { open_id: OWNER },
+    });
+    assert.ok(res.card && res.card.data, 'owner 私聊应能刷新 mine 卡片');
+    const last = state.execCalls[state.execCalls.length - 1];
+    assert.equal(last.args[1], 'mine');
+  });
+});
+
+test('combined 卡片回调缺 chat_type 时 owner 私聊点预报名仍成功', async () => {
+  await withHarness({}, async (state) => {
+    await deliver(state, messagePayload({ message: { message_id: 'om_owner_learn' } }));
+    const res = await cardAction(state, {
+      action: { value: grabValue('evt_no_chat_type') },
+      context: { open_chat_id: OWNER_CHAT },
+      operator: { open_id: OWNER },
+    });
+    assert.equal(res.toast.type, 'success', 'chat_type 缺失不能把本人私聊误判成群');
+    const adds = state.execCalls.filter(
+      (c) => c.args[0] === 'scripts/watchlist.py' && c.args[1] === 'add');
+    assert.equal(adds.length, 1);
+    assert.ok(adds[0].args.includes('evt_no_chat_type'));
+  });
+});
+
+test('combined 卡片回调缺 chat_type 且点击会话是群时预报名仍拒绝', async () => {
+  await withHarness({}, async (state) => {
+    await deliver(state, messagePayload({ message: { message_id: 'om_owner_learn' } }));
+    const before = state.execCalls.length;
+    const res = await cardAction(state, {
+      action: { value: grabValue() },
+      context: { open_chat_id: GROUP_CHAT },
+      operator: { open_id: OWNER },
+    });
+    assert.equal(res.toast.type, 'error', '群里点预报名必须被拒绝');
+    assert.match(res.toast.content, /私聊/);
+    assert.equal(state.execCalls.length, before, '不能执行 watchlist add');
+  });
+});
+
 test('combined 里群查询不会覆盖 owner 私聊记录', async () => {
   await withHarness({}, async (state) => {
     // owner 私聊先留下收件人记录（真实链路也是这么学的）

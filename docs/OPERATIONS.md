@@ -32,26 +32,25 @@
 | 单元 | 类型 | 作用 |
 |------|------|------|
 | `tjise-login.service` | simple | `node server_refresh.js --daemon`：每 2h 校验 token，成功即刷新会话 |
-| `tjise-bot-group.service` | simple | `BOT_ROLE=group_query`：群里被 @ 时只读查询，任何报名动作都拒绝 |
-| `tjise-bot-owner.service` | simple | `BOT_ROLE=private_owner`：只服务 owner 私聊，才有预报名/报名动作 |
+| `tjise-bot.service` | simple | `BOT_ROLE=combined`：一个长连接进程分流两个入口——群里被 @ 只读查询；owner 私聊才有个人查询与预报名/报名动作 |
 | `tjise-trigger.service` | simple | `python3 server/scripts/trigger_server.py`：HTTP 一键触发（18080） |
 | `tjise-autologin.service` | oneshot | `python3 /root/tjise-login/auto_login.py --preempt` |
 | `tjise-autologin.timer` | timer | `OnCalendar=*:0/5`，每 5 分钟唤起上面的 oneshot |
 
 ```bash
-systemctl status tjise-bot-group tjise-bot-owner tjise-login tjise-trigger tjise-autologin.timer
-systemctl restart tjise-bot-group      # 改完 bot.js 两个都要重启（代码同一份）
-systemctl restart tjise-bot-owner
+systemctl status tjise-bot tjise-login tjise-trigger tjise-autologin.timer
+systemctl restart tjise-bot            # 改完 bot.js 只重启这一个（一个进程两个入口）
 systemctl restart tjise-login          # 改完 server_refresh.js 必须重启
-journalctl -u tjise-bot-group -n 100 --no-pager
-journalctl -u tjise-bot-owner -n 100 --no-pager
+journalctl -u tjise-bot -n 100 --no-pager
 ```
 
-**两个实例必须分开**，`BOT_ROLE` 不能相同：同值双开会抢同一批事件（同一条群消息被两个进程各答一次）。
-**旧的单实例 `tjise-bot.service` 必须停掉**——它没有 `BOT_ROLE`，新版 bot.js 会直接拒绝启动，
-留在那里只会让 `systemctl status` 显示 failed 而实际有另一个实例在跑。
+**同一个自建应用只能跑一个 `tjise-bot.service`**：`BOT_ROLE=combined` 是唯一有效值，
+拆分时代的 `group_query` / `private_owner` 已被代码拒绝启动。旧的双单元
+`tjise-bot-group.service` / `tjise-bot-owner.service` 必须 `disable --now`，
+否则同一 App 双开长连接会互抢事件。
+（Webhook 群自定义机器人是另一条独立通道，只推送、没有进程。）
 
-`tjise-bot-owner` 的 `PRIVATE_OWNER_OPEN_ID` 放在 drop-in `tjise-bot-owner.service.d/owner.conf`，
+`PRIVATE_OWNER_OPEN_ID` 放在 `tjise-bot.service.d/owner.conf` drop-in 里，
 `tjise-autologin.service` 里也单独配了一份——两个必须一致，否则私聊静默关闭。
 
 ## 3. crontab
@@ -158,8 +157,8 @@ node server/bot/test_bot_runtime.js
 scp -i ~/.ssh/develop server/scripts/<file>.py root@<你的服务器IP>:/root/tjise-activity-watch/scripts/
 scp -i ~/.ssh/develop server/bot/bot.js        root@<你的服务器IP>:/root/tjise-bot/bot.js
 
-# 3) 重启（bot.js 改了，两个角色实例都要重启）
-ssh root@<你的服务器IP> 'systemctl restart tjise-bot-group tjise-bot-owner && systemctl is-active tjise-bot-group tjise-bot-owner'
+# 3) 重启（combined 只有一个进程）
+ssh root@<你的服务器IP> 'systemctl restart tjise-bot && systemctl is-active tjise-bot'
 ```
 
 `data/` 与 `config.json` 属于线上状态，**不要**从本地覆盖。
@@ -183,10 +182,10 @@ ssh root@<你的服务器IP> 'systemctl restart tjise-bot-group tjise-bot-owner 
 | 登录态失效 | `token_probe.log` 尾部 `result=fail` → 看 `/root/tjise-login/auto_login.log` 是否已自动重登 → 不行就本机 `login.py` 后传 `storage_state.json` |
 | 接口 timeout / handshake | `net_probe.log`：`net=school-only` 是学校侧，`net=down` 是整机断网；ECS 带宽为 0 时表现为 TLS 握手超时 |
 | 自动登录失败 | `auto_login.log` 里 `login_rejected` / `ocr_incomplete`；确认 `credentials.json` 存在且 600、账号密码没改 |
-| 机器人不响应 | `systemctl status tjise-bot-group tjise-bot-owner`、`journalctl -u tjise-bot-group -n 50`；长连接断开会自动重连，反复断查应用凭据 |
-| 机器人进程 failed 且日志有 `BOT_ROLE` | 单元还是旧单实例模板；换成 `tjise-bot-group` / `tjise-bot-owner` 两个单元 |
+| 机器人不响应 | `systemctl status tjise-bot`、`journalctl -u tjise-bot -n 50`；长连接断开会自动重连，反复断查应用凭据 |
+| 机器人进程 failed 且日志有 `BOT_ROLE` | 单元里写的是拆分时代的旧值（或缺失）；改成 `BOT_ROLE=combined` 的单 `tjise-bot.service` |
 | 群里点预报名没反应 | 群入口只读（设计如此）；要预报名请用 owner 私聊里的卡片，或本机工具 |
-| 按钮点了没反应 | 私聊卡片按钮只对 owner 私聊生效（`operator.open_id` + `chat_id` 双校验）；群里点会 toast 拒绝 |
+| 按钮点了没反应 | 私聊卡片按钮只对 owner 私聊生效（`operator.open_id` + 会话 chat_id 双校验）；群里点会 toast 拒绝；`journalctl` 里看 `card action ... -> chat:` 是否解析到了会话语境 |
 
 ## 9. 迁移记录（2026-10-21）
 

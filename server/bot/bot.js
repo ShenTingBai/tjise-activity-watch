@@ -512,11 +512,12 @@ function allowedViews(chatType) {
 
 /** 卡片按钮点击：按 value 重新查一次，就地更新卡片。
  *
- *  combined 的一个回调按 chat_type 分层设门：
- *  - 非 owner 私聊（群或会话类型未知）：g:/u: 压根不进 handleGrabAction，
- *    v:mine 不在视图集里（群里没有个人动作）；v:* 公开视图放行；
+ *  combined 的一个回调按会话身份分层设门：
+ *  - 群或会话类型未知（且点击会话不是已记录的 owner 私聊）：g:/u: 压根不进
+ *    handleGrabAction，v:mine 不在视图集里（群里没有个人动作）；v:* 公开视图放行；
  *  - owner 私聊：先过三重一致（点击人=owner、会话=已记录的 owner 私聊），
  *    通过后才区分 v:* 与 g:/u:*，g:/u: 进 handleGrabAction 还会再校验一次。
+ *  会话类型优先取回调的 chat_type，缺失时用点击会话的 chat_id 兜底判断。
  */
 async function handleCardAction(data) {
   try {
@@ -529,10 +530,17 @@ async function handleCardAction(data) {
       text = text.slice(1, -1).trim();
     }
     const isGrab = text.startsWith('g:') || text.startsWith('u:');
-    // 卡片落在哪种会话里由飞书回调的 chat_type 决定；缺失时按非私聊处理，
-    // 个人动作因此默认被拒（fail-closed），公开视图不受影响。
-    const chatType = String(((data && data.context) || {}).chat_type || '');
-    const isOwnerP2p = chatType === 'p2p';
+    // 卡片落在哪种会话里：优先看回调的 chat_type，但它并非每个版本的飞书
+    // 都会带上（线上日志出现过 chat: unknown）。会话类型缺失时，用
+    // 「点击会话 == 已记录的 owner 私聊」兜底——这个 chat_id 只可能来自
+    // owner 私聊，卡片被转发到群里时 open_chat_id 是群，不会命中。
+    const ctx = (data && data.context) || {};
+    const chatType = String(ctx.chat_type || '');
+    const clickChatId = String(ctx.open_chat_id || ctx.chat_id || data.open_chat_id || '');
+    const ownerP2p = ownerP2pChatId();
+    const isOwnerP2p = chatType === 'p2p' || (!!ownerP2p && clickChatId === ownerP2p);
+    // 解析出的会话类型用于视图集：命中 owner 私聊就按 p2p 处理，其余保持原样
+    const viewChatType = isOwnerP2p ? 'p2p' : chatType;
 
     if (isGrab && !isOwnerP2p) {
       // 群（或会话类型未知）永远不进 handleGrabAction：不是「校验后拒绝」，是压根不进去
@@ -549,7 +557,7 @@ async function handleCardAction(data) {
     const m = text.match(/v:([A-Za-z]+)/);
     const view = m ? m[1].toLowerCase() : 'pending';
     log('card action:', JSON.stringify(raw), '-> text:', text, '-> view:', view,
-      '-> chat:', chatType || 'unknown', '-> role:', BOT_ROLE);
+      '-> chat:', viewChatType || 'unknown', '-> role:', BOT_ROLE);
 
     // 预报名 / 取消预报名：value 是 g:<base64> 或 u:<活动id>，
     // 只可能是 owner 私聊（上面已挡掉其它场合），handleGrabAction 里还会再校验一次。
@@ -557,7 +565,7 @@ async function handleCardAction(data) {
       return await handleGrabAction(data, text);
     }
 
-    if (!allowedViews(chatType).includes(view)) {
+    if (!allowedViews(viewChatType).includes(view)) {
       return { toast: { type: 'info', content: '这个按钮暂时没做' } };
     }
 
@@ -851,6 +859,42 @@ if (!ROLE_OK) {
         // 私聊面 mine：owner 已配置且会话已记录时必须出卡片
         if (v === 'v:mine' && !hasCard) failed++;
       }
+    }
+
+    console.log('== 卡片回调缺少 chat_type（线上真实形态）==');
+    // 线上飞书回调可能不带 chat_type：群会话宁可多拒，owner 私聊必须靠
+    // 「点击会话 == 已记录的 owner 私聊」兜底放行，否则私聊点报名会被误拒。
+    const noTypeOpen = await handleCardAction({
+      action: { value: 'v:open' },
+      context: { open_chat_id: 'oc_group_selftest' },
+      operator: { open_id: 'ou_any_member' },
+    });
+    const noTypeOpenCard = !!(noTypeOpen && noTypeOpen.card && noTypeOpen.card.data);
+    const noTypeOpenTitle = noTypeOpenCard ? noTypeOpen.card.data.header.title.content : '-';
+    console.log('  [no-chat-type/群] v:open -> 卡片=' + noTypeOpenCard + ' 标题=' + noTypeOpenTitle);
+    if (!noTypeOpenCard || !/报名已开放/.test(noTypeOpenTitle)) failed++;
+    if (ownerP2p) {
+      const noTypeMine = await handleCardAction({
+        action: { value: 'v:mine' },
+        context: { open_chat_id: ownerP2p },
+        operator: { open_id: String(process.env.PRIVATE_OWNER_OPEN_ID || 'ou_selftest') },
+      });
+      const noTypeMineCard = !!(noTypeMine && noTypeMine.card && noTypeMine.card.data);
+      console.log('  [no-chat-type/owner 私聊] v:mine -> 卡片=' + noTypeMineCard);
+      if (!noTypeMineCard) failed++;
+      // 非本人点报名：必须落到三重校验的拒绝，而不是外层的「群里只提供查询」
+      const noTypeGrab = await handleCardAction({
+        action: { value: 'g:' + Buffer.from(JSON.stringify({ i: 'evt_selftest' })).toString('base64') },
+        context: { open_chat_id: ownerP2p },
+        operator: { open_id: 'ou_not_owner' },
+      });
+      const reachedInner = !!(noTypeGrab && noTypeGrab.toast && noTypeGrab.toast.type === 'error'
+        && noTypeGrab.toast.content !== GRAB_GROUP_DENIED);
+      console.log('  [no-chat-type/owner 私聊] 非本人点报名 -> 落到三重校验=' + reachedInner
+        + ' toast=' + (noTypeGrab && noTypeGrab.toast ? noTypeGrab.toast.content : '-'));
+      if (!reachedInner) failed++;
+    } else {
+      console.log('  （没有 owner 私聊记录，仅验证群面兜底）');
     }
 
     console.log('== 个人动作门禁 ==');

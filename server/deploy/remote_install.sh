@@ -42,21 +42,35 @@ else
 fi
 
 echo
+# owner 的 open_id：cron 里的 token_probe / net_probe / watchlist_runner 和
+# 07:00 的 --with-grab 都要靠它做私聊回执；没配置时降级为不带 owner 环境。
+OWNER_OPEN_ID="${PRIVATE_OWNER_OPEN_ID:-}"
+OWNER_ENV=""
+if [ -n "$OWNER_OPEN_ID" ]; then
+  OWNER_ENV="PRIVATE_OWNER_OPEN_ID=$OWNER_OPEN_ID "
+fi
 echo "── 写入 crontab ──"
 # 动态监测每分钟唤醒一次，但**不是**每分钟都访问学校：activity_watch.py 自己按
 # next_poll_at 控频（白天 3 分钟 / 夜间 10 分钟，不做临近开放加密）。
 # 用 cron 每分钟唤醒而不是写死 3 分钟，是为了让「刚开放那一分钟」能被赶上。
 # watchlist_runner 的每分钟执行保持不变：它只对齐 owner 自己的清单。
-CRON_LINES="0 7 * * * cd $APP && $PY scripts/run.py >> $APP/data/cron.log 2>&1
-5 7 * * * cd $APP && $PY scripts/remind.py >> $APP/data/remind.log 2>&1
+# 注意：这里必须写全服务器上真实的全部任务——写入方式是「先删掉所有含
+# tjise-activity-watch 的旧行再追加」，漏写一条就等于把那条任务停掉。
+# 按注释行不能带这个路径，否则每次安装都会重复堆积。
+CRON_LINES="0 7 * * * cd $APP && ${OWNER_ENV}$PY scripts/run.py --with-grab >> $APP/data/cron.log 2>&1
+5 7 * * * cd $APP && ${OWNER_ENV}$PY scripts/remind.py >> $APP/data/remind.log 2>&1
 30 10 * * * cd $APP && $PY scripts/run.py >> $APP/data/cron.log 2>&1
 30 16 * * * cd $APP && $PY scripts/run.py >> $APP/data/cron.log 2>&1
 30 21 * * * cd $APP && $PY scripts/run.py --late-checkin --with-open >> $APP/data/cron.log 2>&1
 */5 * * * * cd $APP && $PY scripts/scan.py >> $APP/data/scan.log 2>&1
+*/15 * * * * cd $APP && ${OWNER_ENV}$PY scripts/token_probe.py >> $APP/data/token_probe.log 2>&1
+*/30 * * * * cd $APP && $PY scripts/token_report.py >> $APP/data/token_report.log 2>&1
+*/5 * * * * cd $APP && ${OWNER_ENV}$PY scripts/net_probe.py >> $APP/data/net_probe.log 2>&1
+*/1 * * * * cd $APP && ${OWNER_ENV}$PY scripts/watchlist_runner.py >> $APP/data/watchlist.log 2>&1
 * * * * * cd $APP && $PY scripts/activity_watch.py >> $APP/data/activity_watch.log 2>&1"
 
 ( crontab -l 2>/dev/null | grep -v 'tjise-activity-watch' || true; echo "$CRON_LINES" ) | crontab -
-echo "✓ 已安装定时任务：清单 07:00 / 10:30 / 16:30 / 21:30，私人提醒 07:05，扫描每 5 分钟（全天），动态监测每分钟唤醒（自行控频）"
+echo "✓ 已安装定时任务：清单 07:00（--with-grab）/ 10:30 / 16:30 / 21:30，私人提醒 07:05，扫描每 5 分钟，令牌探活每 15 分钟、令牌报告每 30 分钟、出网自检每 5 分钟、预报名 runner 每分钟、动态监测每分钟唤醒（自行控频）"
 echo
 crontab -l | grep 'tjise-activity-watch'
 echo
@@ -73,7 +87,7 @@ echo "── 机器人实例（单应用 combined 双入口） ──"
 # 单元会互相抢事件，所以这里只生成一个 combined 单元。
 APP_ID="${FEISHU_APP_ID:-}"
 APP_SECRET="${FEISHU_APP_SECRET:-}"
-OWNER_OPEN_ID="${PRIVATE_OWNER_OPEN_ID:-}"
+# OWNER_OPEN_ID 已在写 crontab 前从 PRIVATE_OWNER_OPEN_ID 读好，这里不再重复赋值
 
 if [ -z "$APP_ID" ] || [ -z "$APP_SECRET" ]; then
   echo "! 未提供机器人凭据，跳过 systemd 单元生成。"
