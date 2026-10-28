@@ -920,6 +920,136 @@ class LoginAnchorProductionPathTests(unittest.TestCase):
                 api._pump(Proc(), "登录", kind="login")
                 self.assertFalse(prefs.exists(), "没有可信时钟不得写 v2 锚点")
 
+    def test_failed_or_cancelled_login_keeps_existing_anchor(self):
+        """失败/取消的重新登录：旧凭证与旧锚点一律不动，只上报失败结论。"""
+        from fixtures.business_clock import FakeBusinessClock
+        app = self._app()
+        with tempfile.TemporaryDirectory() as name:
+            session = Path(name) / "session.json"
+            prefs = Path(name) / "ui.json"
+            session.write_text(json.dumps({"token": "tok-old", "saved_at": "2026-10-26 10:00:00"}),
+                               encoding="utf-8")
+            prefs.write_text(json.dumps({"session_timing_v2": {
+                "credential_id": app._credential_id("tok-old"),
+                "saved_epoch": 1793000000.0, "time_source": "ntp", "uncertainty_s": 0.1}}),
+                encoding="utf-8")
+
+            class Proc:
+                returncode = 1
+
+                def __init__(self):
+                    self.stdout = io.StringIO("[X] 窗口被关掉，登录没有完成\n")
+
+                def wait(self):
+                    return 1
+
+            events = []
+            api = app.Api(clock=FakeBusinessClock(epoch=1793100000.0, uncertainty=0.1))
+            api._emit = lambda kind, payload: events.append((kind, payload))
+            with mock.patch.object(app, "SESSION_FILE", session), \
+                    mock.patch.object(app, "PREFS", prefs):
+                api._pump(Proc(), "登录", kind="login")
+                timing = (app.load_prefs() or {}).get("session_timing_v2") or {}
+            self.assertEqual(timing.get("credential_id"), app._credential_id("tok-old"),
+                             "失败/取消不得改写旧锚点")
+            self.assertAlmostEqual(float(timing.get("saved_epoch") or 0), 1793000000.0, delta=0.001)
+            done = [p for k, p in events if k == "done"]
+            self.assertEqual(len(done), 1)
+            self.assertFalse(done[0]["ok"])
+            self.assertEqual(done[0]["reason"], "窗口被关掉，登录没有完成")
+
+    def test_failed_login_creates_no_anchor_for_fresh_session(self):
+        """本来没有锚点、登录又失败：不得凭空冒出 session_timing_v2。"""
+        from fixtures.business_clock import FakeBusinessClock
+        app = self._app()
+        with tempfile.TemporaryDirectory() as name:
+            session = Path(name) / "session.json"
+            prefs = Path(name) / "ui.json"
+            session.write_text(json.dumps({"token": "tok", "saved_at": "2026-10-26 10:00:00"}),
+                               encoding="utf-8")
+
+            class Proc:
+                returncode = 1
+
+                def __init__(self):
+                    self.stdout = io.StringIO("[X] 打不开登录页\n")
+
+                def wait(self):
+                    return 1
+
+            api = app.Api(clock=FakeBusinessClock(epoch=1793100000.0, uncertainty=0.1))
+            api._emit = lambda kind, payload: None
+            with mock.patch.object(app, "SESSION_FILE", session), \
+                    mock.patch.object(app, "PREFS", prefs):
+                api._pump(Proc(), "登录", kind="login")
+                timing = (app.load_prefs() or {}).get("session_timing_v2")
+            self.assertIsNone(timing, "失败路径不得建立锚点")
+
+    def test_successful_relogin_replaces_old_anchor(self):
+        """成功重登：锚点换成新凭证，旧凭证的锚点不能继承下来。"""
+        from fixtures.business_clock import FakeBusinessClock
+        app = self._app()
+        with tempfile.TemporaryDirectory() as name:
+            session = Path(name) / "session.json"
+            prefs = Path(name) / "ui.json"
+            session.write_text(json.dumps({"token": "tok-new", "saved_at": "2026-10-27 10:00:00"}),
+                               encoding="utf-8")
+            prefs.write_text(json.dumps({"session_timing_v2": {
+                "credential_id": app._credential_id("tok-old"),
+                "saved_epoch": 1793000000.0, "time_source": "ntp", "uncertainty_s": 0.1}}),
+                encoding="utf-8")
+
+            class Proc:
+                returncode = 0
+
+                def __init__(self):
+                    self.stdout = io.StringIO("[OK] 登录成功\n")
+
+                def wait(self):
+                    return 0
+
+            api = app.Api(clock=FakeBusinessClock(epoch=1793100000.0, uncertainty=0.1))
+            with mock.patch.object(app, "SESSION_FILE", session), \
+                    mock.patch.object(app, "PREFS", prefs):
+                api._pump(Proc(), "登录", kind="login")
+                timing = (app.load_prefs() or {}).get("session_timing_v2") or {}
+            self.assertEqual(timing.get("credential_id"), app._credential_id("tok-new"))
+            self.assertAlmostEqual(float(timing.get("saved_epoch") or 0), 1793100000.0, delta=1.0)
+
+    def test_anchor_write_failure_never_swallows_login_done(self):
+        """锚点写入失败也必须照常上报登录结论：否则界面永远停在「登录中」。"""
+        from fixtures.business_clock import FakeBusinessClock
+        app = self._app()
+        with tempfile.TemporaryDirectory() as name:
+            session = Path(name) / "session.json"
+            prefs = Path(name) / "ui.json"
+            session.write_text(json.dumps({"token": "tok-new", "saved_at": "2026-10-27 10:00:00"}),
+                               encoding="utf-8")
+
+            class Proc:
+                returncode = 0
+
+                def __init__(self):
+                    self.stdout = io.StringIO("[OK] 登录成功\n")
+
+                def wait(self):
+                    return 0
+
+            events = []
+            api = app.Api(clock=FakeBusinessClock(epoch=1793100000.0, uncertainty=0.1))
+            api._emit = lambda kind, payload: events.append((kind, payload))
+            with mock.patch.object(app, "SESSION_FILE", session), \
+                    mock.patch.object(app, "PREFS", prefs), \
+                    mock.patch.object(app, "save_session_timing_anchor",
+                                      side_effect=RuntimeError("prefs lock timeout")):
+                api._pump(Proc(), "登录", kind="login")
+            done = [p for k, p in events if k == "done"]
+            self.assertEqual(len(done), 1, "锚点失败不得中断 done 上报")
+            self.assertTrue(done[0]["ok"])
+            logs = [p for k, p in events if k == "log"]
+            self.assertTrue(any("锚点没有写成" in str(line) for line in logs),
+                            "锚点失败必须留下可诊断的日志")
+
 
 class LifecycleV2ClockTests(unittest.TestCase):
     """C08：晚校时恢复、未校准关闭、v1/v2 混存与异常退出事实。"""

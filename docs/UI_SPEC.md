@@ -248,6 +248,8 @@
 4. **启动校验状态**（界面验收）：无 session → 「未登录 + 登录」；有 session → 先显示「正在检查登录态」，不得提前写成「登录有效」；真实校验（`check_token` 访问学校接口）成功 → 「登录有效」并提示「已复用本机登录态」；接口返回 4001 → 「登录态失效 + 重新登录」；网络/接口异常 → 「暂时无法确认登录态」，保留已有会话与「刷新」重试，**不得**误报成首次未登录或强制重登。`check` 事件附 `result ∈ {valid, expired, unknown, none}` 附加字段（旧字段 `ok/session_present/hours_left` 语义不变）。
 5. **寿命口径**：`saved_at` 只用于「约剩 N 小时」提醒（约 10–17 小时为实测区间，非保证值），不得作为放行或拦截依据；登录有效性只由学校接口真实校验决定。
 6. **开始按钮门禁**（验收条款）：`updateControls()` 只有 `S.login.result === "valid"` 或 demo 模式（`bootstrap` 带 `demo:true`）允许「开始报名计划」；checking / unknown / none / expired 一律禁用开始，刷新与登录按钮保持可用。`refresh()` 的 check 调用失败（桥接/脚本异常）必须清除「检查中」、落 `unknown` 并更新胶囊与按钮，不得停留在「正在检查登录态」。后端 `start_plan` 是最终防线：非 demo 且最近一次 check 结论不是 `valid`（含尚未检查、checking、unknown、none、expired）一律拒绝并返回下一步提示；demo 模式继续可运行演示计划。
+7. **取消/失败的重新登录不清旧状态**（验收条款，2026-10-28 收口轮）：点「登录 / 重新登录」只是开始一次异步尝试，`doLogin()` 必须先存下完整登录结论快照（`S.login.preLoginSnapshot`：`hours/ok/present/expireAt/savedAt/result`）。取消、窗口被关掉、10 分钟超时或登录校验失败时，`handleDone` 必须把整份快照回滚——胶囊、剩余时间、锚点与按钮文字保持尝试前原样，只多一条这次失败的说明；**不得**把仍有效的旧会话画成「登录已失效」（旧实现的缺陷就是失败分支 `setLogin(null, false)` 把「这次没登成」写成了「登录结论失效」），也不得清掉旧锚点。`session_timing_v2` 只在登录 worker 真实成功路径换新，失败/取消零写入；成功后旧锚点立即作废，等随后的校验事件带新锚点回来。
+8. **登录结论的统一收口**（验收条款，2026-10-28 收口轮）：一次 check 终态（成功、100 秒超时、桥接/脚本异常、条款回绝、旧轮迟到被拒）必须同时刷新登录胶囊、剩余时间、时钟、大屏、路线、列表倒计时/空态与按钮，统一走 `syncLoginDependentView()`（= `paintLogin` + `paintClockStatus` + `refreshLoginEmptyState` + `render`），不允许只更新胶囊而留下旧倒计时。收口只重画、不改结论，且只在 `request_id` 代次校验之后执行：旧轮迟到事件不得覆盖新一轮的登录状态。
 
 ### 5.10 双模式与真实时间线（验收条款）
 

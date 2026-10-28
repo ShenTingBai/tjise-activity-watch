@@ -1409,6 +1409,253 @@ out.push({ text: document.querySelector("#pill-text").textContent,
         self.assertIn("未知", res[0]["expiry"])
 
 
+class LoginSequenceBehaviorTests(unittest.TestCase):
+    """P1：取消/失败/超时的重新登录必须整份回滚，成功换锚点，且同一轮统一收口。
+
+    用状态机序列断言（登录字段 + 胶囊 + 剩余时间 + 按钮），而不是只比一句文案：
+    用户看到的一致性是「所有 surface 在同一结论下同步」，单点文案断言抓不到
+    「胶囊已登录、剩余时间消失」这类混合态。
+    """
+
+    def test_cancelled_relogin_restores_full_prior_login_state(self):
+        """已登录点重登 → 取消：胶囊、剩余时间、锚点、按钮全部回到登录前，只多一条失败说明。"""
+        res = run_js(r"""
+const H = 3600e3;
+const t0 = 1700000000000;
+setBusinessNow(t0);
+const anchor = t0 / 1000 + 4 * 3600;
+setLogin(4, null, true, { session_present: true, estimated_expires_at: anchor, saved_at: "s-old" });
+window.onBackend.check({ ok: true, result: "valid", hours_left: 4, session_present: true,
+  estimated_expires_at: anchor, saved_at: "s-old" });
+const before = {
+  hours: S.login.hours, ok: S.login.ok, present: S.login.present, expireAt: S.login.expireAt,
+  text: document.querySelector("#pill-text").textContent,
+  state: document.querySelector("#pill").dataset.state,
+  sub: document.querySelector("#pill-sub").textContent,
+  btn: document.querySelector("#btn-login").textContent,
+};
+let pending = null;
+let loginCalls = 0;
+window.pywebview = { api: {
+  login: () => { loginCalls += 1; return new Promise((r) => { pending = r; }); },
+  check: () => Promise.resolve({ ok: true }),
+} };
+doLogin();
+const snapDuring = !!S.login.preLoginSnapshot;
+pending({ ok: true });
+await Promise.resolve(); await Promise.resolve();
+window.onBackend.done({ kind: "login", ok: false, reason: "窗口被关掉" });
+out.push({
+  snapDuring, snapCleared: S.login.preLoginSnapshot === null, loginCalls,
+  loginPending: S.login.loginPending,
+  hours: S.login.hours, present: S.login.present, expireAt: S.login.expireAt,
+  text: document.querySelector("#pill-text").textContent,
+  state: document.querySelector("#pill").dataset.state,
+  sub: document.querySelector("#pill-sub").textContent,
+  btn: document.querySelector("#btn-login").textContent,
+  before,
+});
+""")
+        r = res[0]
+        self.assertTrue(r["snapDuring"], "点登录时必须先存下完整登录结论快照")
+        self.assertTrue(r["snapCleared"], "取消落地后快照必须清掉，不能留着下次误回滚")
+        self.assertEqual(r["loginCalls"], 1)
+        self.assertFalse(r["loginPending"])
+        self.assertEqual(r["expireAt"], r["before"]["expireAt"], "取消不得动旧锚点")
+        self.assertEqual(r["present"], r["before"]["present"])
+        self.assertEqual(r["state"], "ok", "仍有效的旧会话不得画成失效")
+        self.assertEqual(r["text"], "已登录")
+        self.assertEqual(r["sub"], r["before"]["sub"], "剩余时间必须原样保留，不能显示成失效/未知")
+        self.assertEqual(r["btn"], r["before"]["btn"], "按钮文字不得因取消而变化")
+
+    def test_login_pending_never_paints_run_board(self):
+        """点登录期间大屏必须说「登录中」，不能借 S.busy 说成「正在准备报名」。"""
+        res = run_js(r"""
+const t0 = 1700000000000;
+setBusinessNow(t0);
+const anchor = t0 / 1000 + 4 * 3600;
+setLogin(4, null, true, { session_present: true, estimated_expires_at: anchor });
+window.onBackend.check({ ok: true, result: "valid", hours_left: 4, session_present: true,
+  estimated_expires_at: anchor });
+const boardBefore = document.querySelector("#selected").textContent;
+let pending = null;
+window.pywebview = { api: {
+  login: () => new Promise((r) => { pending = r; }),
+  check: () => Promise.resolve({ ok: true }),
+} };
+doLogin();
+const during = {
+  tag: document.querySelector("#board-tag-text").textContent,
+  title: document.querySelector("#selected").textContent,
+  text: document.querySelector("#board-text").textContent,
+  busy: S.busy,
+  loginPending: S.login.loginPending,
+};
+pending({ ok: true });
+await Promise.resolve(); await Promise.resolve();
+window.onBackend.done({ kind: "login", ok: false, reason: "窗口被关掉" });
+out.push({
+  boardBefore, during,
+  after: {
+    tag: document.querySelector("#board-tag-text").textContent,
+    title: document.querySelector("#selected").textContent,
+  },
+  loginPending: S.login.loginPending,
+  busy: S.busy,
+});
+""")
+        r = res[0]
+        self.assertTrue(r["during"]["loginPending"], "点登录后必须处于登录尝试态")
+        self.assertTrue(r["during"]["busy"], "登录尝试期间 S.busy 为真（等待 worker）")
+        self.assertEqual(r["during"]["tag"], "登录中", "登录尝试不得露出报名计划的「准备中」状态")
+        self.assertIn("登录窗口", r["during"]["title"])
+        self.assertNotIn("正在准备报名", r["during"]["title"],
+                         "点登录不能把大屏说成正在准备报名")
+        self.assertFalse(r["loginPending"])
+        self.assertFalse(r["busy"])
+        self.assertNotEqual(r["after"]["tag"], "登录中", "取消落地后大屏要回到非登录态")
+        self.assertEqual(r["after"]["title"], r["boardBefore"], "取消后大屏必须回到登录前的内容")
+
+    def test_logged_in_without_anchor_says_unknown_not_blank(self):
+        """有会话但锚点对不上（换过凭证/当时没可信时钟）：胶囊必须明说未知，不能空着。"""
+        res = run_js(r"""
+setBusinessNow(1700000000000);
+setLogin(null, true, true);
+out.push({
+  text: document.querySelector("#pill-text").textContent,
+  sub: document.querySelector("#pill-sub").textContent,
+  note: document.querySelector("#status-detail").textContent,
+  state: document.querySelector("#pill").dataset.state,
+  hours: loginHoursLeft(),
+});
+""")
+        r = res[0]
+        self.assertIsNone(r["hours"], "没有匹配锚点时不得报出小时数")
+        self.assertEqual(r["text"], "已登录")
+        self.assertEqual(r["state"], "ok")
+        self.assertIn("未知", r["sub"], "剩余时间未知时必须明说，不能留空白")
+        self.assertIn("重新登录", r["sub"], "算不出剩余时间时要给出下一步：建议重新登录")
+        self.assertNotIn("小时", r["sub"], "没有锚点不得编造剩余小时数")
+        self.assertIn("登录有效", r["note"], "说明文字要告诉用户登录本身是有效的")
+        self.assertIn("重新登录", r["note"], "说明文字要解释重新登录能恢复估算")
+
+    def test_failed_relogin_keeps_countdown_instead_of_invalid(self):
+        """超时/登录失败：保留旧有效期与「已登录」，只显示这次失败的说明。"""
+        res = run_js(r"""
+const H = 3600e3;
+const t0 = 1700000000000;
+setBusinessNow(t0);
+const anchor = t0 / 1000 + 6 * 3600;
+setLogin(6, null, true, { session_present: true, estimated_expires_at: anchor });
+window.onBackend.check({ ok: true, result: "valid", hours_left: 6, session_present: true,
+  estimated_expires_at: anchor });
+window.pywebview = { api: { login: () => Promise.resolve({ ok: true }), check: () => Promise.resolve({ ok: true }) } };
+doLogin();
+window.onBackend.done({ kind: "login", ok: false, reason: "仍未检测到登录成功" });
+out.push({
+  expireAt: S.login.expireAt,
+  state: document.querySelector("#pill").dataset.state,
+  text: document.querySelector("#pill-text").textContent,
+  sub: document.querySelector("#pill-sub").textContent,
+  hours: loginHoursLeft(),
+});
+""")
+        r = res[0]
+        self.assertEqual(r["expireAt"], 1700000000000 + 6 * 3600e3)
+        self.assertEqual(r["state"], "ok")
+        self.assertEqual(r["text"], "已登录")
+        self.assertIn("6 小时", r["sub"], "失败重登不能吞掉原有剩余时间")
+        self.assertAlmostEqual(r["hours"], 6.0, delta=0.01)
+
+    def test_cancelled_relogin_without_any_session_stays_logged_out(self):
+        """本来就没有会话：取消重登后仍是未登录，不能因为点过登录就显示已登录。"""
+        res = run_js(r"""
+window.pywebview = { api: { login: () => Promise.resolve({ ok: true }), check: () => Promise.resolve({ ok: true }) } };
+setLogin(null, false, false);
+doLogin();
+window.onBackend.done({ kind: "login", ok: false, reason: "打不开登录页" });
+out.push({
+  present: S.login.present, expireAt: S.login.expireAt,
+  state: document.querySelector("#pill").dataset.state,
+  text: document.querySelector("#pill-text").textContent,
+});
+""")
+        r = res[0]
+        self.assertFalse(r["present"])
+        self.assertIsNone(r["expireAt"])
+        self.assertEqual(r["state"], "none")
+        self.assertEqual(r["text"], "未登录")
+
+    def test_successful_relogin_clears_old_anchor_then_adopts_new(self):
+        """成功重登：尝试前快照作废，旧锚点立刻清零，随后 check 带回新锚点。"""
+        res = run_js(r"""
+const H = 3600e3;
+const t0 = 1700000000000;
+setBusinessNow(t0);
+const oldAnchor = t0 / 1000 + 1 * 3600;
+setLogin(1, null, true, { session_present: true, estimated_expires_at: oldAnchor, saved_at: "s-old" });
+window.onBackend.check({ ok: true, result: "valid", hours_left: 1, session_present: true,
+  estimated_expires_at: oldAnchor, saved_at: "s-old" });
+window.pywebview = { api: { login: () => Promise.resolve({ ok: true }), check: () => Promise.resolve({ ok: true }) } };
+doLogin();
+window.onBackend.done({ kind: "login", ok: true });
+const cleared = { expireAt: S.login.expireAt, snap: S.login.preLoginSnapshot };
+const newAnchor = t0 / 1000 + 17.5 * 3600;
+window.onBackend.check({ ok: true, result: "valid", hours_left: 17.5, session_present: true,
+  estimated_expires_at: newAnchor, saved_at: "s-new" });
+out.push({ cleared, after: S.login.expireAt, sub: document.querySelector("#pill-sub").textContent,
+  state: document.querySelector("#pill").dataset.state });
+""")
+        r = res[0]
+        self.assertIsNone(r["cleared"]["expireAt"], "成功后旧锚点必须立即作废")
+        self.assertIsNone(r["cleared"]["snap"], "成功后尝试前快照必须作废")
+        self.assertAlmostEqual(r["after"], 1700000000000 + 17.5 * 3600e3, delta=1000)
+        self.assertEqual(r["state"], "ok")
+        self.assertIn("约剩", r["sub"], "新锚点回来后胶囊必须报剩余时间")
+
+    def test_old_round_check_cannot_override_restored_state(self):
+        """取消落地后，旧轮 check 迟到：不得改写回滚后的登录结论。"""
+        res = run_js(r"""
+const H = 3600e3;
+const t0 = 1700000000000;
+setBusinessNow(t0);
+const anchor = t0 / 1000 + 4 * 3600;
+setLogin(4, null, true, { session_present: true, estimated_expires_at: anchor });
+window.onBackend.check({ ok: true, result: "valid", hours_left: 4, session_present: true,
+  estimated_expires_at: anchor });
+window.pywebview = { api: { login: () => Promise.resolve({ ok: true }), check: () => Promise.resolve({ ok: true }) } };
+doLogin();
+window.onBackend.done({ kind: "login", ok: false, reason: "窗口被关掉" });
+const kept = { expireAt: S.login.expireAt, state: document.querySelector("#pill").dataset.state };
+/* 回滚后新一轮刷新已经开始（S.round.check 是新 id）；此时上一轮的 check 才迟到 */
+S.round.check = "round-new";
+S.round.checkTimer = 0;
+window.onBackend.check({ request_id: "round-from-before", ok: false, result: "none", hours_left: null });
+out.push({ kept, after: { expireAt: S.login.expireAt, state: document.querySelector("#pill").dataset.state } });
+""")
+        r = res[0]
+        self.assertEqual(r["after"], r["kept"], "旧轮迟到结论不得覆盖回滚后的状态")
+
+    def test_sync_login_dependent_view_repaints_every_surface(self):
+        """统一收口函数必须同时重画胶囊/时钟/空态/大屏/路线/列表，不只改胶囊。"""
+        res = run_js(r"""
+window.onBackend.check({ ok: true, result: "valid", hours_left: 3, session_present: true,
+  estimated_expires_at: Date.now() / 1000 + 3 * 3600 });
+const seen = [];
+for (const name of ["paintList", "paintRoute", "paintSelected", "paintClockStatus", "refreshLoginEmptyState"]) {
+  const real = window[name] || eval(name);
+  const spy = function () { seen.push(name); return real.apply(null, arguments); };
+  if (name in window) window[name] = spy; else eval(name + " = spy");
+}
+syncLoginDependentView();
+out.push({ seen, state: document.querySelector("#pill").dataset.state });
+""")
+        r = res[0]
+        self.assertEqual(r["state"], "ok")
+        for name in ("paintList", "paintRoute", "paintSelected", "paintClockStatus", "refreshLoginEmptyState"):
+            self.assertIn(name, r["seen"], "统一收口必须重画 %s" % name)
+
+
 class TourBehaviorTests(unittest.TestCase):
     """R5/R6：引导内容版本判定、焦点循环、背景快捷键隔离、暂停放行（node vm 行为）。"""
 

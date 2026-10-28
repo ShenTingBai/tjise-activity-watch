@@ -63,7 +63,9 @@ const S = {
   listState: "idle",
   /* 最近一次列表失败的原话：完整失败说明只归列表空态，结果框不再复读 */
   listError: "",
-  login: { hours: null, ok: null, expireAt: null, savedAt: null, present: null, checking: false, loginPending: false, result: null },
+  /* preLoginSnapshot：一次重新登录前的完整登录结论快照。取消/超时/失败时整份
+   * 回滚，避免异步尝试的中途状态把仍有效的旧凭证画成「登录已失效」。 */
+  login: { hours: null, ok: null, expireAt: null, savedAt: null, present: null, checking: false, loginPending: false, result: null, preLoginSnapshot: null },
   /* 程序组件自检结论（worker_missing/worker_permission/spawn_failed）：非空时组件
    * 问题优先于登录/网络文案，登录与开始禁用。check/list 两分支按「刷新轮次」
    * 协同恢复：任一分支报组件故障立即挂横幅，另一分支成功/普通 unknown 不得撤；
@@ -468,9 +470,7 @@ function refresh(quiet) {
     S.login.checking = false;
     S.login.ok = false;
     S.login.result = "unknown";
-    paintLogin();
-    updateControls();
-    refreshLoginEmptyState();
+    syncLoginDependentView();
     addLog("[X] 检查登录状态超过 100 秒没有回应，先按「暂时无法确认」处理；点「刷新」重试。");
     settleRefreshBranch("check");
   }, 100000);
@@ -494,10 +494,8 @@ function refresh(quiet) {
     S.login.checking = false;
     S.login.ok = false;
     S.login.result = "unknown";
-    paintLogin();
-    updateControls();
-    /* 结论变了，空态要跟着从「正在检查」落到「暂时无法确认」 */
-    refreshLoginEmptyState();
+    /* 结论变了：胶囊、时钟、空态与所有倒计时一起收口，不能只改胶囊 */
+    syncLoginDependentView();
     addLog("[X] 检查登录状态失败：" + msg(err) + "；点「刷新」再试一次");
     settleRefreshBranch("check");
   });
@@ -532,9 +530,7 @@ function settleSynchronous(res, branch) {
         S.login.checking = false;
         S.login.ok = false;
         S.login.result = "unknown";
-        paintLogin();
-        updateControls();
-        refreshLoginEmptyState();
+        syncLoginDependentView();
         settleRefreshBranch("check");
       }, 100000);
       if (res.result) {
@@ -576,8 +572,7 @@ function settleSynchronous(res, branch) {
       S.login.checking = false;
       S.login.result = "unknown";
       S.login.ok = false;
-      paintLogin();
-      refreshLoginEmptyState();
+      syncLoginDependentView();
       settleRefreshBranch("check");
     } else {
       clearTimeout(S.round.listTimer);
@@ -594,9 +589,7 @@ function settleSynchronous(res, branch) {
     S.login.checking = false;
     S.login.result = "unknown";
     S.login.ok = false;
-    paintLogin();
-    updateControls();
-    refreshLoginEmptyState();
+    syncLoginDependentView();
     addLog("[X] " + ((res && res.text) || "这次检查没能开始") + "；点「刷新」重试。");
     settleRefreshBranch("check");
     return;
@@ -1224,6 +1217,14 @@ function paintSelected() {
     setBoardTag("首次使用", "off", true);
     box.textContent = "登录后开始";
     boardText.textContent = "活动会在登录完成后自动加载。";
+    return;
+  }
+  if (S.login.loginPending) {
+    /* 登录尝试期间 S.busy 也为真，但这不是报名计划：
+     * 不能把大屏说成「正在准备报名」，否则用户以为点登录触发了抢报名。 */
+    setBoardTag("登录中", "amber", true);
+    box.textContent = "正在打开登录窗口";
+    boardText.textContent = "在浏览器里登完再回来；中途关掉窗口会保留原来的登录状态。";
     return;
   }
   if (!S.busy && S.runtime.error && S.listState !== "ready") {
@@ -2309,40 +2310,50 @@ function doLogin() {
     if (!S.terms.declined && !S.terms.unknown) openTerms();
     return;
   }
-  /* 打开浏览器只是开始登录，不代表登录成功；在 done(login) 到达前保留真实的
-   * 失效/未登录结论，避免「取消登录」期间被忙碌态误画成已登录。 */
+  /* 登录是异步尝试：先把当前登录结论整份存下来。取消/超时/窗口关闭/失败
+   * 都整份回滚，只显示这次尝试的错误；只有真实成功才作废快照并等新锚点
+   * （见 handleDone），不能把仍有效的旧凭证画成「登录已失效」。 */
+  S.login.preLoginSnapshot = loginSnapshotState();
   S.login.loginPending = true;
   setResult(null);
   setBusy(true);
+  /* setBusy 会把 S.busy 置真；大屏据此会误判「报名计划在跑」，
+   * 立刻重画一次，让登录尝试显示成「登录中」而不是「正在准备报名」。 */
+  paintSelected();
   addLog("正在打开登录窗口，在弹出的浏览器里登完再回来…");
   api("login").then((res) => {
     if (res && res.demo) {
       /* 演示模式不打开学校登录页：如实说明，不当成登录失败（R20） */
       S.login.loginPending = false;
+      S.login.preLoginSnapshot = null;
       setBusy(false);
       setResult({ ok: "partial", title: "演示模式不登录", text: res.text || "演示模式不联网。" });
       return;
     }
     if (!res || res.ok === false) {
       S.login.loginPending = false;
+      /* 登录窗口没起来 / 被忙碌或条款拦下：回滚到尝试前的结论，只留错误提示 */
+      restoreLoginSnapshotState(S.login.preLoginSnapshot);
+      S.login.preLoginSnapshot = null;
       if (res && res.error && RUNTIME_ERRORS[res.error]) {
         /* FB4：登录的同步组件失败只挂横幅与唯一恢复入口，
          * 不再生成「登录没能开始」同义结果框；同时计入本轮刷新故障累计——
          * 刷新尚有分支未返回时，迟到的成功 check/list 不得撤掉这个新横幅 */
         noteRoundError(res.error);
         setBusy(false);
-        paintBanners();
-        updateControls();
+        syncLoginDependentView();
         return;
       }
       setBusy(false);
-      paintBanners();
-      updateControls();
+      syncLoginDependentView();
       setResult({ ok: false, title: "登录没能开始", text: (res && res.text) || "再点一次「登录」试试。" });
     }
   }).catch((err) => {
     S.login.loginPending = false;
+    restoreLoginSnapshotState(S.login.preLoginSnapshot);
+    S.login.preLoginSnapshot = null;
     setBusy(false);
+    syncLoginDependentView();
     setResult({ ok: false, title: "登录没能开始", text: msg(err) });
   });
 }
@@ -2354,15 +2365,21 @@ function handleDone(payload) {
     S.login.loginPending = false;
     setBusy(false);
     if (data.ok) {
-      /* 登录成功=新会话已保存：旧锚点立即作废（清掉），紧接着的校验事件会带
-       * 新锚点回来；这两秒里宁可显示未知，也不能拿旧凭证的剩余时间充数。 */
+      /* 登录成功=新会话已保存：作废尝试前快照，旧锚点立即清掉；紧接着的校验
+       * 事件会带新锚点回来，这两秒里宁可显示未知，也不能拿旧凭证的剩余时间充数。 */
+      S.login.preLoginSnapshot = null;
       setLogin(null, true, true, { estimated_expires_at: null, saved_at: null });
+      syncLoginDependentView();
       setResult({ ok: true, title: "登录成功", text: "正在加载活动列表。登录剩余时间以学校校验为准。", autoClose: Date.now() + 6000 });
       doCheck();
       refresh(true);
     } else {
-      /* 失败时保留上一次的 present：重登失败 ≠ 从没登录过 */
-      setLogin(null, false);
+      /* 取消 / 超时 / 窗口关闭 / 登录失败：整份回滚到尝试前——旧会话仍然有效，
+       * 不能因为这次没登成把胶囊画成「登录已失效」或丢掉剩余时间；
+       * 只显示这次尝试的失败说明（present 也随快照回滚，不再单独保留）。 */
+      restoreLoginSnapshotState(S.login.preLoginSnapshot);
+      S.login.preLoginSnapshot = null;
+      syncLoginDependentView();
       const copy = loginFailCopy(data.reason);
       setResult({ ok: false, title: copy.title, text: copy.text, action: { label: "再试一次", run: doLogin } });
     }
@@ -3005,6 +3022,25 @@ function showTaskResult(task) {
   }
 }
 
+/* 登录尝试前的完整快照：取消 / 超时 / 窗口关闭 / 失败时整份回滚。
+ * 只回滚界面用的登录结论，不动 session.json——这次没登成不等于旧凭证失效。 */
+function loginSnapshotState() {
+  return {
+    hours: S.login.hours, ok: S.login.ok, present: S.login.present,
+    expireAt: S.login.expireAt, savedAt: S.login.savedAt, result: S.login.result,
+  };
+}
+
+function restoreLoginSnapshotState(snap) {
+  if (!snap) return;
+  S.login.hours = snap.hours;
+  S.login.ok = snap.ok;
+  S.login.present = snap.present;
+  S.login.expireAt = snap.expireAt;
+  S.login.savedAt = snap.savedAt;
+  S.login.result = snap.result;
+}
+
 function setLogin(hours, ok, present, anchor) {
   S.login.hours = numOrNull(hours);
   S.login.ok = ok;
@@ -3045,6 +3081,17 @@ function loginHoursLeft() {
 function expiryText() {
   const at = S.login.expireAt;
   return at ? "约到 " + whenText(at) : "未知（以学校校验为准）";
+}
+
+/* 登录态关联视口的统一收口（P1）：胶囊、剩余时间、时钟、大屏、路线、列表
+ * 倒计时与空态、按钮必须在同一轮结论里一起刷新，不能只改胶囊留下旧倒计时。
+ * 只重画、不改结论；调用点都已在请求代次校验之后，旧轮迟到事件不得用它
+ * 覆盖新轮。 */
+function syncLoginDependentView() {
+  paintLogin();
+  paintClockStatus();
+  refreshLoginEmptyState();
+  render();
 }
 
 function paintLogin() {
@@ -3129,7 +3176,11 @@ function paintLogin() {
   } else if (ok === true) {
     cls += " is-ok";
     text = "已登录";
-    note = "刚核对过，可以加载活动";
+    /* 有会话但没有与当前凭证匹配的锚点（换过 token 或登录时没拿到可信时钟）：
+     * 必须明说「未知」并给出可执行的下一步——重新登录会重建锚点，
+     * 但不能说成失效：学校校验已经确认这次会话有效。 */
+    sub = "剩余时间未知，建议重新登录";
+    note = "已确认登录有效；重新登录一次会重建时间锚点、恢复剩余小时数估算";
     state = "ok";
   }
   pill.className = cls;
@@ -4878,7 +4929,6 @@ window.onBackend = {
     if (data.request_id && data.request_id === S.round.check) {
       clearTimeout(S.round.checkTimer);
     }
-    const hadRuntimeError = !!S.runtime.error;
     /* 真实校验回来了：解除「检查中」，记下四态结论（valid/none/expired/unknown） */
     S.login.checking = false;
     S.login.result = data.result || null;
@@ -4908,12 +4958,11 @@ window.onBackend = {
       addLog(reason.startsWith("[X]") ? reason : "[X] " + reason);
     }
     paintBanners();     /* 组件横幅随 check 结论出现/撤销 */
-    updateControls();
     paintChecks();
-    if (!!S.runtime.error !== hadRuntimeError) {
-      /* 组件结论出现/解除：列表空态与大屏短状态跟着切换（解除即恢复原状态） */
-      render();
-    }
+    /* 同一轮校验结论统一收口：胶囊、时钟、大屏、路线、列表空态与各倒计时
+     * 一起刷新，不留「胶囊更新了、倒计时还是旧的」混合态（上面的 request_id
+     * 代次校验已保证只有本轮结果能走到这里）。 */
+    syncLoginDependentView();
   },
   activities: (payload) => applyActivities(payload, false),
   done: (payload) => handleDone(payload),

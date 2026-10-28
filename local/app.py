@@ -2506,8 +2506,14 @@ class Api:
             # 登录只看退出码：grab.py login 成功时不会打印「报名成功」
             ok = proc.returncode == 0
             if ok:
-                # 只有本次登录真实成功才建立 v2 锚点：check/refresh 不续期
-                self._anchor_login_success()
+                # 只有本次登录真实成功才建立 v2 锚点：check/refresh 不续期，
+                # 失败/取消路径根本不走这里，旧锚点与旧会话原样保留。
+                # 锚点写入失败（偏好锁超时/磁盘只读）不能吞掉登录结论：
+                # 否则 done 永远不来，界面就永远停在「登录中」。
+                try:
+                    self._anchor_login_success()
+                except Exception as exc:  # noqa: BLE001 - 兜底上报，不中断收口
+                    self._emit("log", "[!] 登录成功，但会话时间锚点没有写成：%s" % exc)
         else:
             ok = proc.returncode == 0 and any("报名成功" in t for t in tail)
         reason = ""

@@ -451,7 +451,8 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 }
 
 /* 时钟/时间详情浮层：先给当前状态，再按需展开诊断信息。 */
-.pop { position: fixed; z-index: 40; width: 360px; max-width: calc(100vw - 24px); max-height: min(450px, calc(100vh - 76px)); overflow: auto; padding: 14px 15px 10px; border-radius: 10px; background: var(--paper); color: var(--ink); box-shadow: 0 0 0 1px var(--line-2), 0 12px 28px rgba(18,21,19,.2); }
+/* 高度固定：展开「使用记录」只在浮层内部滚动，浮层本身不长大，避免点击后整块跳变。 */
+.pop { position: fixed; z-index: 40; width: 360px; max-width: calc(100vw - 24px); height: min(452px, calc(100vh - 76px)); overflow: auto; padding: 14px 15px 10px; border-radius: 10px; background: var(--paper); color: var(--ink); box-shadow: 0 0 0 1px var(--line-2), 0 12px 28px rgba(18,21,19,.2); }
 .pop-head { display: flex; align-items: center; justify-content: space-between; }
 .pop-head h2 { margin: 0; color: var(--ink-3); font-size: 13px; font-weight: 600; }
 .pop-head button { width: 26px; height: 26px; border: 0; border-radius: 4px; background: transparent; color: var(--ink-2); font-size: 18px; }
@@ -471,9 +472,13 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .facts div { display: flex; justify-content: space-between; gap: 14px; padding: 4px 0; font-size: 12px; }
 .facts dt { color: var(--ink-3); }
 .facts dd { margin: 0; text-align: right; }
-.pop-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; padding-top: 8px; }
-.pop-facts div { display: block; min-width: 0; padding: 5px 0; }
-.pop-facts dd { margin-top: 2px; overflow: hidden; color: var(--ink); text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+/* 事实区用「标签列 + 值列」两列网格：值再长也只在值列内换行，
+ * 不会被省略号截断，也不会挤进相邻单元格。
+ * 用 display:contents 让 dt/dd 直接成为网格项，行高由最长的一侧决定。 */
+.pop-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 14px; align-items: baseline; padding-top: 8px; }
+.pop-facts div { display: contents; }
+.pop-facts dt { padding: 4px 0; color: var(--ink-3); font-size: 12px; }
+.pop-facts dd { margin: 0; padding: 4px 0; color: var(--ink); font-size: 12px; text-align: right; overflow-wrap: anywhere; }
 .records { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line); }
 .records summary { padding: 3px 0; color: var(--ink-2); font-size: 12px; font-weight: 600; cursor: pointer; }
 .records p { margin: 4px 0; color: var(--ink-3); font-size: 11px; }
