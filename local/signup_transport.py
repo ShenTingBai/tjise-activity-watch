@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import math
 import queue
 import threading
 import time
@@ -88,30 +89,60 @@ class DirectTransport:
 
     def _run(self, ticket: dict) -> None:
         request_id = ticket["request_id"]
+        committed = False
         try:
-            # open 前再查关闭 / 截止；过期或关闭的 ticket 只产生 not_started
+            # 接纳提交点（F02/F04 返修）：单调读数、截止/有效性检查、timeout
+            # 计算与 closed 检查全部在锁内完成并紧邻 started 入队——线程等锁
+            # 期间越过 dispatch/request 截止时必须用新鲜读数判废，不得沿用旧
+            # now 发射。close 用同一把锁，close 返回后不再产生新的 started；
+            # 锁不覆盖后面的阻塞 open/read。
             with self._lock:
-                closed_now = self._closed
-            now = self._monotonic()
-            if closed_now or now > ticket["dispatch_deadline"]:
-                self._emit(ticket, "not_started")
-                return
-            # 紧邻 open 发 started（真实尝试登记点）
-            self._emit(ticket, "started")
-            timeout_s = self._effective_timeout(ticket, now)
+                now = self._monotonic()
+                try:
+                    timeout_s = self._effective_timeout(ticket, now)
+                    invalid = (not math.isfinite(timeout_s) or timeout_s <= 0
+                               or now >= float(ticket["dispatch_deadline"])
+                               or now >= float(ticket["request_deadline"]))
+                except Exception:
+                    timeout_s = 0.0
+                    invalid = True
+                if self._closed or invalid:
+                    self._emit(ticket, "not_started")
+                    return
+                self._emit(ticket, "started")
+                committed = True
             self._perform(ticket, timeout_s)
+        except Exception as exc:
+            # 提交点后任何未预期异常必须补安全事件，不能 started 后无事件
+            if committed:
+                self._emit(ticket, "failed", error_class=type(exc).__name__)
+            else:
+                self._emit(ticket, "not_started")
         finally:
             with self._lock:
                 self._active.discard(request_id)
 
     def _effective_timeout(self, ticket: dict, now: float) -> float:
-        budget_left = max(0.0, ticket["dispatch_deadline"] - now)
-        return max(0.0, min(ticket.get("timeout_s", MAX_TIMEOUT_S), MAX_TIMEOUT_S, budget_left))
+        """网络 timeout = min(票据预算, 8 秒硬上限, request_deadline 剩余)。
+
+        不再用 dispatch_deadline 剩余当网络 timeout（F02）：发射窗只限最晚
+        启动，不限响应等待；也不延长原捕获预算。
+        """
+        cand = float(ticket.get("timeout_s", MAX_TIMEOUT_S))
+        budget_left = float(ticket["request_deadline"]) - now
+        if math.isnan(cand) or math.isnan(budget_left):
+            return float("nan")
+        return min(cand, MAX_TIMEOUT_S, budget_left)
 
     def _perform(self, ticket: dict, timeout_s: float) -> None:
-        request = urllib.request.Request(
-            ticket["url"], headers=ticket.get("headers", {}), method="GET",
-        )
+        try:
+            request = urllib.request.Request(
+                ticket["url"], headers=ticket.get("headers", {}), method="GET",
+            )
+        except Exception as exc:
+            # 构造 Request 异常也要给安全事件（started 已提交）
+            self._emit(ticket, "failed", error_class=type(exc).__name__)
+            return
         try:
             response = self._opener.open(request, timeout=timeout_s)
         except urllib.error.HTTPError as exc:

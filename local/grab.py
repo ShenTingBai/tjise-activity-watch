@@ -2251,6 +2251,10 @@ def cmd_grab(args):
                     except Exception:
                         direct["downgrade"] = True
                         return "downgrade"
+                    remaining = budget.remaining_s()
+                    if remaining <= 0:
+                        return "busy"
+                    mono_now = time.monotonic()
                     direct["seq"] += 1
                     req_id = "%s-%d" % (direct["run_id"], direct["seq"])
                     url = API + "/rjyHdCyr/signUp/" + sig
@@ -2262,8 +2266,9 @@ def cmd_grab(args):
                         "headers": {"Accept": "application/json, text/plain, */*",
                                     "token": captured_token,
                                     "Referer": REFERER, "User-Agent": UA},
-                        "dispatch_deadline": time.monotonic() + INFLIGHT_WAIT_S,
-                        "timeout_s": min(8.0, max(0.0, budget.remaining_s())),
+                        "dispatch_deadline": mono_now + min(INFLIGHT_WAIT_S, remaining),
+                        "request_deadline": mono_now + remaining,
+                        "timeout_s": min(8.0, remaining),
                     }
                     direct["reserved"] += 1
                     ok = direct["transport"].try_submit(ticket)
