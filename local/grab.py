@@ -1903,10 +1903,15 @@ def cmd_grab(args):
                     tail_deadline = (time.monotonic()
                                      + min(1.0, max(0.0, budget.remaining_s())))
                     while (time.monotonic() < tail_deadline
+                           and not budget.expired()
                            and state["pending"] > 0
                            and not state["resp_ok"]
                            and not state["login_invalid"]):
-                        _pump_wait(0.05)
+                        # 最后一片按收尾余量缩短，不能再用完整 50ms 越过尾窗
+                        tail_left = tail_deadline - time.monotonic()
+                        if tail_left <= 0:
+                            break
+                        _pump_wait(min(0.05, tail_left))
 
                 if state["login_invalid"]:
                     stop_reason = "login_invalid"

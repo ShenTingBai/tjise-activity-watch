@@ -23,6 +23,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 LOCAL = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(LOCAL))
@@ -1157,6 +1158,108 @@ class NonBlockingSubmitTimingTests(unittest.TestCase):
                          retry_for=60.0, max_attempts=3)
         self.assertEqual(res.page.request_handlers, [], "request 监听必须解除")
         self.assertEqual(res.page.response_handlers, [], "response 监听必须解除")
+
+    def test_tail_settles_success_arriving_within_one_second(self):
+        # 收尾窗口内到达的成功响应必须结算：点击「确定」到结束不到 1 秒
+        res = run_worker(behavior="slow_success", response_delay=0.4,
+                         at_offset=0.0, retry_for=10.0, max_attempts=1)
+        self.assertEqual(res.attempts, 1)
+        self.assertEqual(res.stop_reason, "success")
+        self.assertEqual(len(res.page.requests), 1, "收尾不得补发第二笔 signUp")
+        confirm_at = [at for at, name, _ in res.page.clicks if name == "确定"][-1]
+        self.assertLess(res.clock.time() - confirm_at, 1.0,
+                        "1 秒内到达的响应不应被漏掉")
+
+    def test_tail_keeps_success_pending_after_one_second(self):
+        # 响应迟到 1.2 秒：收尾最多等 1 秒，到点如实报未确认，请求保持 pending
+        res = run_worker(behavior="slow_success", response_delay=1.2,
+                         at_offset=0.0, retry_for=10.0, max_attempts=1)
+        self.assertEqual(res.attempts, 1)
+        self.assertEqual(res.stop_reason, "unconfirmed")
+        self.assertIn("pending=1", res.terminal_lines[-1],
+                      "迟到的成功不能判成成功或失败")
+        self.assertEqual(len(res.page.requests), 1, "收尾不得补发第二笔 signUp")
+        confirm_at = [at for at, name, _ in res.page.clicks if name == "确定"][-1]
+        elapsed = res.clock.time() - confirm_at
+        self.assertGreaterEqual(elapsed, 0.99, "收尾不能提前放弃在途响应")
+        # 末片按剩余时间缩短，整毫秒推进只留 1ms 容差：1 秒收尾不能被一整片 50ms 撑开
+        self.assertLessEqual(elapsed, 1.001 + 1e-6,
+                             "收尾按剩余时间截断，量化余量不超过 1ms")
+
+    def test_tail_stops_at_short_retry_budget(self):
+        # 重试预算只剩不到 1 秒：收尾按剩余预算封顶，绝不越过预算
+        res = run_worker(behavior="slow_success", response_delay=1.0,
+                         at_offset=0.0, retry_for=0.5, max_attempts=1)
+        self.assertEqual(res.attempts, 1)
+        self.assertEqual(res.stop_reason, "unconfirmed")
+        self.assertIn("pending=1", res.terminal_lines[-1],
+                      "预算到点仍无定论时保留未决")
+        self.assertEqual(len(res.page.requests), 1, "收尾不得补发第二笔 signUp")
+        confirm_at = [at for at, name, _ in res.page.clicks if name == "确定"][-1]
+        self.assertLessEqual(res.clock.time() - confirm_at, 0.501,
+                             "收尾不得越过重试预算")
+        # 绝对到期时间：准备阶段已经花掉的 0.2 秒也要算进预算，不能只看点击后的时长
+        self.assertLessEqual(res.clock.time(), START + 0.501 + 1e-6,
+                             "包含准备阶段的总耗时也不能越过重试预算")
+
+    def test_tail_excludes_success_just_after_deadline(self):
+        # 1.02 秒的成功不能被截止前启动的整片多接住；同时记录实际请求等待的边界
+        waits = []
+        original_wait = FakePage.wait_for_timeout
+
+        def record_wait(page, ms):
+            if page.confirm_clicks:
+                waits.append((page.clock.monotonic(), float(ms) / 1000.0))
+            return original_wait(page, ms)
+
+        with patch.object(FakePage, "wait_for_timeout", record_wait):
+            res = run_worker(behavior="slow_success", response_delay=1.02,
+                             at_offset=0.0, retry_for=10.0, max_attempts=1)
+        self.assertEqual(res.attempts, 1)
+        self.assertEqual(len(res.page.requests), 1)
+        self.assertEqual(res.stop_reason, "unconfirmed")
+        self.assertIn("pending=1", res.terminal_lines[-1])
+        self.assertEqual(len(res.terminal_lines), 1)
+        self.assertTrue(waits)
+        tail_start = waits[0][0]
+        self.assertGreaterEqual(res.clock.monotonic() - tail_start, 0.999)
+        self.assertLessEqual(res.clock.monotonic() - tail_start, 1.001 + 1e-6)
+        for started, requested in waits:
+            self.assertGreater(requested, 0.0)
+            self.assertLessEqual(requested, 0.05 + 1e-6)
+            self.assertLessEqual(started + requested - tail_start, 1.001 + 1e-6)
+        self.assertEqual(res.page.request_handlers, [])
+        self.assertEqual(res.page.response_handlers, [])
+
+    def test_tail_settles_success_just_before_deadline(self):
+        # 收紧尾片不能漏掉截止前到达的成功
+        res = run_worker(behavior="slow_success", response_delay=0.98,
+                         at_offset=0.0, retry_for=10.0, max_attempts=1)
+        self.assertEqual(res.attempts, 1)
+        self.assertEqual(len(res.page.requests), 1)
+        self.assertEqual(res.stop_reason, "success")
+        self.assertEqual(len(res.terminal_lines), 1)
+        confirm_at = [at for at, name, _ in res.page.clicks if name == "确定"][-1]
+        self.assertGreaterEqual(res.clock.time() - confirm_at, 0.98 - 1e-6)
+        self.assertLessEqual(res.clock.time() - confirm_at, 1.001 + 1e-6)
+        self.assertEqual(res.page.request_handlers, [])
+        self.assertEqual(res.page.response_handlers, [])
+
+    def test_tail_stops_at_sign_end(self):
+        # 报名截止比尾窗更早时必须优先停止，不能在截止后补查
+        deadline = START + 1.0
+        res = run_worker(behavior="slow_success", response_delay=2.0,
+                         at_offset=0.0, retry_for=10.0, max_attempts=1,
+                         sign_end=grab.school_time_text(deadline))
+        self.assertEqual(res.attempts, 1)
+        self.assertEqual(len(res.page.requests), 1)
+        self.assertEqual(res.stop_reason, "unconfirmed")
+        self.assertIn("pending=1", res.terminal_lines[-1])
+        self.assertEqual(len(res.terminal_lines), 1)
+        self.assertLessEqual(res.clock.time(), deadline + 0.001 + 1e-6)
+        self.assertTrue(all(post["at"] < deadline for post in res.posts))
+        self.assertEqual(res.page.request_handlers, [])
+        self.assertEqual(res.page.response_handlers, [])
 
 
 if __name__ == "__main__":
