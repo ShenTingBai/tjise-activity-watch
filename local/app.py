@@ -65,7 +65,9 @@ from domain.errors import ClosingError as _ClosingError
 from infrastructure import lifecycle_store as _lifecycle_store
 from infrastructure import prefs_store as _prefs_store
 from infrastructure import process_tree as _process_tree
+from infrastructure import phone_http as _phone_http
 from application import login_service as _login_service
+from application import phone_service as _phone_service
 from application import plan_service as _plan_service
 from application import update_service as _update_service
 
@@ -143,6 +145,27 @@ def terms_state(prefs: dict) -> dict:
         "version": TERMS_VERSION,
         "accepted_version": str((prefs or {}).get("terms_version") or ""),
         "accepted_at": str((prefs or {}).get("terms_accepted_at") or ""),
+    }
+
+
+def _retry_options_payload() -> dict:
+    """三种重试模式的权威选项与默认值：桌面/手机共用这一份口径。
+
+    缺截止的 0 模式回退秒数也在这里声明，不各维护第二套清单。
+    """
+    return {
+        "default": int(_retry_rules.DEFAULT_RETRY_SECONDS),
+        "fallback_seconds": int(_retry_rules.DEFAULT_RETRY_SECONDS),
+        "adaptive_cap_seconds": int(_retry_rules.ADAPTIVE_SECONDS),
+        "choices": [
+            {"value": 120, "label": "2 分钟"},
+            {"value": 600, "label": "10 分钟"},
+            {"value": 1800, "label": "30 分钟"},
+            {"value": 3600, "label": "1 小时"},
+            {"value": int(_retry_rules.ADAPTIVE_RETRY),
+             "label": "自动延长（最多25分钟）"},
+            {"value": 0, "label": "直到报名截止"},
+        ],
     }
 
 
@@ -469,6 +492,12 @@ class Api:
         self._latest_plan_id = ""
         # 已提交过终态的计划（重复 plan_done 幂等：已定结论不被重复包改写）
         self._finished_plan_ids: dict[str, bool] = {}
+        # 手机受限访问（默认关闭）：配对/会话只活在内存里，事件走有界缓冲。
+        # 这里不建 socket——只有显式 start_phone_access 才监听。
+        self._phone = _phone_service.PhoneAccessService(
+            api=self, now=self._clock_now, state_of=self._phone_raw_state,
+            server_factory=lambda host, port, svc: _phone_http.PhoneHttpServer(
+                host, port, svc))
 
     # ---------- 独立北京时间 ----------
     def _clock_now(self) -> float:
@@ -557,8 +586,6 @@ class Api:
 
     # ---------- 事件推送 ----------
     def _emit(self, kind: str, payload) -> None:
-        if not self._window:
-            return
         # check/activities 统一带上本轮请求 ID：界面按 ID 丢弃迟到的旧轮事件，
         # 不靠「最后一次谁先到」猜（R11）
         if isinstance(payload, dict) and "request_id" not in payload:
@@ -566,6 +593,11 @@ class Api:
                 payload = dict(payload, request_id=self._check_request_id)
             elif kind == "activities":
                 payload = dict(payload, request_id=self._list_request_id)
+        # 手机事件缓冲：窗口为空也可发布（有界 400 条、脱敏、独立锁、锁外投递）；
+        # 只入内存缓冲，绝不回调任何 HTTP 客户端，也不在这里碰 Api/协调器锁
+        self._phone.record_event(kind, payload)
+        if not self._window:
+            return
         # 终态快照留档：去重跳过时若原操作已经结束，直接把结果交回去，
         # 不让界面等一个永远不会再发的旧 ID 事件（C06）
         if isinstance(payload, dict) and kind == "check":
@@ -630,22 +662,8 @@ class Api:
             "lifecycle": lifecycle_info,
             # demo 标记：界面据此放行演示计划（真实模式仍要求登录校验 valid）
             "demo": DEMO,
-            # 三种重试模式的权威选项与默认值：桌面/手机共用这一份口径，
-            # 不各维护第二套清单；缺截止的 0 模式回退秒数也在这里声明
-            "retry_options": {
-                "default": int(_retry_rules.DEFAULT_RETRY_SECONDS),
-                "fallback_seconds": int(_retry_rules.DEFAULT_RETRY_SECONDS),
-                "adaptive_cap_seconds": int(_retry_rules.ADAPTIVE_SECONDS),
-                "choices": [
-                    {"value": 120, "label": "2 分钟"},
-                    {"value": 600, "label": "10 分钟"},
-                    {"value": 1800, "label": "30 分钟"},
-                    {"value": 3600, "label": "1 小时"},
-                    {"value": int(_retry_rules.ADAPTIVE_RETRY),
-                     "label": "自动延长（最多25分钟）"},
-                    {"value": 0, "label": "直到报名截止"},
-                ],
-            },
+            # 三种重试模式的权威选项与默认值：桌面/手机共用这一份口径
+            "retry_options": _retry_options_payload(),
         }
         # busy 与计划快照必须在同一「判定点」取：先取协调器快照（锁外），
         # 再回 Api 锁内确认这份快照仍属于当前计划并重新计算 busy。这样既不会
@@ -1548,6 +1566,11 @@ class Api:
             done_event.wait()
             return
         try:
+            # 手机入口先收：关 HTTP、撤销会话，再走进程收尾（顺序是硬要求）
+            try:
+                self._phone.stop()
+            except Exception:
+                pass
             if plan:
                 try:
                     plan.stop()
@@ -1573,6 +1596,66 @@ class Api:
             self._emit("log", "已请求停止")
             return {"ok": True}
         return {"ok": False, "text": "当前没有在跑的任务"}
+
+    # ---------- 手机受限访问（默认关闭） ----------
+    def _phone_raw_state(self) -> dict:
+        """手机状态投影的原料：只读本机缓存，绝不因此触发学校流量。"""
+        with self._lock:
+            activities = [dict(item) for item in self._activities.values()]
+            plan = self._plan
+            last_plan = self._last_plan
+            busy = self._is_busy_locked()
+        snapshot = None
+        if plan is not None:
+            try:
+                snapshot = plan.snapshot()
+            except Exception:
+                snapshot = None
+        if snapshot is None:
+            snapshot = last_plan
+        return {
+            "activities": activities,
+            "login": login_state(self._clock),
+            "plan": snapshot,
+            "busy": busy,
+            "business_clock": self._clock_payload(),
+            "retry_options": _retry_options_payload(),
+            "terms": terms_state(load_prefs()),
+            # relay 公开状态：login-relay 任务接入后改成真实投影
+            "login_relay": {"ready": False},
+        }
+
+    def phone_access_state(self) -> dict:
+        """桌面面板：监听状态、地址、一次性配对码与可选绑定地址。
+
+        配对码只在这里给桌面面板显示，不进 URL、不落日志、不发给未配对手机。
+        """
+        service = self._phone
+        return {"ok": True,
+                "running": service.is_running(),
+                "address": service.address(),
+                "pair_code": service.current_pair_code(),
+                "supported": service.bind_supported("127.0.0.1")}
+
+    def start_phone_access(self, host: str = "127.0.0.1") -> dict:
+        """开启受限手机入口：只绑定回环或 Tailscale 专属地址，固定 8765。"""
+        target = str(host or "127.0.0.1").strip()
+        if not self._phone.bind_supported(target):
+            return {"ok": False, "error": "bind_not_allowed",
+                    "text": "只允许本机回环或 Tailscale 专属地址"}
+        with self._lock:
+            if self._closing:
+                return {"ok": False, "text": "程序正在关闭，手机访问没有开启"}
+        result = self._phone.start(target)
+        if result.get("ok"):
+            self._emit("log", "手机访问已开启：%s" % result.get("address", ""))
+        return result
+
+    def stop_phone_access(self) -> dict:
+        """关闭手机入口并撤销全部会话：有界收尾，不留后台监听。"""
+        result = self._phone.stop()
+        self._emit("log", "手机访问已关闭")
+        return result
 
     def open_data(self) -> dict:
         """打开数据目录，并把**真实路径**回给界面。
