@@ -628,7 +628,57 @@ def session_from_items(items):
 
 
 # ---------------------------------------------------------------- 子命令
+def _cmd_login_relay(args):
+    """手机重登中继模式：独立 headless 上下文 + stdin/stdout JSON 行。
+
+    默认 cmd_login 行为完全不变；只有显式 --relay 才走这条路径。页面自己
+    发 captcha/login，这里只观察响应、填表、结算；凭据从 stdin 收一次用完
+    即弃，stdout 只有 [login] 安全 JSON 行（决策 5）。
+    """
+    import secrets as _secrets
+
+    import login_relay
+
+    ensure_data_dir()
+
+    class _Deps:
+        login_url = BASE + "/stu/" + LOGIN_HASH
+
+        def __init__(self):
+            self._pw = None
+
+        def now(self):
+            return time.monotonic()
+
+        def sleep(self, seconds):
+            time.sleep(seconds)
+
+        def new_id(self):
+            return _secrets.token_hex(8)
+
+        def open_page(self):
+            from playwright.sync_api import sync_playwright
+            self._pw = sync_playwright().start()
+            browser = launch_browser(self._pw, headless=True)
+            ctx = new_context(browser, with_state=False)
+            return ctx.new_page(), ctx, browser
+
+        def post(self, path, payload, tok):
+            return _post(path, payload, tok)
+
+        def save_state(self, state):
+            write_json_atomic(STATE_FILE, state)
+
+        def save_session(self, session):
+            session["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            write_json_atomic(SESSION_FILE, session)
+
+    return login_relay.run_relay(deps=_Deps(), stdin=sys.stdin, stdout=sys.stdout)
+
+
 def cmd_login(args):
+    if getattr(args, "relay", False):
+        return _cmd_login_relay(args)
     from playwright.sync_api import sync_playwright
 
     # login/check/list/grab 共用统一数据根；冻结进程首次会顺带迁移旧 EXE 旁数据
@@ -2800,6 +2850,8 @@ def main():
 
     p = sub.add_parser("login", help="打开浏览器手动登录一次，保存登录态")
     p.add_argument("--timeout", type=int, default=600, help="等待登录的秒数，默认 600")
+    p.add_argument("--relay", action="store_true",
+                   help="内部：手机重登中继模式（headless + stdin/stdout JSON 行）")
     p.set_defaults(func=cmd_login)
 
     p = sub.add_parser("check", help="检查登录态是否有效")

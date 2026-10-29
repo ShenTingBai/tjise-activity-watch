@@ -134,8 +134,8 @@ ACTION_PARAMS = {
     "save_retry_policy": {"retry_policy"},
     # relay 三动作（login-relay 任务接入 Api）：白名单先占位，未实现时明确报错
     "phone_relogin_begin": set(),
-    "phone_relogin_submit": {"challenge_id", "code"},
-    "phone_relogin_cancel": set(),
+    "phone_relogin_submit": {"flow_id", "challenge_id", "code"},
+    "phone_relogin_cancel": {"flow_id"},
 }
 # save_prefs 从手机只许改 retry_policy：不许 terms、路径或任意键
 RETRY_POLICY_KEYS = {"retry_for_s", "max_attempts"}
@@ -156,7 +156,7 @@ def normalize_action(action, args):
         return None, "args_not_allowed"
     clean = {}
     for key, value in args.items():
-        if key in ("request_id", "plan_id", "task_id", "challenge_id"):
+        if key in ("request_id", "plan_id", "task_id", "challenge_id", "flow_id"):
             if not isinstance(value, str) or not _ID_RE.fullmatch(value):
                 return None, "bad_args"
             clean[key] = value

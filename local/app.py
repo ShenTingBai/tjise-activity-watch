@@ -67,6 +67,7 @@ from infrastructure import prefs_store as _prefs_store
 from infrastructure import process_tree as _process_tree
 from infrastructure import phone_http as _phone_http
 from application import login_service as _login_service
+from application import login_relay_service as _login_relay_service
 from application import phone_service as _phone_service
 from application import plan_service as _plan_service
 from application import update_service as _update_service
@@ -438,6 +439,16 @@ def get_lifecycle(now_fn=None) -> AppLifecycle:
         return _LIFECYCLE
 
 
+class _RelayTree:
+    """relay worker 的最小进程句柄：收尾走既有树终止，不另起第二套收尸。"""
+
+    def __init__(self, proc: subprocess.Popen):
+        self.proc = proc
+
+    def terminate(self) -> None:
+        _kill_tree(self.proc)
+
+
 class Api:
     def __init__(self, clock=None) -> None:
         # 独立北京时间（决策 012）：生产 main 注入 BusinessClock；
@@ -498,6 +509,12 @@ class Api:
             api=self, now=self._clock_now, state_of=self._phone_raw_state,
             server_factory=lambda host, port, svc: _phone_http.PhoneHttpServer(
                 host, port, svc))
+        # 手机重登中继：凭据只在进程内存，singleflight，成功才建时钟锚点
+        self._relay = _login_relay_service.LoginRelayService(
+            spawn=self._spawn_relay_worker, now=time.monotonic,
+            emit=self._emit, log=lambda _msg: None,
+            on_success=self._anchor_login_success,
+            on_finish=self._relay_finished)
 
     # ---------- 独立北京时间 ----------
     def _clock_now(self) -> float:
@@ -1566,7 +1583,11 @@ class Api:
             done_event.wait()
             return
         try:
-            # 手机入口先收：关 HTTP、撤销会话，再走进程收尾（顺序是硬要求）
+            # 手机入口先收：有界取消中继、关 HTTP、撤销会话，再走进程收尾
+            try:
+                self._relay.shutdown()
+            except Exception:
+                pass
             try:
                 self._phone.stop()
             except Exception:
@@ -1653,9 +1674,71 @@ class Api:
 
     def stop_phone_access(self) -> dict:
         """关闭手机入口并撤销全部会话：有界收尾，不留后台监听。"""
+        self._relay.cancel()
         result = self._phone.stop()
         self._emit("log", "手机访问已关闭")
         return result
+
+    # ---------- 手机重登中继（凭据只在进程内存） ----------
+    def prepare_phone_relogin(self, username: str = "", password: str = "") -> dict:
+        """桌面「准备手机重登」：账号密码只进当前进程内存，响应只回 ready 布尔。
+
+        绝不写 prefs/文件/命令行/env/日志；手机 HTTP 白名单也读不到这份数据。
+        """
+        result = self._relay.prepare(username, password)
+        if result.get("ok"):
+            self._emit("log", "已为手机重登准备好账号（只在本工具内存里）")
+        return result
+
+    def phone_relogin_begin(self) -> dict:
+        if DEMO:
+            return {"ok": False, "error": "demo",
+                    "text": "演示模式不联网，不会启动重登。"}
+        gate = self._terms_gate()
+        if gate is not None:
+            return {"ok": False, "error": "terms_required",
+                    "text": "请先在电脑上同意使用条款"}
+        with self._lock:
+            if self._closing:
+                return {"ok": False, "text": "程序正在关闭，已取消本次重登"}
+            plan_active = bool(
+                self._plan and self._plan.published_status() in {"ready", "running"})
+        return self._relay.begin(plan_active=plan_active,
+                                 worker_command=worker_command("login"))
+
+    def phone_relogin_submit(self, flow_id: str = "", challenge_id: str = "",
+                             code: str = "") -> dict:
+        return self._relay.submit(flow_id, challenge_id, code)
+
+    def phone_relogin_cancel(self, flow_id: str = "") -> dict:
+        state = self._relay.state()
+        if flow_id and state.get("flow_id") and flow_id != state.get("flow_id"):
+            return {"ok": False, "error": "stale_flow",
+                    "text": "这次重登已经结束"}
+        return self._relay.cancel()
+
+    def _spawn_relay_worker(self, args: list[str]):
+        """relay worker 创建：与 _spawn 同锁关闭屏障与 busy 预留，登记后才允许输入。"""
+        problem = worker_problem()
+        if problem:
+            raise RuntimeError(problem)
+        with self._lock:
+            if self._closing:
+                raise RuntimeError("closing")
+            if self._is_busy_locked():
+                raise RuntimeError("busy")
+            proc = subprocess.Popen(
+                args, cwd=str(HERE), stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                env=_env(), creationflags=CREATE_NO_WINDOW)
+            self._proc = proc       # 占住 busy 位：原有 login/计划不能同跑
+        return _RelayTree(proc)
+
+    def _relay_finished(self) -> None:
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is not None:
+                self._proc = None
 
     def open_data(self) -> dict:
         """打开数据目录，并把**真实路径**回给界面。
@@ -1842,6 +1925,9 @@ class Api:
                 continue
             tail.append(line)
             del tail[:-40]
+            if line.startswith("[login] "):
+                # [login] 结构行交专属 relay flow；原日志/桌面 done 行为保持
+                self._relay.observe_line(line)
             self._emit("log", line)
         proc.wait()
         # done 结论整理在 application.login_service：login 只看退出码，
