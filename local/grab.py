@@ -25,6 +25,7 @@
 
 import argparse
 import json
+import math
 import os
 import queue
 import sys
@@ -1143,17 +1144,24 @@ class BurstPolicy:
     def _wall_now(self):
         """业务墙上时钟读数：只认 clock.now()（业务 epoch），不回退墙钟。
 
-        clock 不可用时抛 ClockUnavailable（由上层统一转 unconfirmed），
-        绝不静默回退 time.time()——那会让扩窗/截止在时钟失效时偷偷按真实
-        墙钟走，破坏「时钟不可用即停止发射」的契约。
+        clock 不可用或读数无效（None/NaN/±inf/无法转换）时抛 ClockUnavailable
+        （由上层统一转 unconfirmed），绝不静默回退 time.time()——那会让扩窗/截止
+        在时钟失效时偷偷按真实墙钟走，破坏「时钟不可用即停止发射」的契约。
         """
         if self._clock is None:
             import time as _time
             return _time.time()
         if hasattr(self._clock, "now"):
-            now = self._clock.now()
-            return float(now) if now is not None else time.time()
-        return float(self._clock())
+            raw = self._clock.now()
+        else:
+            raw = self._clock()
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise ClockUnavailable("业务时钟读数无效")
+        if not math.isfinite(value):
+            raise ClockUnavailable("业务时钟读数无效")
+        return value
 
     def _elapsed(self):
         """单调时钟读数（issued_at/TTL/慢地板用），永不抛 ClockUnavailable。"""
@@ -1502,6 +1510,24 @@ def _decode_body(raw):
     return {}
 
 
+def _recognizable_code(value):
+    """direct 响应业务 code 可识别性（A2 裁决）：仅接受非 bool 的有限整数
+    数值或去空白后严格的十进制整数字符串。bool（True==1 陷阱）、容器、
+    非数值字符串、非有限/非整数浮点一律视为无可识别业务 code（协议异常停发）。
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value) and value.is_integer()
+    if isinstance(value, str):
+        text = value.strip()
+        body = text[1:] if text[:1] in "+-" else text
+        return bool(body) and all("0" <= ch <= "9" for ch in body)
+    return False
+
+
 def _ts_text(ts) -> str:
     """秒级时间戳 → 学校时区的完整时间文本；None 显示 '-'（结构化日志用）。"""
     if not ts:
@@ -1825,6 +1851,8 @@ def cmd_grab(args):
             armed = {"on": False, "dead": False}
             listeners = []
             burst = None    # goto 前异常时 _settle_pending/_finalize 安全空转
+            direct = None   # goto 前异常时 finally 清理安全（A2 任务一）
+            _finalize = None   # 收尾闭包建立标记：早期异常走既有外层终态函数
             try:
                 ctx = new_context(browser)
                 page = ctx.new_page()
@@ -1875,6 +1903,7 @@ def cmd_grab(args):
 
                 reload_gap = 2.0
                 last_reload = 0.0
+                confirm_open = False   # F07：确认框重入状态（超时保留弹窗）
                 stop_reason = ""
                 # 黄金风暴状态机：开放时刻进入 10 轮 90ms，随后 180ms 全速；
                 # 404 连击进退避并扩窗，非 404 立即回全速（2026-10-28 方案）
@@ -1911,10 +1940,15 @@ def cmd_grab(args):
                     "run_id": os.urandom(8).hex(),
                     "seq": 0,
                     "ticket_to_bid": {},
+                    # 本场票据登记表（F03）：request_id -> run_id/attempt_no/生命周期。
+                    # 预留、started、lost、settled、cancelled 显式记账，不拿整数猜来源。
                     "registry": {},
                     "reserved": 0,   # 已提交未 started：预留名额与次数配额
                     "queue": None,
                 }
+                # 收尾一次性状态（F06）：tail_deadline 反复进入不重置；
+                # frozen 冻结响应接纳，不在核对期间放行迟到应答
+                finalize_state = {"tail_deadline": None, "frozen": False}
 
                 def _detect_direct_signer():
                     """入口脚本恰为已知直发包且 signer 可用才返回 build_signup_hash。
@@ -1957,6 +1991,8 @@ def cmd_grab(args):
                     state["phase"] = burst.phase
 
                 def on_request(request):
+                    # F05：回调只校验监听状态/URL 并入本场队列——不登记、不结算、
+                    # 不刷策略、不读业务钟、不打日志；登记由主循环一次完成。
                     if armed["dead"] or not armed["on"]:
                         return
                     # 直发在途（未降级）时，页面自发的同源请求不入账本、不改结论
@@ -1969,19 +2005,10 @@ def cmd_grab(args):
                     if not _is_signup_url(url_text):
                         return
                     ident = id(request)
-                    if ident in admitted_ids or ident in seen_ids:
+                    if ident in seen_ids:
                         return          # 同一个 Request 重复通知只计 1
-                    admitted_ids.add(ident)
                     seen_ids.add(ident)
-                    admitted_all.append(request)
-                    bid = burst.register_request()
-                    request_to_bid[ident] = bid
-                    _sync_pending()
-                    state["last_reason"] = "已发起，等响应"
-                    # 请求发起即上报，不等响应回来才让界面知道已提交
-                    log("[i] 第 %d 次提交：已发起" % state["attempts"])
-                    _retry_event(kind="submit", attempts=state["attempts"],
-                                 request_id=bid, phase=burst.phase)
+                    response_queue.append(("request", request))
 
                 def on_response(response):
                     # 回调只入队：结算统一走主循环的事件泵，不在回调里做 I/O
@@ -2053,16 +2080,17 @@ def cmd_grab(args):
                             log("[!] 版本不兼容：本场切换为点击兜底")
 
                 def _settle_one(response):
-                    """按 request_id 结算一笔在途响应；乱序合法，别家响应不改本场结论。"""
+                    """按 request_id 结算一笔在途响应；乱序合法，别家响应不改本场结论。
+
+                    不以「唯一 pending」认领未知响应（F05）：身份关联只走
+                    已接纳 Request 引用，避免把 direct 未决记到别人头上。
+                    """
                     if burst is None:
                         return
                     resp_request = getattr(response, "request", None)
                     bid = None
                     if resp_request is not None:
                         bid = request_to_bid.get(id(resp_request))
-                    elif burst.pending_count() == 1:
-                        # 替身/旧驱动可能不给 response.request：只在唯一未决时认领
-                        bid = burst.pending_ids()[0]
                     if bid is None:
                         state["last_reason"] = "收到其他请求的响应，本场结论未变"
                         return
@@ -2108,24 +2136,45 @@ def cmd_grab(args):
                     log("[i] 第 %d 次提交：%s" % (state["attempts"], state["last_reason"]))
 
                 def _settle_failed(request):
-                    """requestfailed：按既有 request_id 结算为 lost，立即释放名额。"""
+                    """requestfailed：按既有 request_id 结算为 lost，立即释放名额。
+
+                    不以「唯一 pending」认领未登记 Request（F05）。
+                    """
                     if burst is None:
                         return
                     ident = id(request)
                     bid = request_to_bid.get(ident)
-                    if bid is None and burst.pending_count() == 1:
-                        bid = burst.pending_ids()[0]
                     if bid is None:
                         return
                     burst.settle(bid, "lost")
                     state["last_reason"] = "请求中止（requestfailed），仍未决"
                     _sync_pending()
 
+                def _register_request(request):
+                    """主循环一次登记实际 Request 身份（F05 回调只入队）。"""
+                    ident = id(request)
+                    if ident in admitted_ids:
+                        return
+                    admitted_ids.add(ident)
+                    admitted_all.append(request)
+                    bid = burst.register_request()
+                    request_to_bid[ident] = bid
+                    _sync_pending()
+                    state["last_reason"] = "已发起，等响应"
+                    # 请求发起即上报，不等响应回来才让界面知道已提交
+                    log("[i] 第 %d 次提交：已发起" % state["attempts"])
+                    _retry_event(kind="submit", attempts=state["attempts"],
+                                 request_id=bid, phase=burst.phase)
+
                 def _settle_pending():
+                    if finalize_state["frozen"]:
+                        return        # 尾窗后冻结响应接纳：不再 drain 新事件
                     _drain_direct()     # 直发通道与页面通道同一事件泵
                     while response_queue:
                         item = response_queue.pop(0)
-                        if isinstance(item, tuple) and item and item[0] == "failed":
+                        if isinstance(item, tuple) and item and item[0] == "request":
+                            _register_request(item[1])
+                        elif isinstance(item, tuple) and item and item[0] == "failed":
                             _settle_failed(item[1])
                         else:
                             _settle_one(item)
@@ -2211,7 +2260,7 @@ def cmd_grab(args):
                             # A2 裁决：可识别业务 code 仅限非 bool 有限整数
                             # 数值或严格十进制整数字符串；其余按协议异常停发
                             has_code = (isinstance(payload, dict)
-                                        and payload.get("code") is not None)
+                                        and _recognizable_code(payload.get("code")))
                             if http_status != 200:
                                 anomaly = "通道/协议异常 HTTP %s，停止新发" % (http_status,)
                             elif not has_code:
@@ -2326,6 +2375,8 @@ def cmd_grab(args):
                     Playwright 同步 API 在等待里派发事件回调；成功/登录失效
                     立即返回，让调度循环收成唯一终态。等待按整毫秒推进，
                     不让浮点截断把 90ms 间隔悄悄吃短。
+                    返回 True 表示页面仍可继续；False 表示 page 不存在/已关闭/
+                    等待抛错（F06：调用方必须有界停泵，不得空转烧满尾窗）。
                     """
                     remain = budget.remaining_s()
                     wait_s = max(0.0, min(float(seconds), remain))
@@ -2341,10 +2392,11 @@ def cmd_grab(args):
                         try:
                             page.wait_for_timeout(min(left_ms, 50))  # 50ms 一片
                         except Exception:
-                            break
+                            return False    # 页面不可用：立即停泵
                         _settle_pending()
                         if state["resp_ok"] or state["login_invalid"]:
-                            return
+                            return True
+                    return True
 
                 def _may_fire():
                     """统一发射闸门：drain → 成功 → 4001 → 次数/截止 → 业务时间 → 名额。
@@ -2378,16 +2430,52 @@ def cmd_grab(args):
                         return "inflight"
                     return "ok"
 
+                def _fallback_terminal(exc):
+                    """finalize 异常退路统一终态优先级（F06）：已确认成功 >
+                    有未决 unconfirmed > 无未决的对应异常。不重入、不重建
+                    尾窗、不因异常再做学校请求；校时/预算异常同样不跳过
+                    已入账成功或未决事实。"""
+                    if state["resp_ok"]:
+                        return terminal("success")
+                    if state.get("pending", 0) > 0:
+                        return terminal("unconfirmed")
+                    if isinstance(exc, ClockUnavailable):
+                        state["last_reason"] = "北京时间暂不可用"
+                        return terminal("clock_unavailable")
+                    if isinstance(exc, BudgetExhausted):
+                        return terminal("sign_end" if state["binding"] == "sign_end"
+                                        else "retry_duration")
+                    return terminal("process_error")
+
                 def _finalize(stop_reason, fallback=None):
-                    """统一有界收尾（F04）：先结算可读队列，1 秒尾窗（受预算/sign_end
-                    截断），再按「成功粘性最优先」解析唯一终态。page/时钟不可用不忙转。
+                    """统一有界收尾（F04/F06）：先冻结新接纳、收齐已提交 started，
+                    一次性 1 秒尾窗（受预算/sign_end 截断），再按「成功粘性最优先」
+                    解析唯一终态。page/时钟不可用不忙转；反复进入不重建尾窗。
 
                     成功不被 False/异常覆盖（F01）；pending 且无成功＝未确认（F02）；
                     流程/鉴权/校时异常有未决保留事实。_settle_pending 不依赖 budget，
                     时钟失效也先把可读队列结算掉，再跳过收尾泵。
                     """
+                    if finalize_state.get("result") is not None:
+                        return finalize_state["result"]   # 不重入、不重建尾窗
+                    try:
+                        result = _finalize_once(stop_reason, fallback)
+                    except Exception as exc:
+                        # 所有异常退路（普通/校时/预算）共用同一终态优先级
+                        result = _fallback_terminal(exc)
+                    finalize_state["result"] = result
+                    return result
+
+                def _finalize_once(stop_reason, fallback=None):
+                    # 先冻结新接纳（F04）：close 与 started 提交同锁原子，
+                    # close 返回后不再产生新的 started；不等待阻塞线程。
                     if direct.get("transport") is not None:
-                        direct["transport"].close()
+                        try:
+                            direct["transport"].close()
+                        except Exception:
+                            pass
+                    # 再 drain 提交点已入队的 started/completed，然后取消未跨点
+                    # 预留：不得因 reserved 尚未转 pending 而误报零次/失败
                     _settle_pending()
                     for reg in direct["registry"].values():
                         if reg["state"] == "reserved":
@@ -2398,10 +2486,16 @@ def cmd_grab(args):
                         tail_gate = state["pending"] > 0 and not budget.expired()
                     except ClockUnavailable:
                         tail_gate = False
-                    if tail_gate:
+                    if tail_gate and finalize_state["tail_deadline"] is None:
                         try:
-                            tail_deadline = (time.monotonic()
-                                             + min(1.0, max(0.0, budget.remaining_s())))
+                            finalize_state["tail_deadline"] = (
+                                time.monotonic()
+                                + min(1.0, max(0.0, budget.remaining_s())))
+                        except ClockUnavailable:
+                            pass
+                    tail_deadline = finalize_state["tail_deadline"]
+                    if tail_gate and tail_deadline is not None:
+                        try:
                             while (time.monotonic() < tail_deadline
                                    and not budget.expired()
                                    and state["pending"] > 0
@@ -2409,9 +2503,13 @@ def cmd_grab(args):
                                 tail_left = tail_deadline - time.monotonic()
                                 if tail_left <= 0:
                                     break
-                                _pump_wait(min(0.05, tail_left))
+                                # 最后一片继续 min(0.05, tail_left)；页面不可用立即停泵
+                                if not _pump_wait(min(0.05, tail_left)):
+                                    break
                         except ClockUnavailable:
                             pass    # 时钟失效：收尾泵停；可读队列已由 _settle_pending 结算
+                    # 尾窗结束冻结响应接纳（F06）：核对期间不再 drain 迟到完成事件
+                    finalize_state["frozen"] = True
                     # 成功粘性最优先：已到 code=1 就是成功，不被 False/异常覆盖（F01）
                     if state["resp_ok"]:
                         return terminal("success")
@@ -2423,16 +2521,12 @@ def cmd_grab(args):
                     except ClockUnavailable:
                         can_check = False
                     if can_check:
-                        # 最终核对失败如实上抛为流程异常：无 pending 时报 process_error，
-                        # 有 pending 保留未决（F02）；成功已粘住时上面已 return（F01）。
+                        # 最终核对失败走统一退路优先级（F06）：不重入、
+                        # 不因异常再做学校请求；成功已粘住时上面已 return（F01）。
                         try:
                             joined_now = is_joined(target["id"], budget=budget)
-                        except ClockUnavailable:
-                            raise
-                        except Exception:
-                            if state["pending"] > 0:
-                                return terminal("unconfirmed")
-                            return terminal("process_error")
+                        except Exception as exc:
+                            return _fallback_terminal(exc)
                         if joined_now is True:
                             return terminal("success")
                     # pending 且无成功＝未确认（F02）
@@ -2514,23 +2608,30 @@ def cmd_grab(args):
                             break
                         # res == "downgrade"：本场单向切到下方点击兜底
 
-                    btn = page.locator("uni-button").filter(has_text="立即报名")
-                    if not btn.count():
-                        if time.monotonic() - last_reload >= reload_gap:
-                            page.reload(wait_until="domcontentloaded",
-                                        timeout=budget.timeout_ms(60000))
-                            _pump_wait(0.25)
-                            last_reload = time.monotonic()
-                            reload_gap = min(8.0, reload_gap * 1.5)
-                        else:
-                            _pump_wait(0.3)
-                        continue
+                    # F07 超时重入：确认框已开且「确定」可见时直接复用，不再点
+                    # 「立即报名」；弹窗消失才回普通入口重新开框。
+                    if confirm_open and page.get_by_text("确定", exact=True).count() == 0:
+                        confirm_open = False
+                    if not confirm_open:
+                        btn = page.locator("uni-button").filter(has_text="立即报名")
+                        if not btn.count():
+                            if time.monotonic() - last_reload >= reload_gap:
+                                page.reload(wait_until="domcontentloaded",
+                                            timeout=budget.timeout_ms(60000))
+                                _pump_wait(0.25)
+                                last_reload = time.monotonic()
+                                reload_gap = min(8.0, reload_gap * 1.5)
+                            else:
+                                _pump_wait(0.3)
+                            continue
 
                     # 非阻塞提交：点完「确定」立刻回调度循环（黄金风暴时序）
                     round_start = len(admitted_all)
                     aborted = False
                     try:
-                        btn.first.click(timeout=budget.timeout_ms(3000))
+                        if not confirm_open:
+                            btn.first.click(timeout=budget.timeout_ms(3000))
+                            confirm_open = True
                         # 打开确认框后、点「确定」前再过一次闸门（含名额满原地等≤1s）
                         gate2 = _may_fire()
                         if gate2 == "inflight":
@@ -2603,14 +2704,22 @@ def cmd_grab(args):
                 # F04）。取消尾窗 not login_invalid 限制：4001 后同窗内成功仍可结算。
                 return _finalize(stop_reason)
             except ClockUnavailable:
-                # 校时在浏览器阶段失效：统一收尾（有未决保留事实），不向外抛
+                # 校时在浏览器阶段失效：统一收尾（有未决保留事实），不向外抛。
+                # 收尾闭包尚未建立（预检/页面早期、零提交）时走既有外层终态
+                # 函数，不调用未建立闭包（A2 任务一）。
+                if _finalize is None:
+                    return _clock_stop()
                 return _finalize("clock_unavailable")
             except BudgetExhausted:
                 _fallback = ("sign_end" if state["binding"] == "sign_end"
                              else "retry_duration")
+                if _finalize is None:
+                    return _budget_stop("页面")
                 return _finalize(_fallback, fallback=_fallback)
             except Exception as exc:  # noqa: BLE001 - 流程异常也要在关浏览器前收口
                 state["last_reason"] = "运行异常：%s" % type(exc).__name__
+                if _finalize is None:
+                    return terminal("process_error")
                 return _finalize("process_error", fallback="process_error")
             finally:
                 # 停止/异常路径统一解除监听并失活回调：不留跨计划的残留监听
@@ -2622,7 +2731,7 @@ def cmd_grab(args):
                     except Exception:
                         pass
                 # 直发通道：关新发射（不等待在途线程，不假装取消学校处理）
-                if direct.get("transport") is not None:
+                if direct is not None and direct.get("transport") is not None:
                     try:
                         direct["transport"].close()
                     except Exception:

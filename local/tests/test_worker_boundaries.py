@@ -1186,9 +1186,6 @@ class BurstPolicyPureTests(unittest.TestCase):
                          "sign_end 永远硬截止，扩窗不得越过")
 
     def test_real_response_resets_streak_and_leaves_adaptive(self):
-        policy, clock = self._policy(base_deadline=START + 120.0)
-        clock.wall = START + 5.0
-    def test_real_response_resets_streak_and_leaves_adaptive(self):
         # 语义更新（§4）：纯 404 段不进 ADAPTIVE，故 real 之前的 phase 断言改为
         # 「不得是 ADAPTIVE」；real 到达仍清连击并回到全速（§11 未变）。
         policy, clock = self._policy(base_deadline=START + 120.0)
@@ -1203,6 +1200,46 @@ class BurstPolicyPureTests(unittest.TestCase):
         self.assertEqual(policy.streak_404, 0)
         self.assertEqual(policy.phase, policy.PHASE_FULL_SPEED,
                          "非 404 真实响应必须立即切回全速")
+
+    def test_wall_now_rejects_invalid_business_reading(self):
+        # F05：_wall_now 遇业务钟无效读数必须抛 ClockUnavailable，
+        # 绝不回退 time.time 偷跑墙上时间。
+        class NoneClock:
+            def now(self):
+                return None
+
+            def monotonic(self):
+                return 0.0
+
+            def elapsed_s(self):
+                return 0.0
+
+        policy, _clock = self._policy(base_deadline=START + 120.0)
+        policy._clock = NoneClock()
+        with self.assertRaises(grab.ClockUnavailable):
+            policy._wall_now()
+
+    def test_wall_now_rejects_non_finite_and_unconvertible(self):
+        # F05：None/NaN/±inf/无法转换的读数都必须显式 ClockUnavailable，
+        # 不得接受非有限值，也不得泄漏 ValueError/TypeError。
+        bad_values = (None, float("nan"), float("inf"), float("-inf"),
+                      "abc", object())
+        for bad in bad_values:
+            with self.subTest(bad=repr(bad)):
+                class BadClock:
+                    def now(self_inner, _value=bad):
+                        return _value
+
+                    def monotonic(self_inner):
+                        return 0.0
+
+                    def elapsed_s(self_inner):
+                        return 0.0
+
+                policy, _clock = self._policy(base_deadline=START + 120.0)
+                policy._clock = BadClock()
+                with self.assertRaises(grab.ClockUnavailable):
+                    policy._wall_now()
 
     def test_adaptive_backoff_interval_grows_and_caps(self):
         # 语义更新（§3/§4）：退避种子只给「含 throttled 且连击达阈值」的段；
@@ -2483,7 +2520,6 @@ class UnifiedDirectLoopTests(unittest.TestCase):
         self.assertLessEqual(len(FakeTransport.instances[0].tickets), 2,
                              "异常应答后不得再新发")
 
-
     def test_foreign_and_mismatched_events_have_no_side_effects(self):
         # F03：错 run_id、未知 request_id、错 attempt_no 的 started 无副作用——
         # 不注册尝试、不释放他人预留、不把同步替身事件当成真实发送。
@@ -2539,7 +2575,6 @@ class UnifiedDirectLoopTests(unittest.TestCase):
         self.assertEqual(res.stop_reason, "retry_duration",
                          "外来事件不得改变本场结论")
 
-
     def test_duplicate_events_do_not_rewrite_first_conclusion(self):
         # F03：第一笔已决（code=0）后，重复 code1/版本错误/重复 started/not_started
         # 均不改写首次结论、不降级、不减少其它票据预留。
@@ -2588,7 +2623,6 @@ class UnifiedDirectLoopTests(unittest.TestCase):
                          "重复事件不得减少他人预留、不得漏发第三笔")
         self.assertEqual(res.stop_reason, "retry_duration")
 
-
     def test_lost_ticket_late_success_settles_in_tail_window(self):
         # F03：failed(lost) 不是最终完成——同一合法请求的迟到成功在尾窗内仍能结算。
         calls = {"n": 0}
@@ -2619,7 +2653,6 @@ class UnifiedDirectLoopTests(unittest.TestCase):
         self.assertEqual(res.stop_reason, "success",
                          "lost 后迟到成功必须能合法结算，不得停在未决")
 
-
     def test_max_attempts_one_late_started_counted_and_single(self):
         # max_attempts=1 且 started 真正滞后：无第二笔；started 迟早入账后
         # 最终 attempt/pending 不能为 0。
@@ -2640,7 +2673,6 @@ class UnifiedDirectLoopTests(unittest.TestCase):
         self.assertEqual(res.pending, 1, "started 入账后必须保持未决")
         self.assertEqual(res.stop_reason, "unconfirmed")
 
-
     def test_uncommitted_reservation_cancelled_not_counted(self):
         # 未跨接纳点（started 永不放行）：close 取消预留，不计 attempt。
         def rel(ticket, event):
@@ -2656,7 +2688,6 @@ class UnifiedDirectLoopTests(unittest.TestCase):
         self.assertEqual(res.attempts, 0, "取消的预留不得计 attempt")
         self.assertEqual(res.stop_reason, "retry_duration")
 
-
     def test_two_blocked_threads_no_third_despite_logical_ttl(self):
         # 两笔物理在途：逻辑 TTL 过期也不得凭空创建第三线程（物理上限说了算）。
         FakeTransport.responder_fn = staticmethod(lambda t: "started_only")
@@ -2667,7 +2698,6 @@ class UnifiedDirectLoopTests(unittest.TestCase):
         self.assertEqual(len(FakeTransport.instances[0].tickets), 2,
                          "逻辑 TTL 不得越物理并发上限")
         self.assertEqual(res.stop_reason, "unconfirmed")
-
 
     def test_downgrade_shares_attempts_with_click(self):
         # 降级后 direct 与 click 共用同一账本：总次数共享，不重置预算/连击。
@@ -2682,7 +2712,6 @@ class UnifiedDirectLoopTests(unittest.TestCase):
         self.assertEqual(len(FakeTransport.instances[0].tickets), 1,
                          "降级后不得再发直发票据")
         self.assertIn("streak_404=0", res.terminal_lines[-1], "不得重置连击")
-
 
     def test_late_direct_success_prevents_confirm_click(self):
         # 版本错误到达后，旧 direct 迟到成功在确认前落账：不再点「确定」，
@@ -2722,6 +2751,476 @@ class UnifiedDirectLoopTests(unittest.TestCase):
         self.assertEqual(res.page.confirm_clicks, 0,
                          "迟到成功后不得再点「确定」")
         self.assertIn("streak_404=0", res.terminal_lines[-1], "不得重置连击")
+
+    def test_callbacks_do_not_touch_clock_policy_or_log(self):
+        # F05：回调只入队——回调期间禁止业务时钟读取、结算刷新与日志；
+        # 请求登记由主循环一次完成。
+        res = run_worker(behavior="success", at_offset=0.0, retry_for=10.0,
+                         max_attempts=1)
+        self.assertEqual(res.stop_reason, "success")
+        self.assertEqual(res.attempts, 1)
+        self.assertEqual(CALLBACK_GUARD["violations"], [],
+                         "回调期间不得碰时钟/结算/日志")
+
+    def test_foreign_requestfailed_after_downgrade_keeps_direct_pending(self):
+        # F05：降级后注入未登记 Request 的 requestfailed，不得按“唯一 pending”
+        # 认领 direct 未决名额、不改写本场结论。
+        calls = {"n": 0}
+
+        def responder(ticket):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "started_only"
+            return _d_payload(0, VERSION_MSG)
+
+        FakeTransport.responder_fn = staticmethod(responder)
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                         max_attempts=3, button_visible=False, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport,
+                         inject_failed_at=1000.0 + OPEN_AHEAD + 1.0)
+        self.assertEqual(res.stop_reason, "unconfirmed")
+        self.assertEqual(res.pending, 1, "未登记 requestfailed 不得释放 direct 未决")
+        self.assertNotIn("请求中止", res.terminal_lines[-1],
+                         "未登记 requestfailed 不得改写本场 last_reason")
+
+    def test_confirm_reentry_after_inflight_timeout_reuses_confirm_button(self):
+        # F07：确认框已开且名额 >1 秒才释放时，下一轮先查可见「确定」直接确认，
+        # 不再点「立即报名」（超时重入，不是 0.3 秒内释放的旧例）。
+        calls = {"n": 0}
+
+        def responder(ticket):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "started_only"
+            return _d_payload(0, VERSION_MSG)
+
+        FakeTransport.responder_fn = staticmethod(responder)
+        signer = _RecordingSigner()
+        res = run_worker(behavior="open_race", at_offset=OPEN_AHEAD, retry_for=60.0,
+                         max_attempts=4, button_visible=True, response_delay=1.5,
+                         script_srcs=self._known(), direct_signer=signer,
+                         direct_transport=FakeTransport)
+        btn_clicks = [c for c in res.page.clicks if c[1] == "uni-button"]
+        confirm_clicks = [c for c in res.page.clicks if c[1] == "确定"]
+        self.assertEqual(len(btn_clicks), 1, "超时重入不得重复点「立即报名」")
+        self.assertGreaterEqual(len(confirm_clicks), 1, "名额释放后必须直接确认")
+
+    def test_success_during_confirm_gate_wait_skips_confirm(self):
+        # F07：闸门二等待泵中先收到成功：取消确认，不点「确定」。
+        calls = {"n": 0}
+
+        def responder(ticket):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "started_only"
+            return _d_payload(0, VERSION_MSG)
+
+        FakeTransport.responder_fn = staticmethod(responder)
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success_on_open", at_offset=OPEN_AHEAD,
+                         retry_for=60.0, max_attempts=3, button_visible=True,
+                         response_delay=0.5, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "success")
+        self.assertEqual(res.page.confirm_clicks, 0, "成功先到时不得再点「确定」")
+
+    def _late_completed_release(self, delay_by_attempt, fires=1):
+        """按 attempt_no 返回 completed 的绝对放行时刻（锚定尾窗起点）。"""
+        def rel(ticket, event):
+            if event.get("kind") == "completed":
+                anchor = (1000.0 + OPEN_AHEAD
+                          + fires * grab.GOLDEN_INTERVAL_S)
+                return anchor + delay_by_attempt.get(event.get("attempt_no"), 0.5)
+            return None
+        return rel
+
+    def _run_recording(self, **kwargs):
+        """运行并记录 wait 切片，供尾窗长度精确测量（与 main 尾窗断言同口径）。"""
+        waits = []
+        original_wait = FakePage.wait_for_timeout
+
+        def record_wait(page, ms):
+            waits.append((page.clock.monotonic(), float(ms) / 1000.0))
+            return original_wait(page, ms)
+
+        with patch.object(FakePage, "wait_for_timeout", record_wait):
+            res = run_worker(**kwargs)
+        return res, waits
+
+    def _tail_len(self, res, waits):
+        # 尾窗起点 = 最后一个发射间隔短片（40ms）之后的那一片；
+        # 末尾 1ms 量化片不算间隔片
+        gap_idx = max(i for i, (_at, ms) in enumerate(waits)
+                      if 0.035 <= ms <= 0.045)
+        return res.clock.mono - waits[gap_idx + 1][0]
+
+    def test_direct_late_completed_tail_boundaries(self):
+        # direct 迟到 completed：0.4/0.98 秒在尾窗内 success；
+        # 1.02/1.2 秒超窗 unconfirmed，尾窗时长 <= 1.001+1e-6。
+        for delay, expect in ((0.4, "success"), (0.98, "success"),
+                              (1.02, "unconfirmed"), (1.2, "unconfirmed")):
+            with self.subTest(delay=delay):
+                FakeTransport.reset()
+                FakeTransport.responder_fn = staticmethod(_d_ok)
+                FakeTransport.release_at_fn = self._late_completed_release({1: delay})
+                signer = _RecordingSigner()
+                res, waits = self._run_recording(
+                    behavior="success", at_offset=OPEN_AHEAD,
+                    retry_for=30.0, max_attempts=1, button_visible=False,
+                    script_srcs=self._known(), direct_signer=signer,
+                    direct_transport=FakeTransport)
+                self.assertEqual(res.stop_reason, expect,
+                                 "延迟 %.2f 秒的 completed 结论" % delay)
+                if expect == "unconfirmed":
+                    self.assertEqual(res.pending, 1, "超窗事件不得伪造成结论")
+                    tail_len = self._tail_len(res, waits)
+                    self.assertGreaterEqual(tail_len, 0.999, "收尾不能提前放弃")
+                    self.assertLessEqual(tail_len, 1.001 + 1e-6,
+                                         "尾窗量化余量不超过 1ms")
+
+    def test_direct_late_completed_short_budget_and_sign_end(self):
+        # 短预算 / sign_end 先到：绝对截止不越（与六条 main 尾窗断言同口径）。
+        FakeTransport.responder_fn = staticmethod(_d_ok)
+        FakeTransport.release_at_fn = self._late_completed_release({1: 2.0})
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=0.0, retry_for=0.5,
+                         max_attempts=1, button_visible=False,
+                         script_srcs=self._known(), direct_signer=signer,
+                         direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "unconfirmed")
+        self.assertLessEqual(res.clock.time(), START + 0.501 + 1e-6,
+                             "短预算绝对截止不得越过")
+        FakeTransport.reset()
+        FakeTransport.responder_fn = staticmethod(_d_ok)
+        FakeTransport.release_at_fn = self._late_completed_release({1: 2.0})
+        signer = _RecordingSigner()
+        deadline = START + 1.0
+        res = run_worker(behavior="success", at_offset=0.0, retry_for=10.0,
+                         max_attempts=1, button_visible=False,
+                         script_srcs=self._known(), direct_signer=signer,
+                         direct_transport=FakeTransport,
+                         sign_end=grab.school_time_text(deadline))
+        self.assertEqual(res.stop_reason, "unconfirmed")
+        self.assertLessEqual(res.clock.time(), deadline + 0.001 + 1e-6,
+                             "sign_end 绝对截止不得越过")
+
+    def test_success_after_4001_within_original_tail_wins(self):
+        # 4001 先到、成功在原尾窗内到达仍 success（4001 不重设尾窗起点）。
+        FakeTransport.responder_fn = staticmethod(
+            lambda t: _d_payload(4001) if t["attempt_no"] == 1 else _d_ok(t))
+        FakeTransport.release_at_fn = self._late_completed_release(
+            {1: 0.05, 2: 0.5}, fires=2)
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                         max_attempts=2, button_visible=False,
+                         script_srcs=self._known(), direct_signer=signer,
+                         direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "success",
+                         "原尾窗内迟到成功必须压过 4001")
+
+    def test_tail_not_reset_by_4001(self):
+        # 4001 不重设尾窗起点：窗外迟到成功不得被补接，尾窗时长仍 <=1.001。
+        FakeTransport.responder_fn = staticmethod(
+            lambda t: _d_payload(4001) if t["attempt_no"] == 1 else _d_ok(t))
+        FakeTransport.release_at_fn = self._late_completed_release(
+            {1: 0.05, 2: 1.03}, fires=2)
+        signer = _RecordingSigner()
+        res, waits = self._run_recording(
+            behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+            max_attempts=2, button_visible=False,
+            script_srcs=self._known(), direct_signer=signer,
+            direct_transport=FakeTransport)
+        self.assertNotEqual(res.stop_reason, "success",
+                            "窗外成功不得借重置尾窗偷渡")
+        self.assertLessEqual(self._tail_len(res, waits), 1.001 + 1e-6,
+                             "4001 不得重设尾窗起点")
+
+    def test_broken_page_tail_stops_bounded(self):
+        # page 等待抛错且 pending>0：尾窗有界停泵，不得无时钟推进空转烧满 1 秒。
+        results = {}
+
+        def run():
+            FakeTransport.reset()
+            FakeTransport.responder_fn = staticmethod(lambda t: "started_only")
+            signer = _RecordingSigner()
+            results["res"] = run_worker(
+                behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                max_attempts=1, button_visible=False, script_srcs=self._known(),
+                direct_signer=signer, direct_transport=FakeTransport,
+                break_wait_at=1000.0 + OPEN_AHEAD + grab.GOLDEN_INTERVAL_S + 0.3)
+
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+        th.join(timeout=5.0)
+        self.assertFalse(th.is_alive(), "尾窗不得在页面失效后空转")
+        res = results["res"]
+        self.assertEqual(res.stop_reason, "unconfirmed")
+        self.assertEqual(res.pending, 1)
+
+    def test_final_query_true_after_one_second_still_success(self):
+        # 最终核对耗时跨 1.02 秒：is_joined 明确 True 仍 success。
+        FakeTransport.responder_fn = staticmethod(lambda t: "started_only")
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                         max_attempts=1, button_visible=False,
+                         script_srcs=self._known(), direct_signer=signer,
+                         direct_transport=FakeTransport,
+                         post_delays=[1.02], join_info_data={"id": "act-1"})
+        self.assertEqual(res.stop_reason, "success",
+                         "核对明确 True 时必须 success")
+
+    def test_late_code1_during_final_query_does_not_sneak(self):
+        # 核对期间冻结响应接纳：窗外迟到成功不得偷渡成 success。
+        FakeTransport.responder_fn = staticmethod(_d_ok)
+        FakeTransport.release_at_fn = self._late_completed_release({1: 1.5})
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                         max_attempts=1, button_visible=False,
+                         script_srcs=self._known(), direct_signer=signer,
+                         direct_transport=FakeTransport, post_delays=[1.02])
+        self.assertEqual(res.stop_reason, "unconfirmed",
+                         "冻结后迟到成功不得改写终态")
+
+
+    def test_direct_200_unrecognized_code_stops_sends(self):
+        # A2 裁决：bool/容器/空串/非数值字符串/非整数数值/非有限都不是可识别
+        # 业务 code——HTTP200 协议异常停发，无 pending 报 process_error；
+        # 不得把 True==1 误当报名成功，非法字段也不得切 click。
+        cases = (("true", True), ("false", False), ("obj", {}), ("arr", []),
+                 ("empty", ""), ("garbage", "garbage"), ("float", 1.5),
+                 ("nan", float("nan")), ("none", None))
+        for label, code in cases:
+            with self.subTest(code=label):
+                FakeTransport.reset()
+                FakeTransport.responder_fn = staticmethod(
+                    lambda t, c=code: _d_payload(c))
+                signer = _RecordingSigner()
+                res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                                 retry_for=30.0, max_attempts=3,
+                                 button_visible=False, script_srcs=self._known(),
+                                 direct_signer=signer, direct_transport=FakeTransport)
+                self.assertEqual(len(FakeTransport.instances[0].tickets), 1,
+                                 "%s：停发" % label)
+                self.assertEqual(res.stop_reason, "process_error",
+                                 "%s：无 pending 报 process_error" % label)
+                self.assertNotIn("切换为点击兜底", "\n".join(res.logs),
+                                 "%s：非法字段不得切 click" % label)
+
+    def test_direct_unrecognized_code_with_pending_reports_unconfirmed(self):
+        # A2 裁决：无可识别业务 code 停发时另有 pending，报 unconfirmed。
+        calls = {"n": 0}
+
+        def responder(ticket):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "started_only"
+            return _d_payload([])
+
+        FakeTransport.responder_fn = staticmethod(responder)
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                         retry_for=30.0, max_attempts=3, button_visible=False,
+                         script_srcs=self._known(), direct_signer=signer,
+                         direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "unconfirmed",
+                         "另有 pending 时停发报 unconfirmed")
+        self.assertEqual(res.pending, 1)
+        self.assertLessEqual(len(FakeTransport.instances[0].tickets), 2)
+
+    def test_direct_integer_string_code_is_recognized(self):
+        # A2 裁决：去空白后严格的十进制整数字符串是可识别业务 code，
+        # 按原业务判据处理（"4001"→login_invalid），不按协议异常停发。
+        FakeTransport.responder_fn = staticmethod(lambda t: _d_payload("4001"))
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                         retry_for=30.0, max_attempts=3, button_visible=False,
+                         script_srcs=self._known(), direct_signer=signer,
+                         direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "login_invalid",
+                         "整数字符串按原业务判据走 4001")
+
+
+class FinalizeFallbackTests(unittest.TestCase):
+    """F06 返修：finalize 异常退路共用同一终态优先级——
+    已确认成功 > 有未决 unconfirmed > 无未决的对应异常；只输出一条 done。"""
+
+    def setUp(self):
+        FakeTransport.reset()
+
+    def _known(self):
+        return [KNOWN_SRC]
+
+    def test_finalize_exception_with_pending_reports_unconfirmed(self):
+        # 复现：即时 started、completed 延迟 0.4s、max_attempts=1，尾窗内
+        # BurstPolicy.settle 抛 RuntimeError。done 必须 unconfirmed，
+        # 不得丢掉未决事实冒充 process_error。
+        def rel(ticket, event):
+            if event.get("kind") == "completed":
+                return FakeTransport.clock.mono + 0.4
+            return None
+
+        def boom(self, *args, **kwargs):
+            raise RuntimeError("settle boom")
+
+        FakeTransport.responder_fn = staticmethod(_d_ok)
+        FakeTransport.release_at_fn = rel
+        signer = _RecordingSigner()
+        with patch.object(grab.BurstPolicy, "settle", boom):
+            res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                             retry_for=30.0, max_attempts=1, button_visible=False,
+                             script_srcs=self._known(), direct_signer=signer,
+                             direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "unconfirmed",
+                         "异常退路不得丢掉未决事实")
+        self.assertEqual(res.pending, 1)
+        self.assertEqual(res.attempts, 1)
+        self.assertEqual(len(res.terminal_lines), 1, "只输出一条 done")
+
+    def test_finalize_clock_exception_keeps_pending_facts(self):
+        # 校时异常退路不得跳过已入账未决事实：pending>0 必须 unconfirmed，
+        # 且不因异常重入再做学校请求（is_joined 只查预检+一次最终核对）。
+        queries = {"n": 0}
+
+        def fake_is_joined(*args, **kwargs):
+            queries["n"] += 1
+            if queries["n"] > 1:
+                raise grab.ClockUnavailable("测试注入：校时失效")
+            return None        # 预检：未报名
+
+        FakeTransport.responder_fn = staticmethod(lambda t: "started_only")
+        signer = _RecordingSigner()
+        with patch.object(grab, "is_joined", fake_is_joined):
+            res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                             retry_for=30.0, max_attempts=1, button_visible=False,
+                             script_srcs=self._known(), direct_signer=signer,
+                             direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "unconfirmed",
+                         "校时异常不得跳过未决事实")
+        self.assertEqual(res.pending, 1)
+        self.assertEqual(len(res.terminal_lines), 1, "只输出一条 done")
+        self.assertEqual(queries["n"], 2,
+                         "异常退路不得重入再做学校请求")
+
+    def test_finalize_exception_after_success_keeps_success(self):
+        # 已确认成功退路：同一 drain 内 settle 成功后再抛异常，done 仍是 success。
+        calls = {"n": 0}
+        orig_settle = grab.BurstPolicy.settle
+
+        def flaky(self, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("boom after success")
+            return orig_settle(self, *args, **kwargs)
+
+        def rel(ticket, event):
+            # 两笔 completed 同一绝对时刻放行：必然落入同一次 drain
+            if event.get("kind") == "completed":
+                return 1000.0 + OPEN_AHEAD + 2 * grab.GOLDEN_INTERVAL_S + 0.4
+            return None
+
+        FakeTransport.responder_fn = staticmethod(_d_ok)
+        FakeTransport.release_at_fn = rel
+        signer = _RecordingSigner()
+        with patch.object(grab.BurstPolicy, "settle", flaky):
+            res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                             retry_for=30.0, max_attempts=2, button_visible=False,
+                             script_srcs=self._known(), direct_signer=signer,
+                             direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "success",
+                         "已确认成功不得被异常退路覆盖")
+        self.assertEqual(len(res.terminal_lines), 1, "只输出一条 done")
+
+    def test_finalize_exception_without_pending_reports_process_error(self):
+        # 无未决的普通异常退路：process_error（对应异常）。
+        queries = {"n": 0}
+
+        def fake_is_joined(*args, **kwargs):
+            queries["n"] += 1
+            if queries["n"] > 1:
+                raise RuntimeError("query boom")
+            return None        # 预检：未报名
+
+        FakeTransport.responder_fn = staticmethod(
+            lambda t: _d_payload(0, "报名人数已满"))
+        signer = _RecordingSigner()
+        with patch.object(grab, "is_joined", fake_is_joined):
+            res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                             retry_for=30.0, max_attempts=1, button_visible=False,
+                             script_srcs=self._known(), direct_signer=signer,
+                             direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "process_error",
+                         "无未决的普通异常按对应异常收口")
+        self.assertEqual(len(res.terminal_lines), 1, "只输出一条 done")
+
+
+class EarlyFailureTests(unittest.TestCase):
+    """A2 任务一：预检/页面早期异常不得调用尚未建立的收尾闭包。
+
+    每个分支：零提交、正确异常类别、唯一 done、无不必要的最终查询、
+    浏览器已关闭；异常类别不得被 UnboundLocalError 扭曲成 process_error。
+    """
+
+    def _assert_clean(self, res, stop_reason):
+        self.assertEqual(res.attempts, 0, "早期异常必须零提交")
+        self.assertEqual(res.stop_reason, stop_reason,
+                         "早期异常必须走正确类别终态")
+        self.assertEqual(len(res.terminal_lines), 1, "只输出一条 done")
+        self.assertNotIn("UnboundLocalError", res.terminal_lines[-1],
+                         "早期异常不得被未建立闭包扭曲")
+        self.assertTrue(res.page.closed, "浏览器必须已关闭")
+
+    def test_preflight_clock_failure_uses_outer_terminal(self):
+        # 预检 is_joined 抛 ClockUnavailable：clock_unavailable、零提交、
+        # 不再做最终查询。
+        queries = {"n": 0}
+
+        def fake_is_joined(*args, **kwargs):
+            queries["n"] += 1
+            raise grab.ClockUnavailable("测试注入：预检校时失效")
+
+        with patch.object(grab, "is_joined", fake_is_joined):
+            res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                             retry_for=60.0, max_attempts=3)
+        self._assert_clean(res, "clock_unavailable")
+        self.assertEqual(queries["n"], 1, "不得再做最终查询")
+
+    def test_page_goto_failure_uses_outer_terminal(self):
+        # page.goto 抛异常：process_error，异常类别如实（FakeTimeout）。
+        res = run_worker(behavior="goto_fail", at_offset=OPEN_AHEAD,
+                         retry_for=60.0, max_attempts=3)
+        self._assert_clean(res, "process_error")
+        self.assertIn("FakeTimeout", res.terminal_lines[-1],
+                      "异常类别不得被扭曲")
+
+    def test_page_goto_budget_exhausted_uses_budget_stop(self):
+        # goto 时预算耗尽（timeout_ms 到点拒绝）：按预算类别收口。
+        def boom(self, *args, **kwargs):
+            raise time_contract.BudgetExhausted("重试窗口已到点")
+
+        with patch.object(time_contract.RetryBudget, "timeout_ms", boom):
+            res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                             retry_for=60.0, max_attempts=3)
+        self._assert_clean(res, "retry_duration")
+
+    def test_new_context_failure_uses_outer_terminal(self):
+        # new_context/new_page 失败：process_error，异常类别如实。
+        with patch.object(grab, "new_context",
+                          side_effect=RuntimeError("ctx boom")):
+            res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                             retry_for=60.0, max_attempts=3)
+        self._assert_clean(res, "process_error")
+        self.assertIn("RuntimeError", res.terminal_lines[-1],
+                      "异常类别不得被扭曲")
+
+    def test_wait_until_clock_failure_uses_clock_stop(self):
+        # 进入盯按钮前 wait_until 校时失效：clock_unavailable、
+        # 只有预检一次查询（无不必要的最终查询）。
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                         retry_for=60.0, max_attempts=3,
+                         post_hook=lambda n, clock: clock.lose())
+        self._assert_clean(res, "clock_unavailable")
+        self.assertEqual(len(res.posts), 1, "只有预检一次查询")
 
 
 if __name__ == "__main__":
