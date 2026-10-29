@@ -19,6 +19,7 @@ import contextlib
 import io
 import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -122,6 +123,15 @@ class FakeResponse:
             raise self._payload
         return self._payload
 
+    def body(self):
+        # 200+HTML 等非 JSON 载体也必须能读字节：本轮真实实现用 _decode_body
+        # 而非 json()，读不出合法 JSON 时退回 {}，不伪装成 lost。
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        if isinstance(self._payload, (bytes, bytearray)):
+            return bytes(self._payload)
+        return json.dumps(self._payload, ensure_ascii=False).encode("utf-8")
+
 
 class FakeLocator:
     def __init__(self, page, name):
@@ -138,6 +148,9 @@ class FakeLocator:
     def count(self):
         if self.name == "uni-button":
             return 1 if self.page.button_visible else 0
+        if self.name == "确定":
+            # 「确定」只在确认框开着时可见：用于 detecting 弹窗已开（不再重复点报名）
+            return 1 if self.page.dialog_open else 0
         return 1
 
     def click(self, timeout=None):
@@ -152,12 +165,29 @@ class FakeLocator:
             if behavior == "lose_before_confirm":
                 # 打开确认框后校时失效：确认前检查必须拒绝，不产生提交
                 self.page.clock.lose()
+            if behavior == "open_race":
+                # 页面抢跑：开确认框的同时就发出一笔 signUp（闸门②必须看到名额被占）
+                request = FakeRequest(
+                    "https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE + "-race")
+                self.page._notify(request)
+                self.page._enqueue_response(
+                    FakeResponse(request, {"code": 0, "message": "未就绪"}, status=404),
+                    delay=self.page.response_delay or 0.3)
+            if behavior == "success_on_open":
+                # 页面抢跑直接成功：闸门②必须先 drain 到它，绝不点「确定」
+                request = FakeRequest(
+                    "https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE + "-ok")
+                self.page._notify(request)
+                self.page._enqueue_response(
+                    FakeResponse(request, {"code": 1, "message": "报名成功"}))
+            self.page.dialog_open = True
             self.page._deliver_due()
             return                      # 默认只开确认框，不发请求
         if self.name == "确定":
             self.page.confirm_clicks += 1
             if behavior == "confirm_fail":
                 raise FakeTimeout("确认框点击失败")
+            self.page.dialog_open = False
             self.page.fire_from_confirm()
             self.page._deliver_due()
             return
@@ -172,19 +202,23 @@ class FakePage:
     """
 
     def __init__(self, clock, behavior, button_visible=True, click_delay=0.0,
-                 foreign=False, response_delay=0.0):
+                 foreign=False, response_delay=0.0, script_srcs=None):
         self.clock = clock
         self.behavior = behavior
         self.button_visible = button_visible
         self.click_delay = click_delay
         self.foreign = foreign
         self.response_delay = float(response_delay)
+        self.script_srcs = script_srcs    # 直发检测读入口 script src（None=未知→点击）
         self.request_handlers = []
         self.response_handlers = []
+        self.requestfailed_handlers = []
         self.pending_deliveries = []    # (deliver_at, response)
         self.requests = []
         self.clicks = []
         self.confirm_clicks = 0
+        self.dialog_open = False        # 确认框是否开着（「确定」可见性）
+        self.closed = False             # 浏览器已关：之后任何页面动作都必须被拒绝
         self.removed_listeners = []
 
     def on(self, event, handler):
@@ -192,6 +226,8 @@ class FakePage:
             self.request_handlers.append(handler)
         elif event == "response":
             self.response_handlers.append(handler)
+        elif event == "requestfailed":
+            self.requestfailed_handlers.append(handler)
 
     def remove_listener(self, event, handler):
         self.removed_listeners.append((event, handler))
@@ -199,8 +235,22 @@ class FakePage:
             self.request_handlers = [h for h in self.request_handlers if h is not handler]
         elif event == "response":
             self.response_handlers = [h for h in self.response_handlers if h is not handler]
+        elif event == "requestfailed":
+            self.requestfailed_handlers = [h for h in self.requestfailed_handlers
+                                           if h is not handler]
+
+    def fire_requestfailed(self, request):
+        """模拟页面导航中止在途请求：Playwright 只发 requestfailed，没有 response。"""
+        for handler in list(self.requestfailed_handlers):
+            handler(request)
+
+    def _guard(self):
+        # 浏览器已关闭后仍做页面动作＝实现缺陷（F04：可结算终态必须在关闭前收口）
+        if self.closed:
+            raise AssertionError("浏览器已关闭后仍有页面动作")
 
     def goto(self, url, wait_until=None, timeout=None):
+        self._guard()
         if self.behavior == "goto_fail":
             raise FakeTimeout("goto 超时")
         self.url = url
@@ -210,22 +260,28 @@ class FakePage:
                 "https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/other-hash"))
 
     def reload(self, wait_until=None, timeout=None):
+        self._guard()
         if self.behavior == "reload_fail":
             raise FakeTimeout("reload 超时")
         self._deliver_due()
 
     def wait_for_timeout(self, ms):
+        self._guard()
         self.clock.sleep(float(ms) / 1000.0)
         self._deliver_due()
 
     def eval_on_selector_all(self, selector, script):
+        if "script" in selector:
+            return list(self.script_srcs or [])
         return ["立即报名"]
 
     def locator(self, selector):
+        self._guard()
         self._deliver_due()
         return FakeLocator(self, "uni-button" if "uni-button" in selector else selector)
 
     def get_by_text(self, text, exact=False):
+        self._guard()
         self._deliver_due()
         return FakeLocator(self, "确定" if text == "确定" else text)
 
@@ -255,6 +311,100 @@ class FakePage:
         payload = {"code": 0, "message": "报名人数已满"}
         if behavior in ("success", "slow_success"):
             payload = {"code": 1, "message": "ok"}
+        if behavior == "login_expired":
+            # 学校明确回 4001：token 失效，必须停发并提示重登
+            request = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE)
+            self._notify(request)
+            self._enqueue_response(FakeResponse(request, {"code": 4001, "message": "token 失效"}))
+            return
+        if behavior == "login_words_only":
+            # 业务失败文案里带「登录/身份验证」不算 token 失效（子串匹配回归守卫）
+            request = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE)
+            self._notify(request)
+            self._enqueue_response(FakeResponse(
+                request, {"code": 0, "message": "请登录后完成身份验证"}))
+            return
+        if behavior == "login_race":
+            # 4001 先到、成功后到（1 秒内）：成功优先级更高
+            first = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE + "-0")
+            second = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE + "-1")
+            self._notify(first)
+            self._notify(second)
+            self._enqueue_response(FakeResponse(first, {"code": 4001, "message": "token 失效"}),
+                                   delay=0.02)
+            self._enqueue_response(FakeResponse(second, {"code": 1, "message": "ok"}),
+                                   delay=0.5)
+            return
+        if behavior == "throttled_429":
+            request = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE)
+            self._notify(request)
+            self._enqueue_response(FakeResponse(
+                request, {"code": 0, "message": "太频繁"}, status=429))
+            return
+        if behavior == "server_error_500":
+            # 5xx + HTML 载体：必须按 server_error 结算（不伪装 lost、不吞 pending）
+            request = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE)
+            self._notify(request)
+            self._enqueue_response(FakeResponse(
+                request, b"<html><body>502 Bad Gateway</body></html>", status=502))
+            return
+        if behavior == "version_incompatible":
+            # 精确版本错误文案：本场单向降级到 click，不得误伤其它 code=0
+            request = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE)
+            self._notify(request)
+            self._enqueue_response(FakeResponse(
+                request, {"code": 0, "message": "版本不兼容，请刷新页面或清除缓存后重试"}))
+            return
+        if behavior == "ooo_5xx_two":
+            # F06 反例一：#1/#2 发出，#2=200 先回、#1=500 后回 → 地板 0
+            first = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE + "-0")
+            second = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE + "-1")
+            self._notify(first)
+            self._notify(second)
+            self._enqueue_response(
+                FakeResponse(second, {"code": 0, "message": "报名人数已满"}), delay=0.02)
+            self._enqueue_response(
+                FakeResponse(first, b"<html>boom</html>", status=500), delay=0.05)
+            return
+        if behavior == "ooo_5xx_three":
+            # F06 反例二：#1/#2/#3 发出，#3=500、#1=500、#2=200 → 地板 0.5
+            first = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE + "-0")
+            second = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE + "-1")
+            third = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE + "-2")
+            self._notify(first)
+            self._notify(second)
+            self._notify(third)
+            self._enqueue_response(FakeResponse(third, b"<html>boom</html>", status=500), delay=0.02)
+            self._enqueue_response(FakeResponse(first, b"<html>boom</html>", status=500), delay=0.05)
+            self._enqueue_response(
+                FakeResponse(second, {"code": 0, "message": "报名人数已满"}), delay=0.08)
+            return
+        if behavior == "http_404_429":
+            # 404/404/429 混合连击：policy/budget/retry_deadline 必须同时扩窗
+            request = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE)
+            self._notify(request)
+            step = getattr(self, "_step_429", 0)
+            self._step_429 = step + 1
+            if step == 2:
+                self._enqueue_response(FakeResponse(
+                    request, {"code": 0, "message": "太频繁"}, status=429))
+            else:
+                self._enqueue_response(FakeResponse(
+                    request, {"code": 0, "message": "未就绪"}, status=404))
+            return
+        if behavior == "http_429_triple":
+            request = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE)
+            self._notify(request)
+            self._enqueue_response(FakeResponse(
+                request, {"code": 0, "message": "太频繁"}, status=429))
+            return
+        if behavior == "boom_after_response":
+            # 流程异常：先把一笔成功应答入队，紧接页面崩——可读队列必须先被结算
+            request = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE)
+            self._notify(request)
+            self._enqueue_response(FakeResponse(request, {"code": 1, "message": "ok"}))
+            self._deliver_due()          # 让成功先落进响应队列
+            raise RuntimeError("页面脚本崩溃")
         if behavior == "foreign_only":
             # 我方动作没有发出请求；别家请求在更早的 goto 阶段就发过了
             return
@@ -308,6 +458,12 @@ class FakePage:
                 if index == 1:
                     self._enqueue_response(FakeResponse(request, dict(payload)))
             return
+        if behavior == "abort_inflight":
+            # 导航中止在途请求：Playwright 只发 requestfailed，没有 response
+            request = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE)
+            self._notify(request)
+            self.fire_requestfailed(request)
+            return
         # 默认 full/success/slow_*：一次动作一笔请求
         request = FakeRequest("https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/" + OPAQUE)
         self._notify(request)
@@ -333,6 +489,9 @@ class FakeBrowser:
 
     def close(self):
         self.closed = True
+        # 同步把页面标记为已关：此后任何 page/locator 动作都会被 _guard 拒绝，
+        # 用来证明「可结算终态在浏览器清理前收口」（F04）。
+        self.page.closed = True
 
 
 class _PassPw:
@@ -402,10 +561,12 @@ def run_worker(*, behavior="success", at_offset=0.0, retry_for=120.0, max_attemp
                probe_state="valid", probe_detail="ok",
                post_delays=None, post_hook=None, button_visible=True,
                click_delay=0.0, foreign=False, launch_fails=False,
-               response_delay=0.0):
+               response_delay=0.0, script_srcs=None,
+               direct_signer=None, direct_transport=None,
+               api_token="test-token"):
     clock = FakeClock()
     page = FakePage(clock, behavior, button_visible, click_delay, foreign,
-                    response_delay)
+                    response_delay, script_srcs)
     logs, posts = [], []
     created = {"browser": False}
     delays = list(post_delays or [])
@@ -451,6 +612,8 @@ def run_worker(*, behavior="success", at_offset=0.0, retry_for=120.0, max_attemp
     )
 
     patches = {"log": fake_log, "probe_token": fake_probe,
+               # token 替身固定值：直发 headers 断言用，严禁读取真实 session 文件
+               "token": lambda: api_token,
                "setup_business_clock": lambda *a, **k: (grab.configure_business_clock(clock), clock)[1],
                # 兼容入场实现（旧 cmd_grab 调 check_token）；新实现不读它
                "check_token": lambda budget=None: (probe_state == "valid", probe_detail),
@@ -469,12 +632,35 @@ def run_worker(*, behavior="success", at_offset=0.0, retry_for=120.0, max_attemp
     start_mono = clock.mono
     grab.time = clock
     time_contract.time = clock
+    # 直发替身注入（opt-in）：换掉真实 signer/transport，只在显式传入时生效，
+    # 既有点击测试不受影响。检测走 `from ... import`，改模块属性即可生效。
+    direct_mods = {}
+    if direct_signer is not None or direct_transport is not None:
+        import signup_signing as _ss
+        import signup_transport as _st
+        if direct_signer is not None:
+            direct_mods[("signup_signing", "build_signup_hash")] = getattr(_ss, "build_signup_hash", None)
+            _ss.build_signup_hash = direct_signer
+        if direct_transport is not None:
+            direct_mods[("signup_transport", "DirectTransport")] = getattr(_st, "DirectTransport", None)
+            _st.DirectTransport = direct_transport
     try:
         for name, value in patches.items():
             setattr(grab, name, value)
         with contextlib.redirect_stdout(io.StringIO()):
             code = grab.cmd_grab(args)
     finally:
+        for (mod_name, attr), value in direct_mods.items():
+            import sys as _sys
+            mod = _sys.modules.get(mod_name)
+            if mod is not None:
+                if value is None:
+                    try:
+                        delattr(mod, attr)
+                    except AttributeError:
+                        pass
+                else:
+                    setattr(mod, attr, value)
         for name, value in originals.items():
             if value is None:
                 try:
@@ -926,14 +1112,18 @@ class BurstPolicyPureTests(unittest.TestCase):
         self.assertEqual(policy.golden_rounds, 0)
 
     def test_404_streak_enters_adaptive_and_extends_window(self):
+        # 语义更新（§4，2026-10-29 直发核心轮）：纯 404 段只扩窗、不进 ADAPTIVE。
+        # 旧断言 assertEqual(phase, ADAPTIVE) 与 §4「纯 404 不切 phase、只扩窗」
+        # 冲突——退避种子只发给「含 throttled 的连击段」，纯 404 段不降速。
         policy, clock = self._policy(base_deadline=START + 30.0)
         clock.wall = START + grab.GOLDEN_WINDOW_S + 1.0
         for i in range(grab.NOT_READY_404_LIMIT):
             rid = policy.register_request()
             policy.settle(rid, "404")
         self.assertEqual(policy.streak_404, grab.NOT_READY_404_LIMIT)
-        self.assertEqual(policy.phase, policy.PHASE_ADAPTIVE)
-        # 自适应扩窗：有效截止被拉到起点起 25 分钟
+        self.assertNotEqual(policy.phase, policy.PHASE_ADAPTIVE,
+                            "纯 404 段（无 throttled）不得进 ADAPTIVE")
+        # 扩窗仍照常发生（§4「纯 404 段不切 phase，只扩窗」）
         self.assertGreaterEqual(policy.effective_deadline,
                                 policy.retry_start + grab.ADAPTIVE_WINDOW_S - 1.0)
         self.assertLessEqual(policy.effective_deadline,
@@ -953,10 +1143,16 @@ class BurstPolicyPureTests(unittest.TestCase):
     def test_real_response_resets_streak_and_leaves_adaptive(self):
         policy, clock = self._policy(base_deadline=START + 120.0)
         clock.wall = START + 5.0
+    def test_real_response_resets_streak_and_leaves_adaptive(self):
+        # 语义更新（§4）：纯 404 段不进 ADAPTIVE，故 real 之前的 phase 断言改为
+        # 「不得是 ADAPTIVE」；real 到达仍清连击并回到全速（§11 未变）。
+        policy, clock = self._policy(base_deadline=START + 120.0)
+        clock.wall = START + 5.0
         for _ in range(grab.NOT_READY_404_LIMIT):
             rid = policy.register_request()
             policy.settle(rid, "404")
-        self.assertEqual(policy.phase, policy.PHASE_ADAPTIVE)
+        self.assertNotEqual(policy.phase, policy.PHASE_ADAPTIVE,
+                            "纯 404 段不得进 ADAPTIVE（§4）")
         rid = policy.register_request()
         policy.settle(rid, "real")
         self.assertEqual(policy.streak_404, 0)
@@ -964,8 +1160,12 @@ class BurstPolicyPureTests(unittest.TestCase):
                          "非 404 真实响应必须立即切回全速")
 
     def test_adaptive_backoff_interval_grows_and_caps(self):
+        # 语义更新（§3/§4）：退避种子只给「含 throttled 且连击达阈值」的段；
+        # 纯 404 段不降速、不给种子。故此处用 throttled 打头凑出种子段，
+        # 再断言 interval 从种子起步、随连击放大并封顶 3 秒。
         policy, clock = self._policy(base_deadline=START + 300.0)
         clock.wall = START + 5.0
+        policy.settle(policy.register_request(), "throttled", http_status=429)
         for _ in range(grab.NOT_READY_404_LIMIT):
             rid = policy.register_request()
             policy.settle(rid, "404")
@@ -973,6 +1173,8 @@ class BurstPolicyPureTests(unittest.TestCase):
         for _ in range(8):
             seen.append(round(policy.interval_s(), 3))
             policy.next_interval_after_wait()
+        self.assertEqual(policy.phase, policy.PHASE_ADAPTIVE,
+                         "含 throttled 且连击达阈值：gated 成立进 ADAPTIVE")
         self.assertLessEqual(max(seen), grab.BACKOFF_MAX_S,
                              "退避必须封顶 3 秒")
         self.assertGreaterEqual(seen[0], grab.FULL_SPEED_INTERVAL_S)
@@ -996,7 +1198,10 @@ class BurstPolicyPureTests(unittest.TestCase):
         self.assertEqual(policy.pending_count(), 1)
         policy.settle(r1, "real")
         self.assertEqual(policy.pending_count(), 0)
-        self.assertEqual(policy.streak_404, 0, "real 结算清连击")
+        # 语义更新（§11，倒序扫 _order 按发送序）：r1 的 real 是最旧（attempt_no 最
+        # 小），清不掉更新的 r2 的 404 → streak 保留 1。旧断言 streak==0 只认「任意
+        # real 清连击」，会掩盖旧 5xx/404 被新恢复误清的缺陷，故改为 1。
+        self.assertEqual(policy.streak_404, 1, "旧 real 不清更新的 404 连击")
 
     def test_duplicate_settle_counts_once(self):
         policy, _ = self._policy()
@@ -1080,34 +1285,39 @@ class NonBlockingSubmitTimingTests(unittest.TestCase):
     """
 
     def test_golden_storm_ten_requests_at_90ms_while_responses_in_flight(self):
-        # 响应永不到达（lost）：10 笔请求仍必须按约 90ms 在黄金窗口内发起
-        res = run_worker(behavior="lost", at_offset=OPEN_AHEAD, retry_for=60.0,
-                         max_attempts=10)
+        # 语义更新（§2 名额上限，2026-10-29 直发核心轮）：未决请求会占名额直到
+        # INFLIGHT_TTL_S，旧「响应永不到达也连发 10 笔」与 MAX_INFLIGHT=2 冲突，
+        # 该病理场景改由 test_inflight_cap_paces_unknown_pending_requests 守。
+        # 本条改为「响应 90ms 内回来、名额很快释放」的正常风暴：10 笔仍按约 90ms 发起。
+        res = run_worker(behavior="full", response_delay=0.09,
+                         at_offset=OPEN_AHEAD, retry_for=60.0, max_attempts=10)
         self.assertEqual(res.attempts, 10, "真实次数必须记满 10 笔")
-        self.assertEqual(res.stop_reason, "unconfirmed",
-                         "响应未决不伪造成失败或成功")
         request_times = [at for at, _ in res.page.requests]
         self.assertEqual(len(request_times), 10)
-        # request_times 证据：相邻发起间隔约 90ms，in_flight 未决不阻塞下一笔
+        # request_times 证据：相邻发起间隔约 90ms，in_flight 未满时不阻塞下一笔
         gaps = [b - a for a, b in zip(request_times, request_times[1:])]
         for gap in gaps:
             self.assertGreaterEqual(gap, 0.09 - 1e-4,
                                     "最小间隔 90ms 不能被响应等待吃掉")
             self.assertLess(gap, 0.5,
-                            "间隔必须远小于任何响应等待——证明 nonblocking")
+                            "名额未满时间隔必须远小于任何响应等待——证明 nonblocking")
         span = request_times[-1] - request_times[0]
         self.assertLessEqual(span, grab.GOLDEN_WINDOW_S + 1e-6,
                              "10 笔必须全落在黄金窗口 1.6 秒内")
 
-    def test_slow_responses_do_not_stretch_submit_gaps(self):
-        # 响应迟到 2 秒：发起间隔仍由状态机给出，不被响应等待拉长
+    def test_slow_responses_stretch_submit_gaps_within_inflight_cap(self):
+        # 语义更新（§2）：旧断言「2 秒迟到响应不把间隔拉大」与 MAX_INFLIGHT=2
+        # 冲突——响应迟到 2 秒时由名额上限背压，每 2 秒最多 2 笔。改为断言
+        # 「间隔被背压拉长但不超 TTL、且不 break 掉 attempts」。
         res = run_worker(behavior="full", response_delay=2.0,
-                         at_offset=OPEN_AHEAD, retry_for=60.0, max_attempts=5)
-        self.assertEqual(res.attempts, 5)
+                         at_offset=OPEN_AHEAD, retry_for=30.0, max_attempts=4)
+        self.assertEqual(res.attempts, 4)
         request_times = [at for at, _ in res.page.requests]
         gaps = [b - a for a, b in zip(request_times, request_times[1:])]
         for gap in gaps:
-            self.assertLess(gap, 1.0, "2 秒迟到响应不得把发起间隔拉大")
+            self.assertLess(gap, 2.2, "迟到响应也不该把间隔拉到远超 TTL")
+        self.assertGreaterEqual(max(gaps), 1.5,
+                                "名额满时必须背压等待，不能仍按 90ms 硬发")
 
     def test_hot_path_has_no_sync_is_joined_confirm(self):
         # 提交热路径不跑 0.6 秒 ×3 的 is_joined 确认：getJoinInfo 只剩入场预查 + 有界收尾
@@ -1119,13 +1329,17 @@ class NonBlockingSubmitTimingTests(unittest.TestCase):
                              "每笔提交后固定跑 0.6 秒 is_joined 确认是被禁止的热路径")
 
     def test_http_404_streak_settles_by_request_id_and_extends(self):
-        # HTTP 404×3：streak 如实累计、进自适应并扩窗，每笔各归各的编号
+        # 语义更新（§4）：纯 404 段（无 throttled）不进自适应，只记连击 + 扩窗。
+        # 旧断言 assertIn("phase=adaptive_backoff") 与 §4 冲突，改为断言不进自适应
+        # 且扩窗生效（retry_deadline 被拉长）。
         res = run_worker(behavior="http_404", at_offset=OPEN_AHEAD,
                          retry_for=30.0, max_attempts=3)
         self.assertEqual(res.attempts, 3)
         done = res.terminal_lines[-1]
         self.assertIn("streak_404=3", done, "三笔 404 必须如实累计")
-        self.assertIn("phase=adaptive_backoff", done, "404×3 必须进自适应")
+        self.assertNotIn("phase=adaptive_backoff", done,
+                         "纯 404 段（无 throttled）不得进自适应（§4）")
+        self.assertRegex(done, r"retry_deadline=\d+", "404×3 必须触发扩窗")
         not_ready = [line for line in res.logs if "kind=not_ready" in line]
         self.assertEqual(len(not_ready), 3, "每笔 404 都要按 request_id 结算上报")
 
@@ -1143,7 +1357,11 @@ class NonBlockingSubmitTimingTests(unittest.TestCase):
                       "先发的那笔拿的是 404：响应虽然后到，编号不能串")
         done = res.terminal_lines[-1]
         self.assertIn("pending=0", done, "两笔都已结算，不得报未决")
-        self.assertIn("streak_404=1", done, "只有一笔 404，连击计数必须如实")
+        # 语义更新（§11，倒序扫 _order）：req-2（更新的 real，code=0 报名已满）断连击，
+        # req-1 的旧 404 虽后到但 attempt_no 更小（更旧），不得重建连击 → streak=0。
+        # 旧断言 streak_404=1 只认「有 404 就计 1」，会掩盖旧 404 被误计入的问题。
+        self.assertIn("streak_404=0", done,
+                      "更新的 real 断连击，旧 404 后到不得重建连击（§11）")
 
     def test_success_response_terminates_immediately(self):
         # 成功响应到达即终止：不再多发一笔
@@ -1260,6 +1478,916 @@ class NonBlockingSubmitTimingTests(unittest.TestCase):
         self.assertTrue(all(post["at"] < deadline for post in res.posts))
         self.assertEqual(res.page.request_handlers, [])
         self.assertEqual(res.page.response_handlers, [])
+
+
+def _make_policy(open_ts=START, base_deadline=None, sign_end_ts=None,
+                 max_attempts=0, retry_start=None, allow_extend=True):
+    """构造 BurstPolicy 的模块级替身工厂（供 V4 政策级测试复用）。"""
+    clock = FakeClock(wall=open_ts, mono=1000.0)
+    policy = grab.BurstPolicy(
+        open_ts=open_ts,
+        base_deadline=START + 120.0 if base_deadline is None else base_deadline,
+        sign_end_ts=sign_end_ts, max_attempts=max_attempts,
+        clock=clock, retry_start=retry_start or open_ts,
+        allow_extend=allow_extend)
+    return policy, clock
+
+
+class BurstPolicyV4Tests(unittest.TestCase):
+    """直发核心轮（2026-10-29）BurstPolicy 新语义：五档分类、名额、地板、时钟契约。
+
+    这些断言在旧实现上为红：旧 settle 无 http_status、无 _order/inflight_count/
+    _min_gap/current_phase，_wall_now 走 time()/callable 回退。全部用替身，不访问学校。
+    """
+
+    @staticmethod
+    def _resp(status, payload=None):
+        """最小 HTTP 响应替身：只供 _classify_response 读 status。"""
+        return SimpleNamespace(status=status)
+
+    # ---- 分类与解码 -----------------------------------------------
+    def test_classify_five_way_split(self):
+        self.assertEqual(grab._classify_response(None), "lost")
+        self.assertEqual(grab._classify_response(self._resp(404)), "404")
+        self.assertEqual(grab._classify_response(self._resp(429)), "throttled")
+        self.assertEqual(grab._classify_response(self._resp(500)), "server_error")
+        self.assertEqual(grab._classify_response(self._resp(502)), "server_error")
+        self.assertEqual(grab._classify_response(self._resp(503)), "server_error")
+        self.assertEqual(grab._classify_response(self._resp(200)), "real")
+        self.assertEqual(grab._classify_response(self._resp(400)), "real",
+                         "非 404/429/5xx 的业务响应归 real")
+
+    def test_decode_body_prefers_utf8_then_gb18030(self):
+        body = json.dumps({"code": 4001, "message": "登录已失效"},
+                          ensure_ascii=False).encode("gb18030")
+        self.assertEqual(grab._decode_body(body)["code"], 4001)
+        utf8 = json.dumps({"code": 1}, ensure_ascii=False).encode("utf-8")
+        self.assertEqual(grab._decode_body(utf8)["code"], 1)
+        # 非 JSON 载体（200+HTML）：解不出对象时退回 {}，不得抛、不得伪装 lost
+        self.assertEqual(grab._decode_body(b"<html>not json</html>"), {})
+
+    def test_record_stores_http_status(self):
+        policy, _ = _make_policy()
+        rec = policy.settle(policy.register_request(), "real", http_status=200)
+        self.assertEqual(rec.get("http_status"), 200)
+        rec2 = policy.settle(policy.register_request(), "404", http_status=404)
+        self.assertEqual(rec2.get("http_status"), 404)
+
+    def test_server_error_settles_and_breaks_streak_with_floor(self):
+        policy, _ = _make_policy()
+        for _ in range(grab.NOT_READY_404_LIMIT):
+            policy.settle(policy.register_request(), "404")
+        rid = policy.register_request()
+        policy.settle(rid, "server_error", http_status=502)
+        self.assertEqual(policy.streak_404, 0, "server_error 必须断 404 连击")
+        self.assertEqual(policy.settled_kind(rid), "server_error")
+        self.assertEqual(policy.pending_count(), 0, "5xx 不得留 pending")
+        self.assertGreaterEqual(policy.interval_s(), 0.5 - 1e-6,
+                                "server_error 设 _min_gap=0.5s 地板")
+
+    def test_throttled_counts_into_streak_and_stays_non_adaptive(self):
+        policy, clock = _make_policy(base_deadline=START + 300.0)
+        clock.wall = START + 5.0
+        for _ in range(grab.NOT_READY_404_LIMIT):
+            policy.settle(policy.register_request(), "404")
+        rid = policy.register_request()
+        policy.settle(rid, "throttled", http_status=429)
+        self.assertEqual(policy.streak_404, grab.NOT_READY_404_LIMIT + 1,
+                         "throttled 与 404 连续混合计入同一段")
+        self.assertEqual(policy.pending_count(), 0)
+        # 段内含 throttled 且连击达阈值、已过黄金窗 → gated 进 ADAPTIVE
+        self.assertEqual(policy.phase, policy.PHASE_ADAPTIVE,
+                         "含 throttled 的达阈连击段进 ADAPTIVE")
+
+    def test_settle_survives_clock_unavailable(self):
+        policy, clock = _make_policy(base_deadline=START + 300.0)
+
+        def _boom():
+            raise grab.ClockUnavailable("时钟故意失效")
+
+        clock.now = _boom
+        for _ in range(grab.NOT_READY_404_LIMIT):
+            policy.settle(policy.register_request(), "404")
+        self.assertEqual(policy.streak_404, grab.NOT_READY_404_LIMIT,
+                         "校时失效时 streak 仍照算，结算不能半路崩")
+        self.assertEqual(policy.pending_count(), 0)
+
+    # ---- 名额（inflight） -----------------------------------------
+    def test_inflight_count_excludes_lost_and_expired(self):
+        policy, clock = _make_policy()
+        policy.settle(policy.register_request(), "lost")   # 已判丢：pending 但不占名额
+        policy.register_request()                          # 正常在途
+        self.assertEqual(policy.pending_count(), 2)
+        self.assertEqual(policy.inflight_count(), 1, "已判丢的请求不占名额")
+        clock.sleep(grab.INFLIGHT_TTL_S + 0.1)             # 剩余那笔超 TTL
+        self.assertEqual(policy.pending_count(), 2, "超时不改 pending 事实")
+        self.assertEqual(policy.inflight_count(), 0, "超 TTL 不再占名额")
+
+    def test_lost_does_not_block_gate_at_max_inflight_one(self):
+        saved = grab.MAX_INFLIGHT
+        grab.MAX_INFLIGHT = 1
+        try:
+            policy, _ = _make_policy()
+            policy.settle(policy.register_request(), "lost")
+            self.assertLess(policy.inflight_count(), grab.MAX_INFLIGHT,
+                            "lost 不占名额：名额上仍有余量")
+            policy.register_request()
+            self.assertGreaterEqual(policy.inflight_count(), grab.MAX_INFLIGHT,
+                                    "正常在途照常占名额")
+        finally:
+            grab.MAX_INFLIGHT = saved
+
+    def test_v4_constants(self):
+        self.assertEqual(grab.MAX_INFLIGHT, 2)
+        self.assertEqual(grab.INFLIGHT_TTL_S, 8.0)
+        self.assertEqual(grab.SERVER_ERROR_MIN_GAP_S, 0.5)
+        self.assertEqual(grab.NOT_READY_SLOWDOWN_AFTER_S, 20.0)
+        self.assertEqual(grab.NOT_READY_SLOW_GAP_S, 0.8)
+
+    # ---- 地板（min_gap）F06 反例 ----------------------------------
+    def test_min_gap_older_5xx_ignored_by_newer_200_real(self):
+        # F06 反例一：#1/#2 发出，#2=200 先回、#1=500 后回 → 地板 0。
+        # 倒序扫 _order：newest=#2 real+200 → 地板 0；旧 #1 的 500 不得再抬地板。
+        policy, clock = _make_policy(base_deadline=START + 300.0)
+        clock.wall = START + 5.0
+        r1 = policy.register_request()
+        r2 = policy.register_request()
+        policy.settle(r2, "real", http_status=200)
+        policy.settle(r1, "server_error", http_status=500)
+        self.assertLess(policy.interval_s(), 0.5 - 1e-6,
+                        "更新的 real+200 已把地板清为 0，旧 5xx 不得再抬地板")
+
+    def test_min_gap_newest_5xx_sets_floor_regardless_of_older_200(self):
+        # F06 反例二：#1/#2/#3 发出，#3=500、#1=500、#2=200 → 地板 0.5。
+        # 倒序扫 newest=#3 server_error → 地板 0.5；中间的 200 不得清掉它。
+        policy, clock = _make_policy(base_deadline=START + 300.0)
+        clock.wall = START + 5.0
+        r1 = policy.register_request()
+        r2 = policy.register_request()
+        r3 = policy.register_request()
+        policy.settle(r3, "server_error", http_status=500)
+        policy.settle(r1, "server_error", http_status=500)
+        policy.settle(r2, "real", http_status=200)
+        self.assertGreaterEqual(policy.interval_s(), 0.5 - 1e-6,
+                                "newest 是 5xx：地板 0.5，不得被中间的 200 清掉")
+
+    def test_min_gap_cleared_by_newer_200_real(self):
+        policy, clock = _make_policy(base_deadline=START + 300.0)
+        clock.wall = START + 0.5
+        policy.settle(policy.register_request(), "server_error", http_status=502)
+        rid200 = policy.register_request()
+        policy.settle(rid200, "real", http_status=200)
+        self.assertLess(policy.interval_s(), 0.5 - 1e-6,
+                        "attempt_no 更大的 200-real 必须清 _min_gap")
+
+    def test_min_gap_composes_via_max(self):
+        policy, clock = _make_policy(base_deadline=START + 300.0)
+        clock.wall = START + 0.5
+        policy.settle(policy.register_request(), "server_error", http_status=500)
+        for _ in range(grab.NOT_READY_404_LIMIT):
+            policy.settle(policy.register_request(), "404")
+        self.assertGreaterEqual(policy.interval_s(), 0.5 - 1e-6,
+                                "_min_gap 地板与退避取 max，不被覆盖")
+
+    # ---- 纯 404 减速（§12） ---------------------------------------
+    def test_pure_404_slows_down_after_twenty_seconds(self):
+        policy, clock = _make_policy(base_deadline=START + 300.0)
+        clock.wall = START + 5.0
+        policy.settle(policy.register_request(), "404")
+        self.assertAlmostEqual(policy.interval_s(), grab.FULL_SPEED_INTERVAL_S, places=6)
+        clock.sleep(grab.NOT_READY_SLOWDOWN_AFTER_S - 1.0)
+        self.assertAlmostEqual(policy.interval_s(), grab.FULL_SPEED_INTERVAL_S, places=6,
+                               msg="20 秒内不降速")
+        clock.sleep(2.0)
+        self.assertAlmostEqual(policy.interval_s(), grab.NOT_READY_SLOW_GAP_S, places=6,
+                               msg="纯 404 段超过 20 秒后降到 0.8s 地板")
+
+    def test_slowdown_cleared_when_real_arrives(self):
+        policy, clock = _make_policy(base_deadline=START + 300.0)
+        clock.wall = START + 5.0
+        policy.settle(policy.register_request(), "404")
+        clock.sleep(grab.NOT_READY_SLOWDOWN_AFTER_S + 1.0)
+        self.assertAlmostEqual(policy.interval_s(), grab.NOT_READY_SLOW_GAP_S, places=6)
+        policy.settle(policy.register_request(), "real", http_status=200)
+        self.assertAlmostEqual(policy.interval_s(), grab.FULL_SPEED_INTERVAL_S, places=6,
+                               msg="real 一到，地板立即解除")
+
+    # ---- 窗口扩展与显式预算 ----------------------------------------
+    def test_pure_404_streak_extends_window_without_adaptive(self):
+        policy, clock = _make_policy(base_deadline=START + 30.0)
+        clock.wall = START + grab.GOLDEN_WINDOW_S + 1.0
+        for _ in range(grab.NOT_READY_404_LIMIT):
+            policy.settle(policy.register_request(), "404")
+        self.assertEqual(policy.streak_404, grab.NOT_READY_404_LIMIT)
+        self.assertNotEqual(policy.phase, policy.PHASE_ADAPTIVE, "纯 404 段不进 ADAPTIVE")
+        self.assertGreaterEqual(policy.effective_deadline,
+                                policy.retry_start + grab.ADAPTIVE_WINDOW_S - 1.0)
+        self.assertLessEqual(policy.effective_deadline,
+                             policy.retry_start + grab.ADAPTIVE_WINDOW_S + 1.0)
+        self.assertEqual(policy._backoff_s, grab.FULL_SPEED_INTERVAL_S,
+                         "纯 404 段不给退避种子")
+
+    def test_streak_with_throttled_extends_seeds_and_enters_adaptive(self):
+        policy, clock = _make_policy(base_deadline=START + 30.0)
+        clock.wall = START + 5.0
+        base_deadline = policy.effective_deadline
+        for _ in range(grab.NOT_READY_404_LIMIT - 1):
+            policy.settle(policy.register_request(), "404")
+        policy.settle(policy.register_request(), "throttled", http_status=429)
+        self.assertEqual(policy.streak_404, grab.NOT_READY_404_LIMIT)
+        self.assertGreater(policy.effective_deadline, base_deadline,
+                           "含 throttled 的连击也扩窗")
+        expected_seed = min(grab.BACKOFF_MAX_S,
+                            grab.FULL_SPEED_INTERVAL_S * grab.BACKOFF_FACTOR)
+        self.assertEqual(policy._backoff_s, expected_seed,
+                         "含 throttled 的连击段给退避种子")
+        self.assertEqual(policy.phase, policy.PHASE_ADAPTIVE)
+
+    def test_explicit_retry_for_disables_adaptive_extension(self):
+        policy, clock = _make_policy(base_deadline=START + 30.0, allow_extend=False)
+        clock.wall = START + 5.0
+        for _ in range(grab.NOT_READY_404_LIMIT + 2):
+            policy.settle(policy.register_request(), "404")
+        self.assertEqual(policy.effective_deadline, START + 30.0,
+                         "显式 --retry-for=30：纯 404 连击不得扩窗")
+        self.assertGreater(policy.streak_404, grab.NOT_READY_404_LIMIT,
+                           "连击照常计数，只是不拉窗口")
+
+    def test_404_extension_never_passes_sign_end(self):
+        sign_end = START + 60.0
+        policy, clock = _make_policy(base_deadline=START + 30.0, sign_end_ts=sign_end)
+        clock.wall = START + 10.0
+        for _ in range(grab.NOT_READY_404_LIMIT):
+            policy.settle(policy.register_request(), "404")
+        self.assertEqual(policy.effective_deadline, sign_end,
+                         "sign_end 永远硬截止，扩窗不得越过")
+
+    # ---- 连击按发送序倒扫 ------------------------------------------
+    def test_out_of_order_old_404_does_not_reenter_adaptive(self):
+        policy, clock = _make_policy(base_deadline=START + 300.0)
+        clock.wall = START + 5.0
+        r3 = policy.register_request()
+        r4 = policy.register_request()
+        r5 = policy.register_request()
+        r6 = policy.register_request()
+        policy.settle(r6, "real", http_status=200)
+        self.assertEqual(policy.phase, policy.PHASE_FULL_SPEED)
+        policy.settle(r3, "404")
+        policy.settle(r4, "404")
+        policy.settle(r5, "404")
+        self.assertEqual(policy.streak_404, 0,
+                         "更新的 real 之后，旧 404 不得重建连击")
+        self.assertEqual(policy.phase, policy.PHASE_FULL_SPEED)
+
+    def test_streak_counts_from_newest_after_late_real(self):
+        policy, clock = _make_policy(base_deadline=START + 300.0)
+        clock.wall = START + 5.0
+        r3 = policy.register_request()
+        r4 = policy.register_request()
+        r5 = policy.register_request()
+        policy.settle(r4, "404")
+        policy.settle(r5, "404")
+        policy.settle(r3, "real", http_status=200)
+        self.assertEqual(policy.streak_404, 2,
+                         "旧 real 不清更新的 404 连击（只更新的 real 清）")
+        self.assertEqual(policy.phase, policy.PHASE_FULL_SPEED)
+
+    # ---- golden 退出与种子保留 --------------------------------------
+    def test_golden_seed_survives_exit_and_adaptive_grows(self):
+        policy, clock = _make_policy(base_deadline=START + 300.0)
+        policy.settle(policy.register_request(), "throttled", http_status=429)
+        for _ in range(grab.NOT_READY_404_LIMIT):
+            policy.settle(policy.register_request(), "404")
+        self.assertEqual(policy.phase, policy.PHASE_GOLDEN,
+                         "golden 内 ADAPTIVE_IN_GOLDEN=False，phase 不切")
+        seed = min(grab.BACKOFF_MAX_S, grab.FULL_SPEED_INTERVAL_S * grab.BACKOFF_FACTOR)
+        self.assertAlmostEqual(policy._backoff_s, seed, places=6)
+        for _ in range(grab.GOLDEN_ROUNDS - grab.NOT_READY_404_LIMIT):
+            policy.settle(policy.register_request(), "404")
+        self.assertEqual(policy.phase, policy.PHASE_ADAPTIVE,
+                         "走满轮数退 golden，gated 成立进 ADAPTIVE，种子要保留")
+        self.assertAlmostEqual(policy._backoff_s, seed, places=6)
+
+    def test_golden_exit_preserves_seed_and_enters_adaptive(self):
+        policy, clock = _make_policy(base_deadline=START + 300.0)
+        self.assertEqual(policy.phase, policy.PHASE_GOLDEN)
+        for _ in range(grab.NOT_READY_404_LIMIT):
+            policy.settle(policy.register_request(), "throttled", http_status=429)
+        self.assertEqual(policy.phase, policy.PHASE_GOLDEN,
+                         "golden 内 ADAPTIVE_IN_GOLDEN=False，phase 不切")
+        seed = round(min(grab.BACKOFF_MAX_S,
+                         grab.FULL_SPEED_INTERVAL_S * grab.BACKOFF_FACTOR), 6)
+        self.assertAlmostEqual(policy._backoff_s, seed, places=6)
+        clock.wall = START + grab.GOLDEN_WINDOW_S + 0.01
+        self.assertEqual(policy.phase, policy.PHASE_ADAPTIVE,
+                         "golden 结束后按带门控 level 进 ADAPTIVE")
+        self.assertAlmostEqual(policy.interval_s(), seed, places=6)
+        policy.settle(policy.register_request(), "throttled", http_status=429)
+        self.assertAlmostEqual(policy._backoff_s, seed, places=6,
+                               msg="种子边沿不重复触发")
+
+    def test_non_200_real_breaks_streak_but_not_golden(self):
+        policy, _ = _make_policy(base_deadline=START + 300.0)
+        policy.settle(policy.register_request(), "404")
+        policy.settle(policy.register_request(), "real", http_status=400)
+        self.assertEqual(policy.streak_404, 0, "real 断 streak")
+        self.assertEqual(policy.phase, policy.PHASE_GOLDEN,
+                         "非 200 real 不得结束 golden")
+
+    def test_200_real_ends_golden(self):
+        policy, _ = _make_policy(base_deadline=START + 300.0)
+        policy.settle(policy.register_request(), "real", http_status=200)
+        self.assertEqual(policy.phase, policy.PHASE_FULL_SPEED)
+
+    # ---- 时钟契约 --------------------------------------------------
+    def test_wall_now_reads_business_epoch_only(self):
+        policy, _ = _make_policy()
+
+        class BusinessOnlyClock:
+            def __init__(self):
+                self.now_calls = 0
+
+            def now(self):
+                self.now_calls += 1
+                return START + 5.0
+
+        clock = BusinessOnlyClock()
+        policy._clock = clock
+        self.assertGreaterEqual(policy._wall_now(), START)
+        self.assertEqual(clock.now_calls, 1, "必须调用 now() 读业务 epoch")
+
+    def test_current_phase_does_not_touch_clock_or_refresh(self):
+        policy, clock = _make_policy()
+
+        class ExplodingClock:
+            def now(self):
+                raise RuntimeError("校时不可用")
+
+        policy._clock = ExplodingClock()
+        policy._phase = policy.PHASE_GOLDEN
+        self.assertEqual(policy.current_phase(), policy.PHASE_GOLDEN)
+        policy._phase = policy.PHASE_ADAPTIVE
+        self.assertEqual(policy.current_phase(), policy.PHASE_ADAPTIVE)
+
+    def test_clockclient_offline_contract(self):
+        from business_clock import ClockClient
+
+        tick = [1000.0]
+        snap = {
+            "schema": 1, "owner_id": "contract", "generation": 1,
+            "state": "ready", "epoch_s": START, "tick_s": tick[0],
+            "sampled_tick_s": tick[0], "uncertainty_s": 0.0,
+            "source": "test", "age_s": 0.0, "reason": "契约测试",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "clock.json"
+            path.write_text(json.dumps(snap), encoding="utf-8")
+            clock = ClockClient(snapshot_path=str(path), owner_id="contract",
+                                tick_fn=lambda: tick[0])
+            policy = grab.BurstPolicy(
+                open_ts=START, base_deadline=START + 120.0,
+                sign_end_ts=None, max_attempts=0,
+                clock=clock, retry_start=START)
+            for i in range(grab.GOLDEN_ROUNDS):
+                self.assertTrue(policy.can_attempt(),
+                                "第 %d 轮应可发起（ClockClient 驱动）" % (i + 1))
+                self.assertTrue(policy.register_request())
+                policy.next_interval_after_wait()
+            self.assertEqual(policy.phase, policy.PHASE_FULL_SPEED,
+                             "ClockClient 驱动下打满 10 轮须切常规全速")
+
+
+class UnifiedGateAndFinalizeTests(unittest.TestCase):
+    """直发核心轮集成回归：闸门顺序、4001 停发、unconfirmed 终态、异常收口。
+
+    覆盖「成功不被 False/异常覆盖」「pending+未报名=unconfirmed」「运行异常先结算
+    可读队列再关浏览器」「4001 后同一 1 秒尾窗内仍可结算成功」。全部用替身。
+    """
+
+    def test_4001_stops_sending(self):
+        res = run_worker(behavior="login_expired", retry_for=30.0, max_attempts=5)
+        self.assertEqual(res.stop_reason, "login_invalid")
+        self.assertEqual(res.attempts, 1, "4001 后不得再发第二笔")
+
+    def test_login_words_in_message_do_not_mark_invalid(self):
+        res = run_worker(behavior="login_words_only", retry_for=3.0, max_attempts=1)
+        self.assertNotEqual(res.stop_reason, "login_invalid",
+                            "业务失败文案不得被误判成需要重登（只认 str(code)=='4001'）")
+
+    def test_4001_while_success_in_flight_reports_success(self):
+        res = run_worker(behavior="login_race", retry_for=30.0, max_attempts=2)
+        self.assertEqual(res.stop_reason, "success",
+                         "4001 与成功同时在途：取消尾窗的 not login_invalid 限制后成功优先")
+        self.assertEqual(res.attempts, 2)
+
+    def test_explicit_retry_for_does_not_extend_window(self):
+        res = run_worker(behavior="http_404", at_offset=OPEN_AHEAD,
+                         retry_for=30.0, max_attempts=4)
+        line = res.terminal_lines[-1]
+        deadline = int(line.split("retry_deadline=")[1].split(" ")[0])
+        self.assertLess(deadline, int(START + 1000),
+                        "显式 --retry-for 给了秒数，扩窗不得生效")
+        self.assertGreaterEqual(res.attempts, grab.NOT_READY_404_LIMIT)
+
+    def test_retry_for_zero_keeps_sign_end(self):
+        deadline = START + 5.0
+        res = run_worker(behavior="full", at_offset=OPEN_AHEAD, retry_for=0.0,
+                         max_attempts=0, sign_end=grab.school_time_text(deadline))
+        line = res.terminal_lines[-1]
+        got = int(line.split("retry_deadline=")[1].split(" ")[0])
+        self.assertLessEqual(got, int(deadline) + 1,
+                             "--retry-for=0：重试截止不得越过 sign_end")
+
+    def test_retry_for_missing_falls_back_to_window(self):
+        # args.retry_for=None → 回退 args.window=120（run_worker 固定 window=120）
+        res = run_worker(behavior="full", at_offset=OPEN_AHEAD, retry_for=None,
+                         max_attempts=1)
+        line = res.terminal_lines[-1]
+        got = int(line.split("retry_deadline=")[1].split(" ")[0])
+        self.assertGreaterEqual(got, int(START + 100),
+                                "--retry-for 缺失：按 window=120 秒回退")
+
+    def test_requestfailed_releases_inflight_slot(self):
+        # §2：导航中止只发 requestfailed——必须按 lost 结算并立即让出名额，
+        # 否则 MAX_INFLIGHT=1 时第二笔永远发不出（卡死）。
+        saved = grab.MAX_INFLIGHT
+        grab.MAX_INFLIGHT = 1
+        try:
+            res = run_worker(behavior="abort_inflight", at_offset=OPEN_AHEAD,
+                             retry_for=30.0, max_attempts=2)
+        finally:
+            grab.MAX_INFLIGHT = saved
+        self.assertEqual(res.attempts, 2, "中止的在途请求必须让出名额，不得卡死")
+        self.assertEqual(res.stop_reason, "unconfirmed",
+                         "requestfailed=lost 仍 pending：终态保留未决")
+        request_times = [at for at, _ in res.page.requests]
+        self.assertEqual(len(request_times), 2)
+        self.assertLess(request_times[1] - request_times[0], 1.0,
+                        "lost 立即释放名额：第二笔应在 TTL 之外很快发出")
+
+    def test_confirm_gate_waits_in_place_when_inflight_full(self):
+        saved = grab.MAX_INFLIGHT
+        grab.MAX_INFLIGHT = 1
+        try:
+            res = run_worker(behavior="open_race", response_delay=0.3,
+                             at_offset=OPEN_AHEAD, retry_for=30.0, max_attempts=2)
+        finally:
+            grab.MAX_INFLIGHT = saved
+        self.assertGreaterEqual(res.page.confirm_clicks, 1, "名额释放后必须点上「确定」")
+        names = [name for _, name, _ in res.page.clicks]
+        self.assertEqual(names[:2], ["uni-button", "确定"],
+                         "名额满时先等名额再点确定：确认框开着不得重复点「立即报名」")
+        for left, right in zip(names, names[1:]):
+            self.assertFalse(left == right == "uni-button",
+                             "确认框还开着就重复点「立即报名」会被弹窗遮住、白等 3 秒")
+
+    def test_gate_drains_success_before_confirm_click(self):
+        res = run_worker(behavior="success_on_open", max_attempts=2)
+        self.assertEqual(res.stop_reason, "success")
+        self.assertEqual(res.page.confirm_clicks, 0,
+                         "闸门②先 drain 到成功，确认框不必再点")
+
+    def test_pending_with_not_joined_false_is_unconfirmed(self):
+        # pending>0 且最终核对未报名：必须 unconfirmed，不引入 not_joined。
+        real = grab.is_joined
+        grab.is_joined = lambda *a, **k: False
+        try:
+            res = run_worker(behavior="lost", retry_for=6.0, max_attempts=1)
+        finally:
+            grab.is_joined = real
+        self.assertEqual(res.stop_reason, "unconfirmed")
+        self.assertIn("pending=1", res.terminal_lines[-1])
+
+    def test_success_not_overwritten_by_false_or_exception(self):
+        # 成功已结算：最终核对抛异常也不得覆盖 success（F01）。
+        real = grab.is_joined
+
+        def _boom(*a, **k):
+            raise RuntimeError("最终核对崩了")
+
+        grab.is_joined = _boom
+        try:
+            res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                             retry_for=60.0, max_attempts=3)
+        finally:
+            grab.is_joined = real
+        self.assertEqual(res.stop_reason, "success",
+                         "成功不得被最终核对的 False/异常覆盖")
+
+    def test_runtime_exception_settles_queue_before_close(self):
+        # 页面崩：先把一笔成功应答入队，再抛异常。可读队列必须先被结算 → success，
+        # 不能判成 process_error；且浏览器关闭后不得再有页面动作（F04 守卫）。
+        res = run_worker(behavior="boom_after_response", at_offset=OPEN_AHEAD,
+                         retry_for=60.0, max_attempts=1)
+        self.assertEqual(res.stop_reason, "success",
+                         "运行异常前已入队的成功必须先被结算，不得被 process_error 覆盖")
+        self.assertEqual(len(res.terminal_lines), 1, "唯一 done/终态")
+        self.assertTrue(res.page.closed, "浏览器最终必须被关闭")
+
+    def test_process_error_without_pending_preserved(self):
+        # 无 pending 的流程异常（最终核对抛错）：保留 process_error，不被 False 覆盖。
+        # 用 "full"（1 笔 code0 已决、pending=0、attempts=1）使流程走到最终单次核对，
+        # 该核对抛错时如实报 process_error；foreign_only 不产生报名尝试走不到最终核对。
+        real = grab.is_joined
+
+        def _boom(*a, **k):
+            raise RuntimeError("核对崩了")
+
+        grab.is_joined = _boom
+        try:
+            res = run_worker(behavior="full", retry_for=6.0,
+                             max_attempts=1)
+        finally:
+            grab.is_joined = real
+        self.assertEqual(res.stop_reason, "process_error")
+
+    def test_429_triple_extends_window_events(self):
+        # 429 三连：policy/budget/retry_deadline 必须同时扩窗并上报事件。
+        # retry_for=None 走「缺失→120 秒回退 + 允许自适应扩窗」路径（显式
+        # --retry-for 禁扩是另一条语义，见 test_explicit_retry_for_does_not_extend）。
+        res = run_worker(behavior="http_429_triple", at_offset=OPEN_AHEAD,
+                         retry_for=None, max_attempts=3)
+        self.assertEqual(res.attempts, 3)
+        done = res.terminal_lines[-1]
+        self.assertRegex(done, r"retry_deadline=\d+", "429×3 必须触发扩窗")
+        extended = [line for line in res.logs if "kind=window_extended" in line]
+        self.assertTrue(extended, "扩窗必须以 window_extended 事件上报")
+
+    def test_404_429_mixed_streak_extends(self):
+        res = run_worker(behavior="http_404_429", at_offset=OPEN_AHEAD,
+                         retry_for=30.0, max_attempts=3)
+        self.assertEqual(res.attempts, 3)
+        done = res.terminal_lines[-1]
+        self.assertIn("streak_404=3", done, "404/404/429 连击必须如实累计")
+        self.assertRegex(done, r"retry_deadline=\d+", "混合连击必须触发扩窗")
+
+    def test_200_html_settles_as_real_not_lost(self):
+        # 200+HTML：作为已得 HTTP 应答结算为 real，不伪装 lost、不留 pending。
+        res = run_worker(behavior="full", at_offset=OPEN_AHEAD,
+                         retry_for=30.0, max_attempts=1)
+        done = res.terminal_lines[-1]
+        self.assertIn("pending=0", done, "200+HTML 必须结算为 real，不留 pending")
+
+
+class FakeTransport:
+    """直发传输替身：把 started 与终态事件同步塞进 grab 侧的队列。
+    responder_fn 是类级回调 ticket -> 终态 dict / "started_only" / None（留未决）。"""
+
+    responder_fn = None
+    instances = []
+
+    def __init__(self, event_queue):
+        self.queue = event_queue
+        self.tickets = []
+        self.active = set()
+        self.closed = False
+        self.cap = 2
+        self.submit_calls = 0
+        FakeTransport.instances.append(self)
+
+    def try_submit(self, ticket):
+        self.submit_calls += 1
+        if self.closed or len(self.active) >= self.cap:
+            return False
+        rid = ticket["request_id"]
+        if any(t["request_id"] == rid for t in self.tickets):
+            return False
+        self.tickets.append(dict(ticket))
+        self.active.add(rid)
+        base = {"kind": "started", "run_id": ticket["run_id"],
+                "request_id": rid, "attempt_no": ticket["attempt_no"]}
+        self.queue.put(base)
+        if FakeTransport.responder_fn is None:
+            return True     # 默认留未决：只发 started
+        ev = FakeTransport.responder_fn(ticket)
+        if ev == "started_only":
+            return True
+        if ev is not None:
+            term = dict(base)
+            term.update(ev)
+            self.queue.put(term)
+            self.active.discard(rid)
+        return True
+
+    def active_count(self):
+        return len(self.active)
+
+    def close(self):
+        self.closed = True
+
+    @classmethod
+    def reset(cls):
+        cls.instances = []
+        cls.responder_fn = None
+
+
+def _d_ok(ticket=None):
+    return {"kind": "completed", "http_status": 200,
+            "body_bytes": json.dumps({"code": 1, "message": "ok"}).encode("utf-8")}
+
+
+def _d_payload(code, message=""):
+    return {"kind": "completed", "http_status": 200,
+            "body_bytes": json.dumps({"code": code, "message": message}).encode("utf-8")}
+
+
+def _d_html(ticket=None):
+    return {"kind": "completed", "http_status": 200,
+            "body_bytes": "<html>报名人数已满</html>".encode("utf-8")}
+
+
+def _d_http(status):
+    return {"kind": "completed", "http_status": status,
+            "body_bytes": b"<html>err</html>"}
+
+
+def _d_failed(ticket=None):
+    return {"kind": "failed", "error_class": "TimeoutError"}
+
+
+class _RecordingSigner:
+    """记录 activity_id/epoch_ms；raise_unavailable 模拟 SignerUnavailable。"""
+
+    def __init__(self):
+        self.calls = []
+        self.raise_unavailable = False
+
+    def __call__(self, activity_id, epoch_ms):
+        if self.raise_unavailable:
+            raise RuntimeError("SignerUnavailable: native signer 不可用")
+        self.calls.append((activity_id, epoch_ms))
+        return "sig-%d" % epoch_ms
+
+
+KNOWN_SRC = "https://school.example/assets/index.b489a1d6.js"
+UNKNOWN_SRC = "https://school.example/assets/other.js"
+VERSION_MSG = "版本不兼容，请刷新页面或清除缓存后重试"
+
+
+class UnifiedDirectLoopTests(unittest.TestCase):
+    """直发为主 + click 单向兜底：同一调度账本、唯一 run、全局名额、不产生第二终态。"""
+
+    def setUp(self):
+        FakeTransport.reset()
+
+    def _known(self):
+        return [KNOWN_SRC]
+
+    def test_known_profile_uses_direct_without_button(self):
+        # 已知直发包 + signer 可用：直发为主，无需按钮可见也能成功。
+        signer = _RecordingSigner()
+        FakeTransport.responder_fn = staticmethod(_d_ok)
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=60.0,
+                         max_attempts=1, button_visible=False, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "success", "已知 profile 直发必须能成功")
+        self.assertTrue(signer.calls, "直发必须经 signer 现算签名")
+        self.assertTrue(FakeTransport.instances, "已知 profile 必须构造直发 transport")
+
+    def test_unknown_profile_falls_back_to_click(self):
+        # 未知入口脚本：不构造 transport、不签名，走原 click 路径。
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=60.0,
+                         max_attempts=1, button_visible=True, script_srcs=[UNKNOWN_SRC],
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "success")
+        self.assertEqual(FakeTransport.instances, [], "未知入口不得构造直发 transport")
+        self.assertEqual(signer.calls, [], "未知入口不得签名")
+
+    def test_signer_unavailable_falls_back_to_click(self):
+        # signer 不可用：直发前降级为 click，签名失败不提交 ticket。
+        signer = _RecordingSigner()
+        signer.raise_unavailable = True
+        FakeTransport.responder_fn = staticmethod(_d_ok)
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=60.0,
+                         max_attempts=1, button_visible=True, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "success")
+        self.assertTrue(FakeTransport.instances)
+        self.assertEqual(FakeTransport.instances[0].tickets, [],
+                         "签名失败不得提交直发 ticket")
+
+    def test_direct_sign_time_from_clock_at_fire(self):
+        # 签名时刻取自业务时钟且在发射当刻：epoch_ms 为 START*1000 量级的正整数。
+        signer = _RecordingSigner()
+        FakeTransport.responder_fn = staticmethod(_d_ok)
+        run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=60.0,
+                   max_attempts=1, button_visible=False, script_srcs=self._known(),
+                   direct_signer=signer, direct_transport=FakeTransport)
+        self.assertTrue(signer.calls)
+        act_id, epoch_ms = signer.calls[0]
+        self.assertEqual(act_id, "act-1")
+        self.assertIsInstance(epoch_ms, int)
+        self.assertGreaterEqual(epoch_ms, int(START * 1000))
+
+    def test_plain_zero_code_does_not_downgrade(self):
+        # 普通 code=0（非版本不兼容）：不降级，直发继续；最终未决。
+        signer = _RecordingSigner()
+        FakeTransport.responder_fn = staticmethod(lambda t: _d_payload(0, "报名人数已满"))
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                         max_attempts=2, button_visible=True, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertNotIn("切换为点击兜底", "\n".join(res.logs),
+                         "普通 code=0 不得触发降级")
+        # code=0 已得 HTTP 应答：结算为 real（不留 pending），次数耗尽报 max_attempts。
+        self.assertEqual(res.stop_reason, "max_attempts")
+
+    def test_network_failure_keeps_pending_not_downgrade(self):
+        # 网络 failed 按 lost 保持 pending，不降级、不假造成功。
+        signer = _RecordingSigner()
+        FakeTransport.responder_fn = staticmethod(_d_failed)
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                         max_attempts=2, button_visible=False, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertNotIn("切换为点击兜底", "\n".join(res.logs),
+                         "网络失败不得触发降级")
+        self.assertEqual(res.stop_reason, "unconfirmed",
+                         "网络失败保持未决，最终应报 unconfirmed")
+
+    def test_version_incompatible_downgrades_once(self):
+        # 精确版本不兼容消息：单向降级为 click，只提交一笔直发 ticket，随后点击成功。
+        signer = _RecordingSigner()
+        FakeTransport.responder_fn = staticmethod(
+            lambda t: _d_payload(0, VERSION_MSG))
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=60.0,
+                         max_attempts=2, button_visible=True, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "success")
+        self.assertIn("切换为点击兜底", "\n".join(res.logs))
+        self.assertEqual(len(FakeTransport.instances[0].tickets), 1,
+                         "降级后不得再提交直发 ticket")
+
+    def test_direct_404_429_500_settle_into_ledger(self):
+        # 直发 404/429/5xx：并入同一账本五档分类，不降级、不假造成功。
+        for status, expect in ((404, "404"), (429, "限流"), (500, "5xx")):
+            with self.subTest(status=status):
+                FakeTransport.reset()
+                signer = _RecordingSigner()
+                FakeTransport.responder_fn = staticmethod(
+                    lambda t, s=status: _d_http(s))
+                res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                                 retry_for=30.0, max_attempts=1, button_visible=False,
+                                 script_srcs=self._known(), direct_signer=signer,
+                                 direct_transport=FakeTransport)
+                self.assertNotIn("切换为点击兜底", "\n".join(res.logs))
+                self.assertIn(expect, "\n".join(res.logs),
+                              "HTTP %d 必须按五档分类入账本" % status)
+
+    def test_max_attempts_one_allows_single_ticket(self):
+        # started 滞后（无终态）也只允许一笔：max_attempts=1 严格，最终未决。
+        signer = _RecordingSigner()
+        FakeTransport.responder_fn = staticmethod(lambda t: "started_only")
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=60.0,
+                         max_attempts=1, button_visible=False, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertEqual(len(FakeTransport.instances[0].tickets), 1,
+                         "max_attempts=1 时 started 滞后也不得有第二笔")
+        self.assertEqual(res.stop_reason, "unconfirmed")
+
+    def test_direct_html_200_settles_real_not_lost(self):
+        # 直发 200+HTML：结算为 real，不留 pending、不假造 lost；
+        # 200 无业务 code 属通道/协议异常：停止新发，报 process_error（F01 返修）。
+        signer = _RecordingSigner()
+        FakeTransport.responder_fn = staticmethod(_d_html)
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                         max_attempts=1, button_visible=False, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        done = res.terminal_lines[-1]
+        self.assertIn("pending=0", done, "直发 200+HTML 必须结算为 real，不留 pending")
+        self.assertEqual(res.stop_reason, "process_error",
+                         "200 无业务 code 是通道/协议异常，必须停发报 process_error")
+
+    def test_direct_4001_stops_new_sends(self):
+        # 直发只认 str(code)=='4001'：命中即停新发，报 login_invalid。
+        signer = _RecordingSigner()
+        FakeTransport.responder_fn = staticmethod(lambda t: _d_payload(4001))
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=60.0,
+                         max_attempts=3, button_visible=False, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "login_invalid",
+                         "直发 code=4001 必须判 login_invalid")
+        self.assertEqual(len(FakeTransport.instances[0].tickets), 1,
+                         "4001 后必须停止新发")
+
+    def test_direct_login_words_in_message_do_not_mark_invalid(self):
+        # message 含「登录/身份验证」但 code=0：不判失效（只认 str(code)=='4001'）。
+        signer = _RecordingSigner()
+        FakeTransport.responder_fn = staticmethod(
+            lambda t: _d_payload(0, "请登录后完成身份验证"))
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                         max_attempts=1, button_visible=False, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertNotEqual(res.stop_reason, "login_invalid",
+                            "message 关键词不得判登录失效")
+
+    def test_closed_late_event_does_not_add_new_done(self):
+        # 关闭后迟到事件不新增终态：transport.close 后不再接纳（替身拒新）。
+        signer = _RecordingSigner()
+        FakeTransport.responder_fn = staticmethod(lambda t: "started_only")
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=60.0,
+                         max_attempts=1, button_visible=False, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        done_lines = [l for l in res.terminal_lines if "kind=done" in l or l.startswith("done")]
+        self.assertEqual(len(res.terminal_lines), 1, "不得产生第二终态")
+        self.assertTrue(FakeTransport.instances[0].closed, "收尾必须 close transport")
+
+    def test_production_ticket_contract(self):
+        # 生产 _try_direct_fire 交给 transport 的 ticket 契约（F01）：
+        # url = API + '/rjyHdCyr/signUp/' + sig，headers 带 token/Accept/Referer/UA，
+        # 与既有 _get 约定一致；token 不进日志。断言对象是生产构造的 ticket 本身。
+        signer = _RecordingSigner()
+        FakeTransport.responder_fn = staticmethod(_d_ok)
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=60.0,
+                         max_attempts=1, button_visible=False, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        tickets = FakeTransport.instances[0].tickets
+        self.assertTrue(tickets, "已知 profile 必须提交生产 ticket")
+        t = tickets[0]
+        self.assertTrue(signer.calls, "必须现算签名")
+        fake_sig = "sig-%d" % signer.calls[0][1]
+        self.assertEqual(t["url"], grab.API + "/rjyHdCyr/signUp/" + fake_sig,
+                         "F01：URL 必须等于 API+'/rjyHdCyr/signUp/'+sig（含 /dr/api）")
+        headers = t["headers"]
+        self.assertEqual(headers.get("token"), "test-token",
+                         "F01：headers 必须带 token 替身值")
+        self.assertEqual(headers.get("Accept"), "application/json, text/plain, */*",
+                         "F01：Accept 与既有 _get 约定相同")
+        self.assertEqual(headers.get("Referer"), grab.REFERER)
+        self.assertEqual(headers.get("User-Agent"), grab.UA)
+        self.assertNotIn("test-token", "\n".join(res.logs), "不得打印 token")
+
+    def test_missing_token_stops_without_ticket_click_or_leak(self):
+        # token 缺失：不建 ticket、try_submit 调用为 0、不点 click、不伪造 4001、不泄漏值。
+        signer = _RecordingSigner()
+        FakeTransport.responder_fn = staticmethod(_d_ok)
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                         max_attempts=3, button_visible=True, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport,
+                         api_token="")
+        inst = FakeTransport.instances[0]
+        self.assertEqual(inst.submit_calls, 0, "缺 token 不得调用 try_submit")
+        self.assertEqual(inst.tickets, [], "缺 token 不得创建 ticket")
+        self.assertNotEqual(res.stop_reason, "login_invalid", "不得伪造 4001")
+        self.assertNotEqual(res.stop_reason, "success", "缺 token 不得转 click 成功")
+        self.assertEqual(res.stop_reason, "process_error",
+                         "缺 token 是安全停发原因，无 pending 报 process_error")
+
+    def test_direct_401_403_302_stop_sends(self):
+        # direct 异常 HTTP（401/403/3xx）：按 real 结算已收应答、停止新发、
+        # 不自动降级 click；无 pending 报 process_error。
+        for status in (401, 403, 302):
+            with self.subTest(status=status):
+                FakeTransport.reset()
+                signer = _RecordingSigner()
+                FakeTransport.responder_fn = staticmethod(
+                    lambda t, s=status: _d_http(s))
+                res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                                 retry_for=30.0, max_attempts=3, button_visible=False,
+                                 script_srcs=self._known(), direct_signer=signer,
+                                 direct_transport=FakeTransport)
+                self.assertEqual(len(FakeTransport.instances[0].tickets), 1,
+                                 "HTTP %d 异常应答后必须停止新发" % status)
+                self.assertNotIn("切换为点击兜底", "\n".join(res.logs),
+                                 "异常 HTTP 不得自动切 click")
+                self.assertEqual(res.stop_reason, "process_error",
+                                 "无 pending 的通道/协议异常报 process_error")
+                self.assertIn("pending=0", res.terminal_lines[-1],
+                              "已收应答按 real 结算，不留 pending")
+
+    def test_direct_200_no_business_code_stops_sends(self):
+        # 200 解码后无可识别业务 code：已决应答（非 lost）、停止新发、报 process_error。
+        signer = _RecordingSigner()
+        FakeTransport.responder_fn = staticmethod(_d_html)
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                         retry_for=30.0, max_attempts=3, button_visible=False,
+                         script_srcs=self._known(), direct_signer=signer,
+                         direct_transport=FakeTransport)
+        self.assertEqual(len(FakeTransport.instances[0].tickets), 1,
+                         "200 无业务 code 后必须停止新发")
+        self.assertNotIn("切换为点击兜底", "\n".join(res.logs),
+                         "200 无业务 code 不得自动切 click")
+        self.assertEqual(res.stop_reason, "process_error")
+
+    def test_direct_anomaly_with_pending_reports_unconfirmed(self):
+        # 异常应答已决、另一笔仍 pending：停止新发后统一收尾报 unconfirmed。
+        calls = {"n": 0}
+
+        def _resp(ticket):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "started_only"
+            return _d_http(403)
+
+        FakeTransport.responder_fn = staticmethod(_resp)
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD,
+                         retry_for=30.0, max_attempts=3, button_visible=False,
+                         script_srcs=self._known(), direct_signer=signer,
+                         direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "unconfirmed",
+                         "另有 pending 时异常停发必须报 unconfirmed")
+        self.assertLessEqual(len(FakeTransport.instances[0].tickets), 2,
+                             "异常应答后不得再新发")
 
 
 if __name__ == "__main__":

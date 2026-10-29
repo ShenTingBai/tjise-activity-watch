@@ -26,6 +26,7 @@
 import argparse
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -41,6 +42,9 @@ API = BASE + "/dr/api"
 REFERER = BASE + "/stu/"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+# 直发白名单：只有页面入口脚本恰好是这个已知打包（签名协议与之绑定）才启用直发；
+# 其它/未知脚本一律点击兜底，不下载脚本、不抽新 key（L1 保守匹配，C01）
+KNOWN_DIRECT_SCRIPT_BASENAME = "index.b489a1d6.js"
 
 HERE = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 # 登录态/偏好统一走 runtime_paths：开发与绿色版仍是脚本旁 data，
@@ -1063,6 +1067,15 @@ NOT_READY_404_LIMIT = 3          # 连续 404 视为接口未就绪
 BACKOFF_FACTOR = 1.6             # 自适应退避倍率
 BACKOFF_MAX_S = 3.0              # 自适应退避上限
 ADAPTIVE_WINDOW_S = 1500.0       # 自适应扩窗上限（25 分钟）
+# --- v4 直发核心：调度账本与降级地板（§3/§5/§12）---
+SERVER_ERROR_MIN_GAP_S = 0.5     # 5xx 之后的最小间隔地板
+ADAPTIVE_IN_GOLDEN = False       # golden 内默认不进 adaptive（真实 200 才退黄金）
+MAX_INFLIGHT = 2                 # 物理在途请求上限（直发与 click 共用）
+INFLIGHT_TTL_S = 8.0             # 非 lost pending 超过此时长不再占发射名额
+INFLIGHT_WAIT_S = 0.05           # 名额满时原地泵的步长
+CONFIRM_INFLIGHT_WAIT_S = 1.0    # 确认点击前名额满时最多原地等待的秒数
+NOT_READY_SLOWDOWN_AFTER_S = 20.0  # 纯 404 段持续超过此时长开始降速
+NOT_READY_SLOW_GAP_S = 0.8         # 纯 404 慢未就绪的最小间隔地板
 
 
 class BurstPolicy:
@@ -1075,10 +1088,12 @@ class BurstPolicy:
     不变量：
     * attempts 只数真正发出过的 signUp 请求，单调递增；
     * pending 里每笔都有唯一 request_id，响应按归属结算，乱序合法；
-    * 同一 request 重复通知只算一次；别家响应不改本场结论；
+    * 同一 request 重复结算只算一次；别家响应不改本场结论；
     * effective_deadline 只会因自适应扩窗变大，且永不越过 sign_end；
     * hard_deadline 一旦冻结就不再改写，sign_end 截止永远优先于扩窗；
-    * 进入 terminal 后拒绝再发起任何动作（用户停止同此）。
+    * 进入 terminal 后拒绝再发起任何动作（用户停止同此）；
+    * 登记序 == 发送序（attempt_no 严格递增），倒扫 _order 即倒序扫发送序
+      ——这是乱序结算安全（F06 5xx 地板、连击重算）的前提。
     """
 
     PHASE_GOLDEN = "golden"
@@ -1087,7 +1102,8 @@ class BurstPolicy:
     PHASE_TERMINAL = "terminal"
 
     def __init__(self, open_ts, base_deadline, sign_end_ts=None,
-                 max_attempts=0, clock=None, retry_start=None):
+                 max_attempts=0, clock=None, retry_start=None,
+                 allow_extend=True):
         self._clock = clock
         self.open_ts = float(open_ts)
         self.retry_start = float(retry_start if retry_start is not None else open_ts)
@@ -1105,6 +1121,16 @@ class BurstPolicy:
         self._requests = {}
         self._seq = 0
         self._stopped = False
+        # 显式 --retry-for 时禁扩窗（用户给的秒数是硬承诺，不被自适应拉长）
+        self._allow_extend = bool(allow_extend)
+        # §5 5xx 降速地板（倒扫派生，见 _derive_min_gap）
+        self._min_gap = 0.0
+        # 发送序（只追加，绝不重排/删除）与相关缓存
+        self._order = []
+        self._last_attempt_no = 0
+        self._level_prev = False            # 上一次 _apply_level 的 ungated 电平
+        self._seg_has_throttled = False     # 缓存：最新连击段内是否出现 429
+        self._seg_oldest_issued = None      # 缓存：最新连击段最旧 issued_at
 
     # -- 时间读数 ---------------------------------------------------------
     def _now(self):
@@ -1115,44 +1141,182 @@ class BurstPolicy:
                      else self._clock())
 
     def _wall_now(self):
+        """业务墙上时钟读数：只认 clock.now()（业务 epoch），不回退墙钟。
+
+        clock 不可用时抛 ClockUnavailable（由上层统一转 unconfirmed），
+        绝不静默回退 time.time()——那会让扩窗/截止在时钟失效时偷偷按真实
+        墙钟走，破坏「时钟不可用即停止发射」的契约。
+        """
         if self._clock is None:
             import time as _time
             return _time.time()
-        return float(self._clock.time() if hasattr(self._clock, "time")
-                     else self._clock())
+        if hasattr(self._clock, "now"):
+            now = self._clock.now()
+            return float(now) if now is not None else time.time()
+        return float(self._clock())
+
+    def _elapsed(self):
+        """单调时钟读数（issued_at/TTL/慢地板用），永不抛 ClockUnavailable。"""
+        return float(self._clock.elapsed_s()) if self._clock is not None else self._now()
+
+    # -- 发送序倒扫（乱序安全的核心） ---------------------------------------
+    def _recompute_streak(self):
+        """按发送序（新→旧）倒扫 _order，返回最新连击段的 (长度, 含429, 最旧issued_at)。
+
+        与登记序同口径：首个已结算的非 404/throttled（更新的 real/server_error）
+        断连击——止步于此，更旧的段不看。pending/lost 跳过（不参与判定）。
+        """
+        n = 0
+        has_throttled = False
+        oldest_issued = None
+        for rid in reversed(self._order):
+            rec = self._requests[rid]
+            if rec["status"] != "settled":
+                continue                     # pending / lost：不看
+            if rec["kind"] not in ("404", "throttled"):
+                break                        # 更新的 real/5xx：段已断
+            n += 1
+            if rec["kind"] == "throttled":
+                has_throttled = True
+            issued = rec.get("issued_at")
+            if issued is not None and (oldest_issued is None or issued < oldest_issued):
+                oldest_issued = issued
+        return n, has_throttled, oldest_issued
+
+    def _derive_min_gap(self):
+        """5xx 降速地板：按发送序倒扫，最新「有定论」的记录说了算（§5/F06）。
+
+        倒扫取最新有定论者，天然乱序安全：
+        - server_error（5xx）→ 0.5；
+        - 404 且状态码==404（未就绪）或 real 且状态码==200（干净成功）→ 0；
+        - throttled(429) / 非200 real / 无状态码 bare404 → 跳过（看更旧）；
+        - 全部跳过（从未有定论）→ 0。
+        替代 feature 的事件式 _note_min_gap/_clear_min_gap（旧 5xx 晚到会在新
+        200 之后错误置 0.5 的 F06 缺陷）。
+        """
+        for rid in reversed(self._order):
+            rec = self._requests[rid]
+            if rec["status"] != "settled":
+                continue                     # pending/lost：跳过
+            kind = rec["kind"]
+            status = rec.get("http_status")
+            if kind == "server_error":
+                return SERVER_ERROR_MIN_GAP_S
+            if kind == "404" and status == 404:
+                return 0.0
+            if kind == "real" and status == 200:
+                return 0.0
+            # throttled / non-200 real / bare 404 → 跳过，看更旧
+            continue
+        return 0.0
 
     # -- 阶段与调度 -------------------------------------------------------
     @property
     def phase(self):
-        self._refresh_phase()
+        self._apply_level()
         return self._phase
 
-    def _refresh_phase(self):
-        """按已观察事实刷新阶段；非 404 响应会让黄金/退避立即退位。"""
-        if self._phase == self.PHASE_TERMINAL:
+    def current_phase(self):
+        """只读返回当前 phase，不触发 _apply_level（回调路径不读时钟）。"""
+        return self._phase
+
+    def _golden_time_up(self):
+        """黄金墙钟是否已到点；clock 不可用时返回 False（保守留在 golden）。"""
+        try:
+            return self._wall_now() >= self.open_ts + GOLDEN_WINDOW_S
+        except Exception:
+            return False
+
+    def _apply_level(self):
+        """电平/边沿两层重算：streak、5xx 地板、种子边沿、golden 退出、phase。
+
+        电平：当前事实直接决定 level（ungated = streak>=3 且段内含 429）。
+        边沿：level 从 false→true 才给退避种子，true→false 且非 ADAPTIVE 才清——
+        否则单个 429 每次重算都重置退避/清种子，把种子语义打碎。
+        """
+        if self._stopped or self._phase == self.PHASE_TERMINAL:
             return
+        n, has_throttled, oldest_issued = self._recompute_streak()
+        self.streak_404 = n
+        self._seg_has_throttled = has_throttled
+        self._seg_oldest_issued = oldest_issued
+        self._min_gap = self._derive_min_gap()
+        ungated = n >= NOT_READY_404_LIMIT and has_throttled
+        # 边沿：false→true 给种子；true→false 且非 ADAPTIVE 清种子
+        if ungated and not self._level_prev:
+            self._backoff_s = self._seed_backoff()
+        elif (not ungated and self._level_prev
+              and self._phase != self.PHASE_ADAPTIVE):
+            self._backoff_s = FULL_SPEED_INTERVAL_S
+        self._level_prev = ungated
+        # golden：默认不进 adaptive（ADAPTIVE_IN_GOLDEN=False）；轮数/墙钟到点退位
         if self._phase == self.PHASE_GOLDEN:
-            now = self._wall_now()
-            if self.golden_rounds >= GOLDEN_ROUNDS or now >= self.open_ts + GOLDEN_WINDOW_S:
+            if self.golden_rounds >= GOLDEN_ROUNDS or self._golden_time_up():
+                self._exit_golden()
+            return
+        self._refresh_phase(ungated)
+
+    def _exit_golden(self):
+        """golden 的唯一出口：退到 FULL_SPEED，按当前事实决定是否带种子进 adaptive。
+
+        统一从这里退出，避免路径分叉把 golden 内累积的种子清掉。
+        """
+        if self._phase != self.PHASE_GOLDEN:
+            return
+        self._phase = self.PHASE_FULL_SPEED
+        n, has_throttled, _ = self._recompute_streak()
+        ungated = n >= NOT_READY_404_LIMIT and has_throttled
+        self._refresh_phase(ungated)
+        if ungated and self._backoff_s == FULL_SPEED_INTERVAL_S:
+            self._backoff_s = self._seed_backoff()
+
+    def _refresh_phase(self, ungated):
+        """按已重算的 ungated 电平刷 phase。gated 必须在退出 golden 之后判定。
+
+        ADAPTIVE_IN_GOLDEN=False（§3 常量开关）⇒ gated 的第二项恒假，即 golden
+        内永不进 ADAPTIVE；改成 True 才会让 golden 内的段也切 phase（死分支，
+        留着是为了让开关真的能切，不是遗留代码）。
+        """
+        in_golden_ok = ADAPTIVE_IN_GOLDEN if self._phase == self.PHASE_GOLDEN else True
+        if ungated and in_golden_ok:
+            if self._phase != self.PHASE_ADAPTIVE:
+                self._phase = self.PHASE_ADAPTIVE
+        else:
+            if self._phase == self.PHASE_ADAPTIVE:
                 self._phase = self.PHASE_FULL_SPEED
                 self._backoff_s = FULL_SPEED_INTERVAL_S
-            return
-        if self._phase == self.PHASE_ADAPTIVE and self.streak_404 < NOT_READY_404_LIMIT:
-            self._phase = self.PHASE_FULL_SPEED
-            self._backoff_s = FULL_SPEED_INTERVAL_S
+
+    def _seed_backoff(self):
+        """退避种子值：一段含 throttled 的连击降速后从这里起步。"""
+        return min(BACKOFF_MAX_S, FULL_SPEED_INTERVAL_S * BACKOFF_FACTOR)
 
     def interval_s(self):
-        """下一次尝试前必须等待的最小间隔。"""
-        self._refresh_phase()
+        """下一次尝试前必须等待的最小间隔（base / 5xx 地板 / 纯404慢地板 取 max）。"""
+        self._apply_level()
         if self._phase == self.PHASE_GOLDEN:
-            return GOLDEN_INTERVAL_S
-        if self._phase == self.PHASE_ADAPTIVE:
-            return min(BACKOFF_MAX_S, max(FULL_SPEED_INTERVAL_S, self._backoff_s))
-        return FULL_SPEED_INTERVAL_S
+            base = GOLDEN_INTERVAL_S
+        elif self._phase == self.PHASE_ADAPTIVE:
+            base = min(BACKOFF_MAX_S, max(FULL_SPEED_INTERVAL_S, self._backoff_s))
+        else:
+            base = FULL_SPEED_INTERVAL_S
+        # §12：纯 404 段一直未就绪（服务器晚开几分钟）时降速到 0.8s 地板——
+        # 段内一旦混进 throttled 就交给退避，出现 real 立即随连击清零而解除。
+        slow_floor = 0.0
+        if (self.streak_404 > 0 and not self._seg_has_throttled
+                and self._seg_oldest_issued is not None):
+            age_s = self._elapsed() - self._seg_oldest_issued
+            if age_s > NOT_READY_SLOWDOWN_AFTER_S:
+                slow_floor = NOT_READY_SLOW_GAP_S
+        # §5：5xx 后的最小间隔地板，与退避/黄金/慢未就绪取 max
+        return max(base, self._min_gap, slow_floor)
 
     def next_interval_after_wait(self):
         """等待完本次间隔后推进退避计数，返回下一轮间隔。"""
         if self._phase == self.PHASE_ADAPTIVE:
+            if self._level_prev and self._backoff_s == FULL_SPEED_INTERVAL_S:
+                # 段内种子边沿已消耗（_backoff_s 已是 seed），此处只兜底
+                # 进 ADAPTIVE 时按 level 重放种子，否则从全速起步被错算成「无退避」
+                self._backoff_s = self._seed_backoff()
             self._backoff_s = min(BACKOFF_MAX_S,
                                   max(FULL_SPEED_INTERVAL_S, self._backoff_s) * BACKOFF_FACTOR)
         return self.interval_s()
@@ -1168,7 +1332,13 @@ class BurstPolicy:
         return True
 
     def extend_deadline_for_adaptive(self):
-        """404 连击触发自适应扩窗：有效截止拉到起点起 25 分钟，sign_end 仍硬截。"""
+        """404 连击触发自适应扩窗：有效截止拉到起点起 25 分钟，sign_end 仍硬截。
+
+        显式 --retry-for 时（allow_extend=False）整条扩窗路径不生效：
+        用户给的秒数是硬承诺，不能被自适应偷偷拉长。
+        """
+        if not self._allow_extend:
+            return self.effective_deadline
         target = self.retry_start + ADAPTIVE_WINDOW_S
         if self.sign_end_ts:
             target = min(target, self.sign_end_ts)
@@ -1181,45 +1351,69 @@ class BurstPolicy:
         """为一笔真实发出的 signUp 请求分配唯一 ID 并入账。"""
         self._seq += 1
         request_id = "req-%d" % self._seq
+        attempt_no = self.attempts + 1
+        # 不变量：attempt_no 严格递增 ⇒ 登记序 == 发送序，倒扫 _order 才等价
+        # 按发送顺序从新到旧（乱序结算的安全前提）。本方法跑在回调里，
+        # assert 被 -O 剥掉或异常被吞都会漏账，所以只记日志不抛。
+        if attempt_no <= self._last_attempt_no:
+            log("attempt_no 未递增（%s → %s）：倒序重算不再等于发送序"
+                % (self._last_attempt_no, attempt_no))
+        self._last_attempt_no = attempt_no
+        # issued_at 只在登记时读一次单调时钟（永不抛 ClockUnavailable），
+        # 供纯 404 慢地板（段起点 = 段最旧 issued_at）与 inflight TTL 复用。
         self._requests[request_id] = {"status": "pending", "kind": None,
-                                      "attempt_no": self.attempts + 1}
+                                      "attempt_no": attempt_no,
+                                      "issued_at": self._elapsed()}
+        self._order.append(request_id)   # 只追加，绝不重排/删除
         self.attempts += 1
         if self._phase == self.PHASE_GOLDEN:
             self.golden_rounds += 1
         return request_id
 
-    def settle(self, request_id, kind):
-        """结算一笔请求的响应归属；kind ∈ {404, real, lost}。
+    def settle(self, request_id, kind, http_status=None):
+        """结算一笔请求的响应归属；kind ∈ {404, throttled, server_error, real, lost}。
 
-        乱序合法：响应可以按任意顺序回来；重复结算同一笔只认第一次。
-        404 会加连击并可能进退避；real 清连击并退出退避/黄金。
-        lost（响应体丢失/读不出）不结算：请求保持未决，终态如实报「未确认」。
+        乱序合法：响应可按任意顺序回来；重复结算同一笔只认第一次。
+        - 404：计入连击段；连击达阈值只扩窗，不切 phase（§4）；
+        - throttled：计入连击段、连击达阈值给退避种子（含 throttled 才给），
+          但不结束 golden（§4）；单个 429 只结算，不单独触发退避；
+        - server_error：断开连击、设 5xx 地板（§5），永不切 phase；
+        - real：断开连击；http_status==200 时结束 golden 并回 FULL_SPEED（§11），
+          非 200 real 只断连击、不结束 golden；
+        - lost：不结算，请求保持未决，终态如实报「未确认」。
+        http_status 记原始 HTTP 状态码，供 §5/§11 判定。
         """
         record = self._requests.get(request_id)
         if record is None or record["status"] == "settled":
             return None
+        if http_status is not None:
+            record["http_status"] = http_status
         if kind == "lost":
             record["kind"] = "lost"
             return record          # 不改 status，仍是 pending
         record["status"] = "settled"
         record["kind"] = kind
-        if kind == "404":
-            self.streak_404 += 1
-            if self.streak_404 >= NOT_READY_404_LIMIT:
-                if self._phase != self.PHASE_TERMINAL:
-                    self._phase = self.PHASE_ADAPTIVE
-                    self._backoff_s = min(BACKOFF_MAX_S,
-                                          FULL_SPEED_INTERVAL_S * BACKOFF_FACTOR)
-                self.extend_deadline_for_adaptive()
-        elif kind == "real":
-            self.streak_404 = 0
-            if self._phase == self.PHASE_GOLDEN:
-                self._phase = self.PHASE_FULL_SPEED
-                self._backoff_s = FULL_SPEED_INTERVAL_S
-            elif self._phase == self.PHASE_ADAPTIVE:
-                self._phase = self.PHASE_FULL_SPEED
-                self._backoff_s = FULL_SPEED_INTERVAL_S
+        # prev 必须在 _apply_level 之前取：_apply_level 会把重算结果写回 streak_404
+        prev_len = self.streak_404
+        # 连击/地板/种子/phase 全部交给 _apply_level：按发送顺序倒序重算（乱序安全），
+        # 不再在 settle 里做 +=1 / =0——旧 404 后到不得重建连击，非 200 real 断连击但不退黄金（§11）。
+        self._apply_level()
+        if kind == "real" and http_status == 200 and self._phase == self.PHASE_GOLDEN:
+            # §11：200-real 事件驱动结束 golden（接口已就绪，与它是否清连击无关）。
+            self._exit_golden()
+        # 扩窗边沿只看长度（§4「纯 404 段不切 phase，只扩窗」）；种子边沿在 _apply_level
+        self._maybe_extend_window(prev_len, self.streak_404)
         return record
+
+    def _maybe_extend_window(self, prev_len, new_len):
+        """扩窗边沿：只看连击长度（404 与 throttled 同等计入），new>prev 每增长一次就扩一次。
+
+        判据刻意不含 has_throttled——纯 404 也照常扩窗（§4），纯 404 的 20s→0.8s
+        慢地板依赖这个能力。extend_deadline_for_adaptive 幂等且被 sign_end 硬截；
+        显式 --retry-for 时整条路径不生效。
+        """
+        if new_len >= NOT_READY_404_LIMIT and new_len > prev_len:
+            self.extend_deadline_for_adaptive()
 
     def pending_ids(self):
         return [rid for rid, rec in self._requests.items()
@@ -1227,6 +1421,25 @@ class BurstPolicy:
 
     def pending_count(self):
         return len(self.pending_ids())
+
+    def inflight_count(self):
+        """占发射名额的在途请求数（§2）：pending、非 lost、且未超 INFLIGHT_TTL_S。
+
+        lost 不占名额——页面重载/导航中止只发 requestfailed，若继续占名额，
+        名额会一点点占满直到永久不发。pending 超过 INFLIGHT_TTL_S 也不占名额
+        （等不回来的请求不该堵死发射），但它仍是 pending：终态如实报「未确认」，
+        迟到响应照常结算。
+        """
+        now = self._elapsed()
+        count = 0
+        for rec in self._requests.values():
+            if rec["status"] != "pending" or rec["kind"] == "lost":
+                continue
+            issued = rec.get("issued_at")
+            if issued is not None and now - issued >= INFLIGHT_TTL_S:
+                continue
+            count += 1
+        return count
 
     def settled_kind(self, request_id):
         rec = self._requests.get(request_id)
@@ -1246,10 +1459,14 @@ class BurstPolicy:
 
 
 def _classify_response(response):
-    """把一次 signUp 响应归类为 404 / real；没有响应体也按 real 结算。
+    """把一次 signUp 响应归类为五档：404 / throttled / server_error / real / lost。
 
-    HTTP 404 明确是「接口未就绪/限流」；其余 HTTP 状态（含 200+JSON、
-    5xx）都算真实响应，必须结束黄金阶段。响应体丢失时不能挂成 404。
+    - 404：接口未就绪（还没开放报名）；
+    - 429→throttled：限流信号，据此进退避种子；
+    - >=500→server_error：服务端异常（网关/超载），当 real 断 404 连击但需 5xx 地板降速；
+    - 其余（200+JSON、400 等业务响应）→real：必须结束黄金阶段；
+    - 无响应→lost：请求保持未决，终态如实报「未确认」。
+    5xx 常是 HTML 错误页，不能按「读不出就 lost」处理（会永久挂 pending）。
     """
     if response is None:
         return "lost"
@@ -1258,7 +1475,31 @@ def _classify_response(response):
         status_code = int(status)
     except (TypeError, ValueError):
         status_code = 200
-    return "404" if status_code == 404 else "real"
+    if status_code == 404:
+        return "404"
+    if status_code == 429:
+        return "throttled"
+    if status_code >= 500:
+        return "server_error"
+    return "real"
+
+
+def _decode_body(raw):
+    """字节响应体 → dict。先严格 utf-8，失败再 gb18030（学校接口多为 GBK 系）。
+
+    解不出时返回 {}（等价 code=None），绝不抛异常——否则 HTML 错误页会把
+    结算路径炸掉、请求永久 pending。
+    """
+    if not raw:
+        return {}
+    for encoding in ("utf-8", "gb18030"):
+        try:
+            text = raw.decode(encoding) if isinstance(raw, (bytes, bytearray)) else str(raw)
+            data = json.loads(text)
+            return data if isinstance(data, dict) else {}
+        except (UnicodeDecodeError, ValueError):
+            continue
+    return {}
 
 
 def _ts_text(ts) -> str:
@@ -1583,6 +1824,7 @@ def cmd_grab(args):
             # 监听容器先于 try 建立：finally 里停用监听不会因未定义而失败
             armed = {"on": False, "dead": False}
             listeners = []
+            burst = None    # goto 前异常时 _settle_pending/_finalize 安全空转
             try:
                 ctx = new_context(browser)
                 page = ctx.new_page()
@@ -1601,7 +1843,14 @@ def cmd_grab(args):
                         % (is_joined(target["id"], budget=budget), btns))
                     return 0
 
-                joined = is_joined(target["id"], budget=budget)
+                # 前置核对与最终核对分开（F07）：这里查询失败不等于没报名，吞掉
+                # 非时钟异常后照常进入盯按钮；最终核对的失败如实上抛。
+                try:
+                    joined = is_joined(target["id"], budget=budget)
+                except ClockUnavailable:
+                    raise
+                except Exception:
+                    joined = None
                 if joined is True:
                     return terminal("already_signed")
                 if joined is None:
@@ -1637,6 +1886,7 @@ def cmd_grab(args):
                     max_attempts=args.max_attempts,
                     clock=clock,
                     retry_start=frozen or at_ts,
+                    allow_extend=args.retry_for is None,
                 )
                 # 受控提交窗口：只承认本场盯按钮期间发出的 signUp 请求。
                 # 学校真实接口是 GET signUp/<opaque-hash>，hash 不含活动 ID，
@@ -1649,6 +1899,53 @@ def cmd_grab(args):
                 request_to_bid = {}
                 response_queue = []
 
+                # 直发（主）+ 点击（单向兜底）同一调度账本：直发仅当入口脚本为
+                # 已知打包且 signer 可用时启用；否则全程点击。direct 字典始终存在，
+                # 未启用时 downgrade=False 且 transport=None，对点击路径零影响。
+                direct = {
+                    "enabled": False,
+                    "downgrade": False,
+                    "protocol_stop": False,   # 通道/协议异常：停止新发，统一收尾
+                    "signer": None,
+                    "transport": None,
+                    "run_id": os.urandom(8).hex(),
+                    "seq": 0,
+                    "ticket_to_bid": {},
+                    "reserved": 0,   # 已提交未 started：预留名额与次数配额
+                    "queue": None,
+                }
+
+                def _detect_direct_signer():
+                    """入口脚本恰为已知直发包且 signer 可用才返回 build_signup_hash。
+
+                    只读已加载页面 script src，不下载脚本、不在热路径额外请求学校；
+                    任何异常一律返回 None（点击兜底），不扰动既有流程。
+                    """
+                    try:
+                        from signup_signing import build_signup_hash
+                        srcs = page.eval_on_selector_all(
+                            "script", "els => els.map(e => e.getAttribute('src') || '')")
+                        for s in (srcs or []):
+                            base = str(s).split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+                            if base == KNOWN_DIRECT_SCRIPT_BASENAME:
+                                return build_signup_hash
+                    except Exception:
+                        return None
+                    return None
+
+                _signer = _detect_direct_signer()
+                if _signer is not None:
+                    try:
+                        from signup_transport import DirectTransport
+                    except Exception:
+                        DirectTransport = None
+                    if DirectTransport is not None:
+                        direct["signer"] = _signer
+                        direct["queue"] = queue.Queue()
+                        direct["transport"] = DirectTransport(direct["queue"])
+                        direct["enabled"] = True
+                        log("[i] 入口脚本为已知直发包：启用直发（点击兜底保留）")
+
                 def _is_signup_url(url_text):
                     return url_text.startswith(BASE) and "/rjyHdCyr/signUp/" in url_text
 
@@ -1660,6 +1957,9 @@ def cmd_grab(args):
 
                 def on_request(request):
                     if armed["dead"] or not armed["on"]:
+                        return
+                    # 直发在途（未降级）时，页面自发的同源请求不入账本、不改结论
+                    if direct["enabled"] and not direct["downgrade"]:
                         return
                     try:
                         url_text = str(request.url)
@@ -1686,6 +1986,8 @@ def cmd_grab(args):
                     # 回调只入队：结算统一走主循环的事件泵，不在回调里做 I/O
                     if armed["dead"]:
                         return
+                    if direct["enabled"] and not direct["downgrade"]:
+                        return
                     try:
                         url_text = str(response.url)
                     except Exception:
@@ -1694,9 +1996,65 @@ def cmd_grab(args):
                         return
                     response_queue.append(response)
 
+                def on_requestfailed(request):
+                    # 回调只入队：导航中止只发 requestfailed，没有 response，
+                    # 交 _settle_failed 按既有 request_id 结算为 lost（立即释放名额）
+                    if armed["dead"]:
+                        return
+                    if direct["enabled"] and not direct["downgrade"]:
+                        return
+                    try:
+                        url_text = str(request.url)
+                    except Exception:
+                        return
+                    if not _is_signup_url(url_text):
+                        return
+                    response_queue.append(("failed", request))
+
+                def _sync_budget_window():
+                    """扩窗同步（F05）：policy 截止变大时重建 RetryBudget 并广播事件。
+
+                    纯 404 与 429 连击都会经 burst.settle→_maybe_extend_window 拉长
+                    effective_deadline；这里统一把预算与事件对齐，sign_end 仍硬截。
+                    """
+                    nonlocal budget
+                    if (burst is not None
+                            and burst.effective_deadline > getattr(budget, "deadline_epoch", 0)):
+                        budget = RetryBudget(burst.effective_deadline, business_clock=clock)
+                        state["deadline"] = burst.effective_deadline
+                        _retry_event(kind="window_extended",
+                                     retry_deadline=int(burst.effective_deadline),
+                                     sign_end=int(sign_end_ts or 0))
+
+                def _apply_conclusion(payload):
+                    """对一笔 real 应答的 body 结论：成功粘性 / 只认 str(code)==4001 / 版本不兼容单向降级。
+
+                    click 与直发共用同一套结论语义，避免两条通道判据漂移。
+                    """
+                    code = payload.get("code") if isinstance(payload, dict) else None
+                    message = ""
+                    if isinstance(payload, dict):
+                        message = str(payload.get("message") or "")
+                    state["last_reason"] = "code:%s %s" % (code, message[:30])
+                    # 成功结论粘性：只要有一笔 code=1 就是成功，后续失败响应不改写
+                    if code == 1:
+                        state["resp_ok"] = True
+                    # 只认 str(code)=='4001'：message 子串/关键词不作数（避免误判）
+                    if code is not None and str(code) == "4001":
+                        state["login_invalid"] = True
+                    # 版本不兼容：code 规范化'0'且 message 去末尾句号后精确匹配才降级（本场单向 click）
+                    if code is not None and str(code).strip() == "0":
+                        norm = message.strip()
+                        if norm.endswith("。"):
+                            norm = norm[:-1]
+                        if norm == "版本不兼容，请刷新页面或清除缓存后重试" and not direct["downgrade"]:
+                            direct["downgrade"] = True
+                            log("[!] 版本不兼容：本场切换为点击兜底")
+
                 def _settle_one(response):
                     """按 request_id 结算一笔在途响应；乱序合法，别家响应不改本场结论。"""
-                    nonlocal budget
+                    if burst is None:
+                        return
                     resp_request = getattr(response, "request", None)
                     bid = None
                     if resp_request is not None:
@@ -1708,13 +2066,23 @@ def cmd_grab(args):
                         state["last_reason"] = "收到其他请求的响应，本场结论未变"
                         return
                     raw_kind = _classify_response(response)
+                    http_status = getattr(response, "status", None)
+                    try:
+                        http_status = int(http_status) if http_status is not None else None
+                    except (TypeError, ValueError):
+                        http_status = None
                     payload = None
                     if raw_kind == "real":
+                        # 已得 HTTP 应答按 real 结算：200+HTML（学校错误页）不伪装
+                        # lost；仅响应体完全读不出才降为 lost（保持未决，不假造结论）。
                         try:
-                            payload = response.json()
+                            raw = response.body()
                         except Exception:
-                            raw_kind = "lost"   # 响应体读不出：保持未决，不假造结论
-                    burst.settle(bid, raw_kind)
+                            raw_kind = "lost"
+                        else:
+                            payload = _decode_body(raw)
+                    burst.settle(bid, raw_kind, http_status=http_status)
+                    _sync_budget_window()
                     if raw_kind == "lost":
                         state["last_reason"] = "响应读取失败，请求仍未决"
                     elif raw_kind == "404":
@@ -1723,34 +2091,186 @@ def cmd_grab(args):
                                      streak_404=burst.streak_404,
                                      phase=burst.phase,
                                      retry_deadline=int(burst.effective_deadline))
-                        # 自适应扩窗可能拉长有效截止：重建预算，sign_end 仍硬截
-                        if burst.effective_deadline > getattr(budget, "deadline_epoch", 0):
-                            budget = RetryBudget(burst.effective_deadline,
-                                                 business_clock=clock)
-                            state["deadline"] = burst.effective_deadline
-                            _retry_event(kind="window_extended",
-                                         retry_deadline=int(burst.effective_deadline),
-                                         sign_end=int(sign_end_ts or 0))
+                    elif raw_kind == "throttled":
+                        state["last_reason"] = "429 限流"
+                        _retry_event(kind="throttled", request_id=bid,
+                                     streak_404=burst.streak_404,
+                                     phase=burst.phase,
+                                     retry_deadline=int(burst.effective_deadline))
+                    elif raw_kind == "server_error":
+                        state["last_reason"] = "5xx 服务端异常"
+                        _retry_event(kind="server_error", request_id=bid,
+                                     http_status=http_status, phase=burst.phase)
                     else:
-                        code = payload.get("code") if isinstance(payload, dict) else None
-                        message = ""
-                        if isinstance(payload, dict):
-                            message = str(payload.get("message") or "")
-                        state["last_reason"] = "code:%s %s" % (code, message[:30])
-                        # 成功结论粘性：只要有一笔 code=1 就是成功，后续失败响应不改写
-                        if code == 1:
-                            state["resp_ok"] = True
-                        code_text = "" if code is None else str(code)
-                        if (code_text == "4001" or "4001" in message
-                                or "登录" in message or "身份验证" in message):
-                            state["login_invalid"] = True
+                        _apply_conclusion(payload)
                     _sync_pending()
                     log("[i] 第 %d 次提交：%s" % (state["attempts"], state["last_reason"]))
 
-                def _settle_pending():
-                    while response_queue:
-                        _settle_one(response_queue.pop(0))
+                def _settle_failed(request):
+                    """requestfailed：按既有 request_id 结算为 lost，立即释放名额。"""
+                    if burst is None:
+                        return
+                    ident = id(request)
+                    bid = request_to_bid.get(ident)
+                    if bid is None and burst.pending_count() == 1:
+                        bid = burst.pending_ids()[0]
+                    if bid is None:
+                        return
+                    burst.settle(bid, "lost")
+                    state["last_reason"] = "请求中止（requestfailed），仍未决"
                     _sync_pending()
+
+                def _settle_pending():
+                    _drain_direct()     # 直发通道与页面通道同一事件泵
+                    while response_queue:
+                        item = response_queue.pop(0)
+                        if isinstance(item, tuple) and item and item[0] == "failed":
+                            _settle_failed(item[1])
+                        else:
+                            _settle_one(item)
+                    _sync_pending()
+
+                def _settle_direct_event(ev):
+                    """把一笔直发传输事件并入同一调度账本（started 登记 / completed 五档 / failed 保持未决）。"""
+                    kind = ev.get("kind")
+                    req_id = ev.get("request_id")
+                    if kind == "started":
+                        # started 只登记一次真实尝试；未启动 ticket 不计 attempts
+                        if req_id in direct["ticket_to_bid"]:
+                            return
+                        if direct["reserved"] > 0:
+                            direct["reserved"] -= 1
+                        bid = burst.register_request()
+                        direct["ticket_to_bid"][req_id] = bid
+                        _sync_pending()
+                        state["last_reason"] = "直发已发起"
+                        log("[i] 第 %d 次提交：直发已发起" % state["attempts"])
+                        _retry_event(kind="submit", attempts=state["attempts"],
+                                     request_id=bid, phase=burst.phase)
+                        return
+                    if kind == "not_started":
+                        # 过期/关闭未真正发出：释放预留，不计次数
+                        if direct["reserved"] > 0 and req_id not in direct["ticket_to_bid"]:
+                            direct["reserved"] -= 1
+                        return
+                    bid = direct["ticket_to_bid"].get(req_id)
+                    if bid is None:
+                        return      # 跨 run / 重复 / 未知 ID：无影响
+                    if kind == "failed":
+                        # 网络失败按 lost 保持 pending（不假造成功/失败结论）
+                        burst.settle(bid, "lost")
+                        _sync_budget_window()
+                        state["last_reason"] = "直发网络失败，仍未决"
+                        _sync_pending()
+                        return
+                    if kind == "completed":
+                        http_status = ev.get("http_status")
+                        body = ev.get("body_bytes")
+                        raw_kind = "real"
+                        if http_status == 404:
+                            raw_kind = "404"
+                        elif http_status == 429:
+                            raw_kind = "throttled"
+                        elif isinstance(http_status, int) and http_status >= 500:
+                            raw_kind = "server_error"
+                        payload = None
+                        if raw_kind == "real":
+                            payload = _decode_body(body)
+                        burst.settle(bid, raw_kind, http_status=http_status)
+                        _sync_budget_window()
+                        # 通道/协议异常（F01 返修）：非 200/404/429/5xx 的 HTTP，
+                        # 或 200 解码后无可识别业务 code。已收应答按 real 结算
+                        # （不伪装 lost），不套业务结论（不冒充 4001、不切 click），
+                        # 停止新发后由统一收尾按无成功 pending>0→unconfirmed 解析。
+                        anomaly = None
+                        if raw_kind == "real":
+                            has_code = (isinstance(payload, dict)
+                                        and payload.get("code") is not None)
+                            if http_status != 200:
+                                anomaly = "通道/协议异常 HTTP %s，停止新发" % (http_status,)
+                            elif not has_code:
+                                anomaly = "通道/协议异常：200 无业务 code，停止新发"
+                        if anomaly is not None:
+                            direct["protocol_stop"] = True
+                            state["last_reason"] = anomaly
+                            log("[!] " + anomaly)
+                        elif raw_kind == "404":
+                            state["last_reason"] = "404 接口未就绪/限流"
+                            _retry_event(kind="not_ready", request_id=bid,
+                                         streak_404=burst.streak_404, phase=burst.phase,
+                                         retry_deadline=int(burst.effective_deadline))
+                        elif raw_kind == "throttled":
+                            state["last_reason"] = "429 限流"
+                            _retry_event(kind="throttled", request_id=bid,
+                                         streak_404=burst.streak_404, phase=burst.phase,
+                                         retry_deadline=int(burst.effective_deadline))
+                        elif raw_kind == "server_error":
+                            state["last_reason"] = "5xx 服务端异常"
+                            _retry_event(kind="server_error", request_id=bid,
+                                         http_status=http_status, phase=burst.phase)
+                        else:
+                            _apply_conclusion(payload)
+                        _sync_pending()
+                        log("[i] 第 %d 次提交：%s" % (state["attempts"], state["last_reason"]))
+
+                def _drain_direct():
+                    if burst is None or direct["queue"] is None:
+                        return
+                    q = direct["queue"]
+                    while True:
+                        try:
+                            ev = q.get_nowait()
+                        except queue.Empty:
+                            break
+                        _settle_direct_event(ev)
+
+                def _try_direct_fire():
+                    """现算签名并直发一笔：时间取自 business clock（ClockUnavailable 停发射，不用 time.time）。
+
+                    签名失败/try_submit 拒绝不计次数；返回 "fired"/"busy"/"downgrade"/"stop"。
+                    token 只取本场内存：缺失不建 ticket、不转 click，安全停发（F01）。
+                    """
+                    if direct["transport"] is None or direct["signer"] is None:
+                        direct["downgrade"] = True
+                        return "downgrade"
+                    try:
+                        captured_token = token()
+                    except Exception:
+                        captured_token = ""
+                    if not captured_token:
+                        direct["protocol_stop"] = True
+                        state["last_reason"] = "token 缺失，停止发送"
+                        log("[!] token 缺失：停止发送")
+                        return "stop"
+                    try:
+                        epoch_ms = int(business_now() * 1000)
+                    except ClockUnavailable:
+                        raise
+                    try:
+                        sig = direct["signer"](str(target["id"]), epoch_ms)
+                    except Exception:
+                        direct["downgrade"] = True
+                        return "downgrade"
+                    direct["seq"] += 1
+                    req_id = "%s-%d" % (direct["run_id"], direct["seq"])
+                    url = API + "/rjyHdCyr/signUp/" + sig
+                    ticket = {
+                        "run_id": direct["run_id"],
+                        "request_id": req_id,
+                        "attempt_no": burst.attempts + direct["reserved"] + 1,
+                        "url": url,
+                        "headers": {"Accept": "application/json, text/plain, */*",
+                                    "token": captured_token,
+                                    "Referer": REFERER, "User-Agent": UA},
+                        "dispatch_deadline": time.monotonic() + INFLIGHT_WAIT_S,
+                        "timeout_s": min(8.0, max(0.0, budget.remaining_s())),
+                    }
+                    direct["reserved"] += 1
+                    ok = direct["transport"].try_submit(ticket)
+                    if not ok:
+                        direct["reserved"] -= 1
+                        return "busy"
+                    return "fired"
 
                 def _pump_wait(seconds):
                     """短事件泵：按预算截断等待，同时派发并结算在途响应。
@@ -1778,22 +2298,164 @@ def cmd_grab(args):
                         if state["resp_ok"] or state["login_invalid"]:
                             return
 
+                def _may_fire():
+                    """统一发射闸门：drain → 成功 → 4001 → 次数/截止 → 业务时间 → 名额。
+
+                    返回 "ok" 才允许发下一笔；其余为不发原因（调用方据此收口或原地等）。
+                    回调路径不读时钟的部分用 current_phase，业务时间用 business_bounds。
+                    """
+                    _settle_pending()
+                    if state["resp_ok"]:
+                        return "success"
+                    if state["login_invalid"]:
+                        return "login_invalid"
+                    if direct.get("protocol_stop"):
+                        return "protocol_stop"
+                    if not burst.can_attempt():
+                        return "attempts"
+                    # 直发已提交未 started 的预留也占次数/名额配额（started 滞后也不允许第二笔）
+                    if (args.max_attempts > 0
+                            and burst.attempts + direct["reserved"] >= args.max_attempts):
+                        return "attempts"
+                    try:
+                        now_lower, _now_upper = business_bounds()
+                    except ClockUnavailable:
+                        return "clock"
+                    if now_lower < at_ts:
+                        return "not_open"
+                    if burst.inflight_count() + direct["reserved"] >= MAX_INFLIGHT:
+                        return "inflight"
+                    return "ok"
+
+                def _finalize(stop_reason, fallback=None):
+                    """统一有界收尾（F04）：先结算可读队列，1 秒尾窗（受预算/sign_end
+                    截断），再按「成功粘性最优先」解析唯一终态。page/时钟不可用不忙转。
+
+                    成功不被 False/异常覆盖（F01）；pending 且无成功＝未确认（F02）；
+                    流程/鉴权/校时异常有未决保留事实。_settle_pending 不依赖 budget，
+                    时钟失效也先把可读队列结算掉，再跳过收尾泵。
+                    """
+                    _settle_pending()
+                    # 1 秒尾窗（main 语义，取消 not login_invalid：4001 后同窗内成功仍可结算）
+                    try:
+                        tail_gate = state["pending"] > 0 and not budget.expired()
+                    except ClockUnavailable:
+                        tail_gate = False
+                    if tail_gate:
+                        try:
+                            tail_deadline = (time.monotonic()
+                                             + min(1.0, max(0.0, budget.remaining_s())))
+                            while (time.monotonic() < tail_deadline
+                                   and not budget.expired()
+                                   and state["pending"] > 0
+                                   and not state["resp_ok"]):
+                                tail_left = tail_deadline - time.monotonic()
+                                if tail_left <= 0:
+                                    break
+                                _pump_wait(min(0.05, tail_left))
+                        except ClockUnavailable:
+                            pass    # 时钟失效：收尾泵停；可读队列已由 _settle_pending 结算
+                    # 成功粘性最优先：已到 code=1 就是成功，不被 False/异常覆盖（F01）
+                    if state["resp_ok"]:
+                        return terminal("success")
+                    if state["login_invalid"]:
+                        stop_reason = "login_invalid"
+                    # 单次最终核对（F07）：仅原预算允许开始才查；不引入 not_joined
+                    try:
+                        can_check = bool(state["attempts"]) and not budget.expired()
+                    except ClockUnavailable:
+                        can_check = False
+                    if can_check:
+                        # 最终核对失败如实上抛为流程异常：无 pending 时报 process_error，
+                        # 有 pending 保留未决（F02）；成功已粘住时上面已 return（F01）。
+                        try:
+                            joined_now = is_joined(target["id"], budget=budget)
+                        except ClockUnavailable:
+                            raise
+                        except Exception:
+                            if state["pending"] > 0:
+                                return terminal("unconfirmed")
+                            return terminal("process_error")
+                        if joined_now is True:
+                            return terminal("success")
+                    # pending 且无成功＝未确认（F02）
+                    if state["pending"] > 0:
+                        return terminal("unconfirmed")
+                    if stop_reason:
+                        return terminal(stop_reason)
+                    if fallback:
+                        return terminal(fallback)
+                    return terminal("sign_end" if state["binding"] == "sign_end" else "retry_duration")
+
                 listeners.append(("request", on_request))
                 listeners.append(("response", on_response))
+                listeners.append(("requestfailed", on_requestfailed))
                 page.on("request", on_request)
                 page.on("response", on_response)
+                page.on("requestfailed", on_requestfailed)
                 armed["on"] = True    # 整个提交阶段受控：在途响应按 request_id 结算
                 _checkpoint_event("watch_started")
                 log("[i] 开始盯按钮")
 
                 while not budget.expired():
-                    # 先结算在途响应：成功/登录失效立即收口，绝不为下一笔再等
-                    _settle_pending()
-                    if state["resp_ok"]:
+                    # 统一发射闸门：先结算在途，再判成功/4001/次数/业务时间/名额
+                    verdict = _may_fire()
+                    if verdict == "success":
                         break
-                    if state["login_invalid"]:
+                    if verdict == "login_invalid":
                         stop_reason = "login_invalid"
                         break
+                    if verdict == "protocol_stop":
+                        # 通道/协议异常或 token 缺失：停止新发，统一收尾解析
+                        # process_error / unconfirmed（不新增公开终态）
+                        stop_reason = "process_error"
+                        break
+                    if verdict == "attempts":
+                        if state["attempts"] >= args.max_attempts > 0:
+                            stop_reason = "max_attempts"
+                        else:
+                            stop_reason = ("sign_end" if (sign_end_ts and
+                                           burst.effective_deadline >= sign_end_ts)
+                                           else "retry_duration")
+                        break
+                    if verdict == "clock":
+                        # 校时失效：停止自动动作；已提交未决保留，零提交不算失败
+                        stop_reason = ("unconfirmed" if state["pending"] > 0
+                                       else "clock_unavailable")
+                        if stop_reason == "clock_unavailable":
+                            state["last_reason"] = "北京时间暂不可用"
+                        break
+                    if verdict == "not_open":
+                        # 业务下界还没到开放时刻：原地等，不耗次数（决策 012）
+                        try:
+                            _now_lower, _now_upper = business_bounds()
+                        except ClockUnavailable:
+                            stop_reason = ("unconfirmed" if state["pending"] > 0
+                                           else "clock_unavailable")
+                            break
+                        _pump_wait(min(0.25, max(0.0, at_ts - _now_lower)))
+                        continue
+                    if verdict == "inflight":
+                        # 名额满：原地泵等在途释放，不耗次数；受预算截断
+                        _pump_wait(INFLIGHT_WAIT_S)
+                        continue
+
+                    # 直发为主：已启用且未降级时用直发，不再等按钮可见；降级后落到点击兜底
+                    if direct["enabled"] and not direct["downgrade"]:
+                        res = _try_direct_fire()
+                        if res == "fired":
+                            gap = burst.interval_s()
+                            _pump_wait(min(max(0.0, gap), max(0.0, budget.remaining_s())))
+                            burst.next_interval_after_wait()
+                            continue
+                        if res == "busy":
+                            _pump_wait(INFLIGHT_WAIT_S)
+                            continue
+                        if res == "stop":
+                            # token 缺失等安全停发：不转 click，统一收尾
+                            stop_reason = "process_error"
+                            break
+                        # res == "downgrade"：本场单向切到下方点击兜底
 
                     btn = page.locator("uni-button").filter(has_text="立即报名")
                     if not btn.count():
@@ -1807,51 +2469,34 @@ def cmd_grab(args):
                             _pump_wait(0.3)
                         continue
 
-                    # 多笔未决合法：黄金风暴允许并发在途请求，不因 pending 停手（C03 升级）
-                    if not burst.can_attempt():
-                        if state["attempts"] >= args.max_attempts > 0:
-                            stop_reason = "max_attempts"
-                        else:
-                            stop_reason = ("sign_end" if (sign_end_ts and
-                                           burst.effective_deadline >= sign_end_ts)
-                                           else "retry_duration")
-                        break
-
-                    # 按钮提前可见也不能提前发请求：业务下界 >= 开放时刻才动手，
-                    # 上界判断避免测量误差导致提前或贴线发起（决策 012）
-                    try:
-                        now_lower, now_upper = business_bounds()
-                    except ClockUnavailable:
-                        # 校时失效：停止自动动作；已提交未决保留，零提交不算失败
-                        stop_reason = ("unconfirmed" if state["pending"] > 0
-                                       else "clock_unavailable")
-                        if stop_reason == "clock_unavailable":
-                            state["last_reason"] = "北京时间暂不可用"
-                        break
-                    if now_upper < at_ts:
-                        _pump_wait(min(0.25, at_ts - now_upper))
-                        continue
-                    if now_lower < at_ts:
-                        _pump_wait(min(0.25, at_ts - now_lower))
-                        continue
-                    if budget.expired():
-                        break
-
-                    # 非阻塞提交：点完「确定」立刻回调度循环，不逐笔等响应（黄金风暴时序）
+                    # 非阻塞提交：点完「确定」立刻回调度循环（黄金风暴时序）
                     round_start = len(admitted_all)
                     aborted = False
                     try:
                         btn.first.click(timeout=budget.timeout_ms(3000))
-                        # 打开确认框之后、点「确定」之前再核一次：
-                        # 到期/次数到/还没开放都绝不确认（C02）
-                        if budget.expired():
-                            raise _SubmitAborted("确认前重试窗口已到点")
-                        if not burst.can_attempt():
-                            raise _SubmitAborted("确认前已达最大提交次数或窗口关闭")
-                        if business_now() < at_ts:
-                            raise _SubmitAborted("确认前还没到开放时间")
-                        page.get_by_text("确定", exact=True).first.click(
-                            timeout=budget.timeout_ms(3000))
+                        # 打开确认框后、点「确定」前再过一次闸门（含名额满原地等≤1s）
+                        gate2 = _may_fire()
+                        if gate2 == "inflight":
+                            waited = 0.0
+                            while gate2 == "inflight" and waited < CONFIRM_INFLIGHT_WAIT_S:
+                                _pump_wait(INFLIGHT_WAIT_S)
+                                waited += INFLIGHT_WAIT_S
+                                gate2 = _may_fire()
+                        if gate2 in ("success", "login_invalid"):
+                            # 在途已出结论：不点确定，交给收尾解析唯一终态
+                            aborted = True
+                            state["last_reason"] = "确认前已出结论，取消本次确认"
+                        elif gate2 != "ok":
+                            aborted = True
+                            state["last_reason"] = "确认前闸门未过（%s）" % gate2
+                            raise _SubmitAborted(state["last_reason"])
+                        else:
+                            if budget.expired():
+                                raise _SubmitAborted("确认前重试窗口已到点")
+                            if business_now() < at_ts:
+                                raise _SubmitAborted("确认前还没到开放时间")
+                            page.get_by_text("确定", exact=True).first.click(
+                                timeout=budget.timeout_ms(3000))
                     except ClockUnavailable:
                         raise           # 校时失效不是点击失败：交统一收尾
                     except _SubmitAborted as exc:
@@ -1897,38 +2542,19 @@ def cmd_grab(args):
                     _pump_wait(min(max(0.0, gap), max(0.0, budget.remaining_s())))
                     burst.next_interval_after_wait()
 
-                # 有界收尾：给在途响应一个短暂结算窗口（最长 1 秒且不越预算），
-                # 成功响应不因刚到停止点就漏掉；到点仍无定论就如实报未确认
-                if state["pending"] > 0 and not budget.expired():
-                    tail_deadline = (time.monotonic()
-                                     + min(1.0, max(0.0, budget.remaining_s())))
-                    while (time.monotonic() < tail_deadline
-                           and not budget.expired()
-                           and state["pending"] > 0
-                           and not state["resp_ok"]
-                           and not state["login_invalid"]):
-                        # 最后一片按收尾余量缩短，不能再用完整 50ms 越过尾窗
-                        tail_left = tail_deadline - time.monotonic()
-                        if tail_left <= 0:
-                            break
-                        _pump_wait(min(0.05, tail_left))
-
-                if state["login_invalid"]:
-                    stop_reason = "login_invalid"
-                if state["resp_ok"]:
-                    return terminal("success")
-
-                # 收尾查询：有剩余预算才查；查询不到不等于没报名
-                joined_now = None
-                if state["attempts"] and not budget.expired():
-                    joined_now = is_joined(target["id"], budget=budget)
-                if joined_now is True:
-                    return terminal("success")
-                if state["pending"] > 0:
-                    return terminal("unconfirmed")
-                if stop_reason:
-                    return terminal(stop_reason)
-                return terminal("sign_end" if state["binding"] == "sign_end" else "retry_duration")
+                # 统一有界收尾：结算可读队列 + 1 秒尾窗 + 唯一终态（在关浏览器前，
+                # F04）。取消尾窗 not login_invalid 限制：4001 后同窗内成功仍可结算。
+                return _finalize(stop_reason)
+            except ClockUnavailable:
+                # 校时在浏览器阶段失效：统一收尾（有未决保留事实），不向外抛
+                return _finalize("clock_unavailable")
+            except BudgetExhausted:
+                _fallback = ("sign_end" if state["binding"] == "sign_end"
+                             else "retry_duration")
+                return _finalize(_fallback, fallback=_fallback)
+            except Exception as exc:  # noqa: BLE001 - 流程异常也要在关浏览器前收口
+                state["last_reason"] = "运行异常：%s" % type(exc).__name__
+                return _finalize("process_error", fallback="process_error")
             finally:
                 # 停止/异常路径统一解除监听并失活回调：不留跨计划的残留监听
                 armed["on"] = False
@@ -1936,6 +2562,12 @@ def cmd_grab(args):
                 for event_name, handler in listeners:
                     try:
                         page.remove_listener(event_name, handler)
+                    except Exception:
+                        pass
+                # 直发通道：关新发射（不等待在途线程，不假装取消学校处理）
+                if direct.get("transport") is not None:
+                    try:
+                        direct["transport"].close()
                     except Exception:
                         pass
                 try:
