@@ -1911,6 +1911,7 @@ def cmd_grab(args):
                     "run_id": os.urandom(8).hex(),
                     "seq": 0,
                     "ticket_to_bid": {},
+                    "registry": {},
                     "reserved": 0,   # 已提交未 started：预留名额与次数配额
                     "queue": None,
                 }
@@ -2131,16 +2132,28 @@ def cmd_grab(args):
                     _sync_pending()
 
                 def _settle_direct_event(ev):
-                    """把一笔直发传输事件并入同一调度账本（started 登记 / completed 五档 / failed 保持未决）。"""
+                    """把一笔直发传输事件并入同一调度账本（started 登记 / completed 五档 / failed 保持未决）。
+
+                    F03：先核对本场 run_id、已登记 request_id 与票据 attempt_no；
+                    任何未知/跨场/不匹配事件无副作用——不释放他人预留、不改
+                    policy/last_reason、不套业务结论。
+                    """
                     kind = ev.get("kind")
                     req_id = ev.get("request_id")
+                    reg = direct["registry"].get(req_id)
+                    if reg is None or ev.get("run_id") != direct["run_id"] \
+                            or ev.get("attempt_no") != reg["attempt_no"]:
+                        return      # 跨场 / 未知 / 身份不匹配：无副作用
                     if kind == "started":
-                        # started 只登记一次真实尝试；未启动 ticket 不计 attempts
-                        if req_id in direct["ticket_to_bid"]:
+                        # started 仅一次登记；transport 受锁保护的入队顺序
+                        # 即发送尝试提交序，预留号只做校验不猜发送序
+                        if reg["state"] != "reserved":
                             return
+                        reg["state"] = "started"
                         if direct["reserved"] > 0:
                             direct["reserved"] -= 1
                         bid = burst.register_request()
+                        reg["bid"] = bid
                         direct["ticket_to_bid"][req_id] = bid
                         _sync_pending()
                         state["last_reason"] = "直发已发起"
@@ -2149,21 +2162,30 @@ def cmd_grab(args):
                                      request_id=bid, phase=burst.phase)
                         return
                     if kind == "not_started":
-                        # 过期/关闭未真正发出：释放预留，不计次数
-                        if direct["reserved"] > 0 and req_id not in direct["ticket_to_bid"]:
-                            direct["reserved"] -= 1
+                        # 只释放仍预留的本条；重复、started 后的 not_started 无副作用
+                        if reg["state"] == "reserved":
+                            reg["state"] = "cancelled"
+                            if direct["reserved"] > 0:
+                                direct["reserved"] -= 1
                         return
-                    bid = direct["ticket_to_bid"].get(req_id)
+                    bid = reg["bid"]
                     if bid is None:
-                        return      # 跨 run / 重复 / 未知 ID：无影响
+                        return      # 未跨接纳点的票据没有可结算身份
                     if kind == "failed":
-                        # 网络失败按 lost 保持 pending（不假造成功/失败结论）
-                        burst.settle(bid, "lost")
+                        if reg["state"] != "started":
+                            return  # 已决 / lost 后重复 failed：无副作用
+                        # lost 保持 pending（不假造结论），同一合法请求仍可在
+                        # 尾窗内被迟到的确定应答结算
+                        if burst.settle(bid, "lost") is None:
+                            return
+                        reg["state"] = "lost"
                         _sync_budget_window()
                         state["last_reason"] = "直发网络失败，仍未决"
                         _sync_pending()
                         return
                     if kind == "completed":
+                        if reg["state"] == "settled":
+                            return  # 已决不改写
                         http_status = ev.get("http_status")
                         body = ev.get("body_bytes")
                         raw_kind = "real"
@@ -2176,7 +2198,9 @@ def cmd_grab(args):
                         payload = None
                         if raw_kind == "real":
                             payload = _decode_body(body)
-                        burst.settle(bid, raw_kind, http_status=http_status)
+                        applied = burst.settle(bid, raw_kind, http_status=http_status)
+                        if applied is None:
+                            return  # 重复结算被拒：结论/扩窗/降级副作用一并拒绝
                         _sync_budget_window()
                         # 通道/协议异常（F01 返修）：非 200/404/429/5xx 的 HTTP，
                         # 或 200 解码后无可识别业务 code。已收应答按 real 结算
@@ -2184,6 +2208,8 @@ def cmd_grab(args):
                         # 停止新发后由统一收尾按无成功 pending>0→unconfirmed 解析。
                         anomaly = None
                         if raw_kind == "real":
+                            # A2 裁决：可识别业务 code 仅限非 bool 有限整数
+                            # 数值或严格十进制整数字符串；其余按协议异常停发
                             has_code = (isinstance(payload, dict)
                                         and payload.get("code") is not None)
                             if http_status != 200:
@@ -2191,24 +2217,29 @@ def cmd_grab(args):
                             elif not has_code:
                                 anomaly = "通道/协议异常：200 无业务 code，停止新发"
                         if anomaly is not None:
+                            reg["state"] = "settled"
                             direct["protocol_stop"] = True
                             state["last_reason"] = anomaly
                             log("[!] " + anomaly)
                         elif raw_kind == "404":
+                            reg["state"] = "settled"
                             state["last_reason"] = "404 接口未就绪/限流"
                             _retry_event(kind="not_ready", request_id=bid,
                                          streak_404=burst.streak_404, phase=burst.phase,
                                          retry_deadline=int(burst.effective_deadline))
                         elif raw_kind == "throttled":
+                            reg["state"] = "settled"
                             state["last_reason"] = "429 限流"
                             _retry_event(kind="throttled", request_id=bid,
                                          streak_404=burst.streak_404, phase=burst.phase,
                                          retry_deadline=int(burst.effective_deadline))
                         elif raw_kind == "server_error":
+                            reg["state"] = "settled"
                             state["last_reason"] = "5xx 服务端异常"
                             _retry_event(kind="server_error", request_id=bid,
                                          http_status=http_status, phase=burst.phase)
                         else:
+                            reg["state"] = "settled"
                             _apply_conclusion(payload)
                         _sync_pending()
                         log("[i] 第 %d 次提交：%s" % (state["attempts"], state["last_reason"]))
@@ -2251,6 +2282,8 @@ def cmd_grab(args):
                     except Exception:
                         direct["downgrade"] = True
                         return "downgrade"
+                    # 签名耗时后重新过预算闸门（F02）：remaining 已含 sign_end
+                    # 硬截；不足不建 ticket、不发送，也不后台读业务时钟迁就。
                     remaining = budget.remaining_s()
                     if remaining <= 0:
                         return "busy"
@@ -2266,14 +2299,24 @@ def cmd_grab(args):
                         "headers": {"Accept": "application/json, text/plain, */*",
                                     "token": captured_token,
                                     "Referer": REFERER, "User-Agent": UA},
+                        # dispatch 只管最晚启动；request_deadline 是网络预算截止，
+                        # timeout_s 为本笔捕获的预算，线程不得延长它们。
                         "dispatch_deadline": mono_now + min(INFLIGHT_WAIT_S, remaining),
                         "request_deadline": mono_now + remaining,
                         "timeout_s": min(8.0, remaining),
+                    }
+                    # try_submit 之前登记 reservation；拒绝时释放该条（F03/F04）
+                    direct["registry"][req_id] = {
+                        "run_id": direct["run_id"],
+                        "attempt_no": ticket["attempt_no"],
+                        "state": "reserved",
+                        "bid": None,
                     }
                     direct["reserved"] += 1
                     ok = direct["transport"].try_submit(ticket)
                     if not ok:
                         direct["reserved"] -= 1
+                        direct["registry"].pop(req_id, None)
                         return "busy"
                     return "fired"
 
@@ -2318,9 +2361,12 @@ def cmd_grab(args):
                         return "protocol_stop"
                     if not burst.can_attempt():
                         return "attempts"
-                    # 直发已提交未 started 的预留也占次数/名额配额（started 滞后也不允许第二笔）
+                    # 直发已提交未 started 的预留也占次数/名额配额（started 滞后也不允许第二笔）；
+                    # 预留只是暂时占用，占满时泵等核清，不当作真实 attempts 耗尽漏账终止
                     if (args.max_attempts > 0
                             and burst.attempts + direct["reserved"] >= args.max_attempts):
+                        if direct["reserved"] > 0:
+                            return "inflight"
                         return "attempts"
                     try:
                         now_lower, _now_upper = business_bounds()
@@ -2340,7 +2386,13 @@ def cmd_grab(args):
                     流程/鉴权/校时异常有未决保留事实。_settle_pending 不依赖 budget，
                     时钟失效也先把可读队列结算掉，再跳过收尾泵。
                     """
+                    if direct.get("transport") is not None:
+                        direct["transport"].close()
                     _settle_pending()
+                    for reg in direct["registry"].values():
+                        if reg["state"] == "reserved":
+                            reg["state"] = "cancelled"
+                    direct["reserved"] = 0
                     # 1 秒尾窗（main 语义，取消 not login_invalid：4001 后同窗内成功仍可结算）
                     try:
                         tail_gate = state["pending"] > 0 and not budget.expired()

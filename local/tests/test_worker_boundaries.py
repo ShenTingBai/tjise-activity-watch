@@ -20,6 +20,7 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -35,6 +36,10 @@ import time_contract  # noqa: E402
 START = 1792000000.0
 OPEN_AHEAD = 20.0
 OPAQUE = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"   # 学校前端算出的 hash，不含活动 ID
+
+# 回调哨兵（F05）：回调派发期间禁止业务时钟读取、结算刷新与日志；
+# 违例只记录不抛出，由测试断言为空。
+CALLBACK_GUARD = {"active": False, "violations": []}
 
 
 class FakeTimeout(Exception):
@@ -68,10 +73,14 @@ class FakeClock:
     # ---- 业务时钟视图（决策 012）：cmd_grab 需要注入独立北京时间 ----
     def now(self):
         self._require()
+        if CALLBACK_GUARD["active"]:
+            CALLBACK_GUARD["violations"].append("clock.now")
         return self.wall
 
     def bounds(self):
         self._require()
+        if CALLBACK_GUARD["active"]:
+            CALLBACK_GUARD["violations"].append("clock.bounds")
         return self.wall, self.wall
 
     def _require(self):
@@ -202,7 +211,8 @@ class FakePage:
     """
 
     def __init__(self, clock, behavior, button_visible=True, click_delay=0.0,
-                 foreign=False, response_delay=0.0, script_srcs=None):
+                 foreign=False, response_delay=0.0, script_srcs=None,
+                 inject_failed_at=None, break_wait_at=None):
         self.clock = clock
         self.behavior = behavior
         self.button_visible = button_visible
@@ -210,6 +220,8 @@ class FakePage:
         self.foreign = foreign
         self.response_delay = float(response_delay)
         self.script_srcs = script_srcs    # 直发检测读入口 script src（None=未知→点击）
+        self.inject_failed_at = inject_failed_at   # 到点注入未登记 Request 的 requestfailed
+        self.break_wait_at = break_wait_at         # 到点后 wait_for_timeout 抛错（页面失效）
         self.request_handlers = []
         self.response_handlers = []
         self.requestfailed_handlers = []
@@ -220,6 +232,15 @@ class FakePage:
         self.dialog_open = False        # 确认框是否开着（「确定」可见性）
         self.closed = False             # 浏览器已关：之后任何页面动作都必须被拒绝
         self.removed_listeners = []
+
+    def _dispatch(self, event, target, *args):
+        """回调派发：挂哨兵，禁止回调碰时钟/结算/日志（F05）。"""
+        CALLBACK_GUARD["active"] = True
+        try:
+            for handler in list(target):
+                handler(*args)
+        finally:
+            CALLBACK_GUARD["active"] = False
 
     def on(self, event, handler):
         if event == "request":
@@ -241,8 +262,7 @@ class FakePage:
 
     def fire_requestfailed(self, request):
         """模拟页面导航中止在途请求：Playwright 只发 requestfailed，没有 response。"""
-        for handler in list(self.requestfailed_handlers):
-            handler(request)
+        self._dispatch("requestfailed", self.requestfailed_handlers, request)
 
     def _guard(self):
         # 浏览器已关闭后仍做页面动作＝实现缺陷（F04：可结算终态必须在关闭前收口）
@@ -267,7 +287,13 @@ class FakePage:
 
     def wait_for_timeout(self, ms):
         self._guard()
+        if self.break_wait_at is not None and self.clock.mono >= self.break_wait_at:
+            raise RuntimeError("page wait failed")
         self.clock.sleep(float(ms) / 1000.0)
+        if self.inject_failed_at is not None and self.clock.mono >= self.inject_failed_at:
+            self.inject_failed_at = None
+            self.fire_requestfailed(FakeRequest(
+                "https://xg.tjise.edu.cn/dr/api/rjyHdCyr/signUp/ghost-unregistered"))
         self._deliver_due()
 
     def eval_on_selector_all(self, selector, script):
@@ -287,8 +313,7 @@ class FakePage:
 
     def _notify(self, request):
         self.requests.append((self.clock.time(), request.url))
-        for handler in self.request_handlers:
-            handler(request)
+        self._dispatch("request", self.request_handlers, request)
 
     def _enqueue_response(self, response, delay=None):
         if delay is None:
@@ -303,8 +328,7 @@ class FakePage:
                                    if item[0] > now]
         due.sort(key=lambda item: item[0])
         for _, response in due:
-            for handler in list(self.response_handlers):
-                handler(response)
+            self._dispatch("response", self.response_handlers, response)
 
     def fire_from_confirm(self):
         behavior = self.behavior
@@ -538,6 +562,13 @@ class Result:
                     for line in self.logs if "kind=done" in line] or [0])
 
     @property
+    def pending(self):
+        lines = [line for line in self.logs if "kind=done" in line]
+        if not lines:
+            return None
+        return int(lines[-1].split("pending=")[1].split(" ")[0])
+
+    @property
     def terminal_lines(self):
         return [line for line in self.logs if "[retry] " in line and "stop_reason=" in line]
 
@@ -563,15 +594,22 @@ def run_worker(*, behavior="success", at_offset=0.0, retry_for=120.0, max_attemp
                click_delay=0.0, foreign=False, launch_fails=False,
                response_delay=0.0, script_srcs=None,
                direct_signer=None, direct_transport=None,
-               api_token="test-token"):
+               api_token="test-token",
+               inject_failed_at=None, break_wait_at=None, join_info_data=None):
     clock = FakeClock()
     page = FakePage(clock, behavior, button_visible, click_delay, foreign,
-                    response_delay, script_srcs)
+                    response_delay, script_srcs,
+                    inject_failed_at=inject_failed_at, break_wait_at=break_wait_at)
     logs, posts = [], []
     created = {"browser": False}
     delays = list(post_delays or [])
+    join_calls = {"n": 0}
+    CALLBACK_GUARD["active"] = False
+    CALLBACK_GUARD["violations"] = []
 
     def fake_log(msg):
+        if CALLBACK_GUARD["active"]:
+            CALLBACK_GUARD["violations"].append("log")
         logs.append(str(msg))
 
     def fake_probe(budget=None):
@@ -594,6 +632,10 @@ def run_worker(*, behavior="success", at_offset=0.0, retry_for=120.0, max_attemp
         if effective < delay:
             return {"code": -1, "message": "TimeoutError"}
         if "/getJoinInfo/" in path:
+            # 首次查询是入场预检（必须未报名）；后续查询才按 join_info_data 作答
+            join_calls["n"] += 1
+            if join_calls["n"] > 1 and join_info_data is not None:
+                return {"code": 1, "data": join_info_data}
             return {"code": 1, "data": None}
         return {"code": 1, "data": {}}
 
@@ -644,6 +686,9 @@ def run_worker(*, behavior="success", at_offset=0.0, retry_for=120.0, max_attemp
         if direct_transport is not None:
             direct_mods[("signup_transport", "DirectTransport")] = getattr(_st, "DirectTransport", None)
             _st.DirectTransport = direct_transport
+            bind = getattr(direct_transport, "bind_clock", None)
+            if bind is not None:
+                bind(clock)
     try:
         for name, value in patches.items():
             setattr(grab, name, value)
@@ -2030,10 +2075,19 @@ class UnifiedGateAndFinalizeTests(unittest.TestCase):
 
 
 class FakeTransport:
-    """直发传输替身：把 started 与终态事件同步塞进 grab 侧的队列。
-    responder_fn 是类级回调 ticket -> 终态 dict / "started_only" / None（留未决）。"""
+    """直发传输替身：把 started 与终态事件塞进 grab 侧的队列。
+    responder_fn 是类级回调 ticket -> 终态 dict / "started_only" / None（留未决）。
+
+    虚拟事件泵（opt-in）：release_at_fn(ticket, event) 返回虚拟放行时刻（绝对
+    mono 读数）时事件先进暂存，由 get_nowait 在到期后放行——用于构造“started
+    真正滞后/迟到应答”。返回 None 表示立即入列；默认整段同步，旧例不受影响。
+    extra_fn(ticket) 返回的外来/重复事件走同一投递路径，供来源校验红例注入。
+    """
 
     responder_fn = None
+    extra_fn = None
+    release_at_fn = None
+    clock = None
     instances = []
 
     def __init__(self, event_queue):
@@ -2043,7 +2097,46 @@ class FakeTransport:
         self.closed = False
         self.cap = 2
         self.submit_calls = 0
+        self._held = []
+        if FakeTransport.release_at_fn is not None:
+            self._wrap_queue(event_queue)
         FakeTransport.instances.append(self)
+
+    @classmethod
+    def bind_clock(cls, clock):
+        cls.clock = clock
+
+    def _wrap_queue(self, q):
+        """按虚拟时钟放行暂存事件：grab 侧每次 get_nowait 先收到期件。"""
+        orig_get_nowait = q.get_nowait
+        held = self._held
+
+        def get_nowait():
+            if held and FakeTransport.clock is not None:
+                now = FakeTransport.clock.mono
+                due = [item for item in held if item[0] <= now]
+                if due:
+                    held[:] = [item for item in held if item[0] > now]
+                    due.sort(key=lambda item: item[0])
+                    for _, ev in due:
+                        self._deliver(ev)
+            return orig_get_nowait()
+
+        q.get_nowait = get_nowait
+
+    def _emit(self, ticket, event):
+        release_at = None
+        if FakeTransport.release_at_fn is not None:
+            release_at = FakeTransport.release_at_fn(ticket, event)
+        if release_at is None:
+            self._deliver(event)
+        else:
+            self._held.append((release_at, event))
+
+    def _deliver(self, event):
+        if event.get("kind") in ("completed", "failed", "not_started"):
+            self.active.discard(event.get("request_id"))
+        self.queue.put(event)
 
     def try_submit(self, ticket):
         self.submit_calls += 1
@@ -2056,17 +2149,16 @@ class FakeTransport:
         self.active.add(rid)
         base = {"kind": "started", "run_id": ticket["run_id"],
                 "request_id": rid, "attempt_no": ticket["attempt_no"]}
-        self.queue.put(base)
-        if FakeTransport.responder_fn is None:
-            return True     # 默认留未决：只发 started
-        ev = FakeTransport.responder_fn(ticket)
-        if ev == "started_only":
-            return True
-        if ev is not None:
-            term = dict(base)
-            term.update(ev)
-            self.queue.put(term)
-            self.active.discard(rid)
+        self._emit(ticket, base)
+        if FakeTransport.responder_fn is not None:
+            ev = FakeTransport.responder_fn(ticket)
+            if ev is not None and ev != "started_only":
+                term = dict(base)
+                term.update(ev)
+                self._emit(ticket, term)
+        if FakeTransport.extra_fn is not None:
+            for extra in FakeTransport.extra_fn(ticket):
+                self._emit(ticket, extra)
         return True
 
     def active_count(self):
@@ -2079,6 +2171,8 @@ class FakeTransport:
     def reset(cls):
         cls.instances = []
         cls.responder_fn = None
+        cls.extra_fn = None
+        cls.release_at_fn = None
 
 
 def _d_ok(ticket=None):
@@ -2388,6 +2482,246 @@ class UnifiedDirectLoopTests(unittest.TestCase):
                          "另有 pending 时异常停发必须报 unconfirmed")
         self.assertLessEqual(len(FakeTransport.instances[0].tickets), 2,
                              "异常应答后不得再新发")
+
+
+    def test_foreign_and_mismatched_events_have_no_side_effects(self):
+        # F03：错 run_id、未知 request_id、错 attempt_no 的 started 无副作用——
+        # 不注册尝试、不释放他人预留、不把同步替身事件当成真实发送。
+        # 第二笔真正 started 滞后（虚拟事件泵暂存），外来事件立即入列。
+        calls = {"n": 0}
+
+        def responder(ticket):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _d_payload(0, "报名人数已满")
+            return "started_only"
+
+        def extras(ticket):
+            if calls["n"] != 2:
+                return []
+            return [
+                # 错 run_id：本场不得认领
+                {"kind": "started", "run_id": "other-run",
+                 "request_id": ticket["request_id"], "attempt_no": ticket["attempt_no"]},
+                # 未知 request_id：不得按“唯一预留”认领
+                {"kind": "started", "run_id": ticket["run_id"],
+                 "request_id": "ghost-1", "attempt_no": ticket["attempt_no"]},
+                # 错 attempt_no：票据身份不匹配
+                {"kind": "started", "run_id": ticket["run_id"],
+                 "request_id": ticket["request_id"],
+                 "attempt_no": ticket["attempt_no"] + 9},
+                {"kind": "not_started", "run_id": ticket["run_id"],
+                 "request_id": ticket["request_id"],
+                 "attempt_no": ticket["attempt_no"] + 9},
+            ]
+
+        def rel(ticket, event):
+            # 只有第二笔自己合规的 started 才算真正滞后（永不放行）；
+            # 第一笔与外来事件立即入列
+            if (event.get("kind") == "started"
+                    and event.get("attempt_no") == 2
+                    and event.get("run_id") == ticket["run_id"]
+                    and event.get("request_id") == ticket["request_id"]):
+                return FakeTransport.clock.mono + 9999.0
+            return None
+
+        FakeTransport.responder_fn = staticmethod(responder)
+        FakeTransport.extra_fn = extras
+        FakeTransport.release_at_fn = rel
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                         max_attempts=2, button_visible=False, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertEqual(res.attempts, 1,
+                         "外来 started 不得注册尝试（只有第一笔真实入账）")
+        self.assertEqual(len(FakeTransport.instances[0].tickets), 2,
+                         "预留占满次数配额时不得漏账追加第三笔")
+        self.assertEqual(res.stop_reason, "retry_duration",
+                         "外来事件不得改变本场结论")
+
+
+    def test_duplicate_events_do_not_rewrite_first_conclusion(self):
+        # F03：第一笔已决（code=0）后，重复 code1/版本错误/重复 started/not_started
+        # 均不改写首次结论、不降级、不减少其它票据预留。
+        calls = {"n": 0}
+
+        def responder(ticket):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _d_payload(0, "报名人数已满")
+            return "started_only"
+
+        def extras(ticket):
+            if calls["n"] != 1:
+                return []
+            base = {"run_id": ticket["run_id"], "request_id": ticket["request_id"],
+                    "attempt_no": ticket["attempt_no"]}
+            return [
+                dict(base, kind="started"),
+                dict(base, kind="not_started"),
+                dict(base, kind="completed", http_status=200,
+                     body_bytes=json.dumps({"code": 1, "message": "ok"}).encode("utf-8")),
+                dict(base, kind="completed", http_status=200,
+                     body_bytes=json.dumps(
+                         {"code": 0, "message": VERSION_MSG}).encode("utf-8")),
+            ]
+
+        def rel(ticket, event):
+            if (event.get("kind") == "started"
+                    and event.get("attempt_no") == 2):
+                return FakeTransport.clock.mono + 9999.0
+            return None
+
+        FakeTransport.responder_fn = staticmethod(responder)
+        FakeTransport.extra_fn = extras
+        FakeTransport.release_at_fn = rel
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                         max_attempts=2, button_visible=False, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertNotEqual(res.stop_reason, "success",
+                            "重复 code1 不得改写首次已决结论")
+        self.assertNotIn("切换为点击兜底", "\n".join(res.logs),
+                         "重复版本错误不得触发降级")
+        self.assertEqual(res.attempts, 1, "重复 started 不得重复入账")
+        self.assertEqual(len(FakeTransport.instances[0].tickets), 2,
+                         "重复事件不得减少他人预留、不得漏发第三笔")
+        self.assertEqual(res.stop_reason, "retry_duration")
+
+
+    def test_lost_ticket_late_success_settles_in_tail_window(self):
+        # F03：failed(lost) 不是最终完成——同一合法请求的迟到成功在尾窗内仍能结算。
+        calls = {"n": 0}
+
+        def responder(ticket):
+            calls["n"] += 1
+            return _d_failed(ticket)
+
+        def extras(ticket):
+            return [dict(ticket, kind="completed", http_status=200,
+                         body_bytes=json.dumps({"code": 1, "message": "ok"}).encode("utf-8"),
+                         run_id=ticket["run_id"], request_id=ticket["request_id"],
+                         attempt_no=ticket["attempt_no"])]
+
+        def rel(ticket, event):
+            # failed 立即（标 lost 保持未决）；completed 迟到 0.5 秒（落在尾窗内）
+            if event.get("kind") == "completed":
+                return FakeTransport.clock.mono + 0.5
+            return None
+
+        FakeTransport.responder_fn = staticmethod(responder)
+        FakeTransport.extra_fn = extras
+        FakeTransport.release_at_fn = rel
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                         max_attempts=1, button_visible=False, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "success",
+                         "lost 后迟到成功必须能合法结算，不得停在未决")
+
+
+    def test_max_attempts_one_late_started_counted_and_single(self):
+        # max_attempts=1 且 started 真正滞后：无第二笔；started 迟早入账后
+        # 最终 attempt/pending 不能为 0。
+        def rel(ticket, event):
+            if event.get("kind") == "started":
+                return FakeTransport.clock.mono + 8.0   # 真正滞后（非同步）
+            return None
+
+        FakeTransport.responder_fn = staticmethod(lambda t: "started_only")
+        FakeTransport.release_at_fn = rel
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                         max_attempts=1, button_visible=False, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertEqual(len(FakeTransport.instances[0].tickets), 1,
+                         "max_attempts=1 不得有第二笔")
+        self.assertEqual(res.attempts, 1, "已跨接纳点的 started 必须入账")
+        self.assertEqual(res.pending, 1, "started 入账后必须保持未决")
+        self.assertEqual(res.stop_reason, "unconfirmed")
+
+
+    def test_uncommitted_reservation_cancelled_not_counted(self):
+        # 未跨接纳点（started 永不放行）：close 取消预留，不计 attempt。
+        def rel(ticket, event):
+            return FakeTransport.clock.mono + 9999.0   # 永不放行
+
+        FakeTransport.responder_fn = staticmethod(lambda t: "started_only")
+        FakeTransport.release_at_fn = rel
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                         max_attempts=1, button_visible=False, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertEqual(len(FakeTransport.instances[0].tickets), 1)
+        self.assertEqual(res.attempts, 0, "取消的预留不得计 attempt")
+        self.assertEqual(res.stop_reason, "retry_duration")
+
+
+    def test_two_blocked_threads_no_third_despite_logical_ttl(self):
+        # 两笔物理在途：逻辑 TTL 过期也不得凭空创建第三线程（物理上限说了算）。
+        FakeTransport.responder_fn = staticmethod(lambda t: "started_only")
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=30.0,
+                         max_attempts=0, button_visible=False, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertEqual(len(FakeTransport.instances[0].tickets), 2,
+                         "逻辑 TTL 不得越物理并发上限")
+        self.assertEqual(res.stop_reason, "unconfirmed")
+
+
+    def test_downgrade_shares_attempts_with_click(self):
+        # 降级后 direct 与 click 共用同一账本：总次数共享，不重置预算/连击。
+        FakeTransport.responder_fn = staticmethod(lambda t: _d_payload(0, VERSION_MSG))
+        signer = _RecordingSigner()
+        res = run_worker(behavior="success", at_offset=OPEN_AHEAD, retry_for=60.0,
+                         max_attempts=2, button_visible=True, script_srcs=self._known(),
+                         direct_signer=signer, direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "success")
+        self.assertEqual(res.attempts, 2,
+                         "direct 与 click 共享总次数（1+1）")
+        self.assertEqual(len(FakeTransport.instances[0].tickets), 1,
+                         "降级后不得再发直发票据")
+        self.assertIn("streak_404=0", res.terminal_lines[-1], "不得重置连击")
+
+
+    def test_late_direct_success_prevents_confirm_click(self):
+        # 版本错误到达后，旧 direct 迟到成功在确认前落账：不再点「确定」，
+        # 成功粘性保持，不重置预算/连击。
+        calls = {"n": 0}
+
+        def responder(ticket):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "started_only"          # 第一笔：事件全滞后
+            return _d_payload(0, VERSION_MSG)  # 第二笔：版本错误（降级）
+
+        def extras(ticket):
+            if calls["n"] != 1:
+                return []
+            return [dict(ticket, kind="completed", http_status=200,
+                         body_bytes=json.dumps({"code": 1, "message": "ok"}).encode("utf-8"),
+                         run_id=ticket["run_id"], request_id=ticket["request_id"],
+                         attempt_no=ticket["attempt_no"])]
+
+        def rel(ticket, event):
+            # 第一笔的 started/completed 全部滞后 0.5 秒（慢确认框后被 gate2 收到）
+            if event.get("attempt_no") == 1:
+                return FakeTransport.clock.mono + 0.5
+            return None
+
+        FakeTransport.responder_fn = staticmethod(responder)
+        FakeTransport.extra_fn = extras
+        FakeTransport.release_at_fn = rel
+        signer = _RecordingSigner()
+        res = run_worker(behavior="slow_dialog", at_offset=OPEN_AHEAD, retry_for=60.0,
+                         max_attempts=3, button_visible=True, click_delay=2.0,
+                         script_srcs=self._known(), direct_signer=signer,
+                         direct_transport=FakeTransport)
+        self.assertEqual(res.stop_reason, "success",
+                         "迟到成功必须保持成功粘性")
+        self.assertEqual(res.page.confirm_clicks, 0,
+                         "迟到成功后不得再点「确定」")
+        self.assertIn("streak_404=0", res.terminal_lines[-1], "不得重置连击")
 
 
 if __name__ == "__main__":
