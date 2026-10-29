@@ -589,4 +589,13 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }
 
 
+/* ---- 手机访问面板：地址、一次性配对码与进程内准备重登 ---- */
+.phone-panel { margin: 12px 0; padding: 12px 14px; border: 1px solid var(--line, #dfe4ef); border-radius: 12px; background: #fff; }
+.phone-panel h2 { margin: 0 0 8px; font-size: 15px; }
+.phone-panel h3 { margin: 12px 0 6px; font-size: 14px; }
+.phone-line { margin: 4px 0; font-size: 13px; color: #4b5563; overflow-wrap: anywhere; }
+.phone-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+.phone-actions input { min-height: 34px; padding: 6px 10px; border: 1px solid #cbd2e0; border-radius: 8px; font-size: 14px; }
+
+
 /* ---- 独立北京时间（决策 012）：顶栏唯一时间入口，状态用图形+短字表达 ---- */

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>天软活动 · 手机</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<main class="wrap">
+  <!-- 配对：首开必经；没有会话 cookie 一律回到这里 -->
+  <section id="pair" class="card">
+    <h1>连接电脑</h1>
+    <p class="hint">在电脑上的工具窗口里查看 6 位配对码，5 分钟内有效。</p>
+    <label class="field"><span>配对码</span>
+      <input id="pair-code" inputmode="numeric" autocomplete="one-time-code"
+             maxlength="6" placeholder="6 位数字" aria-label="配对码"></label>
+    <button id="btn-pair" class="primary" type="button">配对</button>
+    <p id="pair-error" class="error" role="alert"></p>
+  </section>
+
+  <!-- 主界面：配对成功后显示 -->
+  <section id="app" hidden>
+    <header class="bar">
+      <h1>这次报名</h1>
+      <span id="conn" class="pill" data-state="ok">已连接</span>
+      <button id="btn-refresh" class="ghost" type="button">刷新</button>
+    </header>
+    <p id="banner" class="error" role="alert" hidden></p>
+
+    <section class="card">
+      <h2>筛选</h2>
+      <label class="field"><span>名称/关键词</span>
+        <input id="q" type="search" placeholder="搜活动名或地点" aria-label="名称或关键词"></label>
+      <div class="row" role="group" aria-label="报名状态">
+        <button class="chip" type="button" data-status="all" aria-pressed="true">全部</button>
+        <button class="chip" type="button" data-status="free" aria-pressed="false">可报名</button>
+        <button class="chip" type="button" data-status="signed" aria-pressed="false">已报名</button>
+      </div>
+      <div class="row" role="group" aria-label="开放时间">
+        <button class="chip" type="button" data-time="all" aria-pressed="true">不限</button>
+        <button class="chip" type="button" data-time="today" aria-pressed="false">今天</button>
+        <button class="chip" type="button" data-time="week" aria-pressed="false">7 天内</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>活动</h2>
+      <ul id="items" class="items"></ul>
+      <p id="empty" class="hint">没有符合条件的活动。</p>
+    </section>
+
+    <section class="card">
+      <h2>重试设置</h2>
+      <label class="field"><span>尝试时长</span>
+        <select id="retry-for" aria-label="尝试时长"></select></label>
+      <p id="retry-hint" class="hint"></p>
+      <label class="field"><span>最多提交次数（0=不限）</span>
+        <input id="max-attempts" type="number" min="0" step="1" value="0" aria-label="最多提交次数"></label>
+    </section>
+
+    <section class="card">
+      <h2>执行</h2>
+      <p id="plan-line" class="hint">未开始</p>
+      <div class="row">
+        <button id="btn-start" class="primary" type="button">开始报名计划</button>
+        <button id="btn-stop" class="danger" type="button" hidden>停止计划</button>
+      </div>
+      <p id="pending-note" class="hint" hidden>已发出开始请求，正在核对结果，请先不要重复点击。</p>
+      <button id="btn-cancel-task" class="danger" type="button" hidden>取消这一场</button>
+    </section>
+
+    <section class="card">
+      <h2>日志</h2>
+      <ol id="logs" class="logs"></ol>
+    </section>
+
+    <section class="card">
+      <h2>重新登录</h2>
+      <p id="relogin-note" class="hint"></p>
+      <img id="captcha" alt="验证码" hidden>
+      <label class="field"><span>验证码</span>
+        <input id="code" inputmode="text" autocomplete="off" maxlength="4"
+               placeholder="4 位字母数字" aria-label="验证码"></label>
+      <div class="row">
+        <button id="btn-relogin" class="primary" type="button">在手机上重登</button>
+        <button id="btn-relogin-submit" class="primary" type="button" hidden>提交验证码</button>
+        <button id="btn-relogin-refresh" class="ghost" type="button" hidden>换一张图</button>
+        <button id="btn-relogin-cancel" class="ghost" type="button" hidden>取消</button>
+      </div>
+    </section>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

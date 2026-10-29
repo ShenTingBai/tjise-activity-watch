@@ -243,6 +243,24 @@
       </div>
     </div>
   </div>
+  <!-- 手机访问面板：启停受限入口、地址、一次性配对码与进程内准备重登 -->
+  <section class="phone-panel" id="phone-panel" aria-label="手机访问">
+    <h2>手机访问</h2>
+    <p class="phone-line">地址：<span id="phone-address">未开启</span></p>
+    <p class="phone-line">配对码：<span id="phone-code">—</span></p>
+    <div class="phone-actions">
+      <button class="btn btn-solid" id="btn-phone-start" type="button">开启手机访问</button>
+      <button class="btn btn-line" id="btn-phone-stop" type="button" hidden>关闭手机访问</button>
+    </div>
+    <h3>准备手机重登</h3>
+    <p class="phone-line">账号密码只保存在本工具内存里，关闭即清除，不写文件。</p>
+    <div class="phone-actions">
+      <input id="phone-relogin-user" type="text" autocomplete="username" placeholder="账号" aria-label="重登账号">
+      <input id="phone-relogin-pass" type="password" autocomplete="current-password" placeholder="密码" aria-label="重登密码">
+      <button class="btn btn-solid" id="btn-phone-prepare" type="button">准备</button>
+    </div>
+    <p class="phone-line" id="phone-relogin-note"></p>
+  </section>
   <!-- 时间详情浮层：一个入口承载当前时间、状态、误差与重新校准 -->
   <div class="pop" id="clock-pop" role="dialog" aria-label="北京时间详情" hidden></div>
   <!-- 停止计划二次确认：Esc / 继续计划 都不会触发停止 -->
@@ -274,6 +292,7 @@
   <script src="controllers/terms.js"></script>
   <script src="views/update.js"></script>
   <script src="views/help.js"></script>
+  <script src="views/phone.js"></script>
   <script src="controllers/update.js"></script>
   <script src="controllers/prefs.js"></script>
   <script src="state/filters.js"></script>
