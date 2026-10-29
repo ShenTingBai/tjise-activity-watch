@@ -65,10 +65,22 @@ class PhoneAccessService:
         return is_allowed_bind(host)
 
     def current_pair_code(self) -> str:
-        """桌面面板显示一次性配对码；不进 URL、不落日志、不给未配对的手机。"""
+        """桌面面板显示一次性配对码；用过/过期就自动换一张新的。
+
+        一码一次的语义不变：换出来的码同样只能兑换一次。不进 URL、不落日志、
+        不发给未配对手机。
+        """
+        now = float(self._now())
         with self._lock:
+            if self._server is not None and (
+                    not self._pair_code or self._pair_used
+                    or not pair_code_fresh(self._pair_created, now)):
+                self._pair_code = "".join(secrets.choice("0123456789")
+                                          for _ in range(PAIR_CODE_LEN))
+                self._pair_created = now
+                self._pair_used = False
             if self._pair_code and not self._pair_used and pair_code_fresh(
-                    self._pair_created, self._now()):
+                    self._pair_created, now):
                 return self._pair_code
             return ""
 

@@ -202,7 +202,8 @@ class PairAndSessionTests(PhoneServiceBase):
         self.clock["now"] += PAIR_TTL_S + 1
         self.assertFalse(self.service.pair(code, ip="127.0.0.1")["ok"],
                          "5 分钟后配对码必须作废")
-        self.assertEqual(self.service.current_pair_code(), "")
+        fresh = self.service.current_pair_code()
+        self.assertNotEqual(fresh, code, "过期后面板换一张新的一码一次")
 
     def test_three_failures_lock_ip_and_global_locks_across_ips(self):
         self.service.start("127.0.0.1", 0)
