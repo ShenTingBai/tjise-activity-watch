@@ -23,6 +23,9 @@ async function boot() {
     /* 生命周期快照（上次关闭时长/质量、登录估算）：只进时钟浮层当提示，
      * 不参与登录四态判定，也不影响开始门禁 */
     S.lifecycle = info.lifecycle || null;
+    /* 三种重试模式的权威选项与默认值：桌面/手机共用 bootstrap 口径，
+     * 覆盖 store.js 的离线兜底副本（两者由用例对照，不各写一套） */
+    if (info.retry_options && info.retry_options.choices) S.retryOptions = info.retry_options;
     applyPrefs(info.prefs || {});
     /* 条款快照（bootstrap.terms）：未同意时拦下后面的首轮自动加载；
      * 首次（且本版本从未拒绝过）弹一次条款，之后只留横幅入口不强弹 */

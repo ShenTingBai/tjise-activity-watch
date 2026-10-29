@@ -271,6 +271,11 @@ function paintChecks() {
     else if (ui === "holdover") checks.push({ tone: "warn", text: "正在使用上次校准结果，工具会自动重新校准" });
     else checks.push({ tone: "ok", text: "报名时间按北京时间执行" });
   }
+  /* 「直到报名截止」但选中场次没给报名截止：老实提示 2 分钟兜底，不假装能一直试 */
+  if (S.retryPolicy.retry_for_s === 0) {
+    const missing = items.some((item) => !toTs(item.sign_end));
+    if (missing) checks.push({ tone: "warn", text: "有场次没提供报名截止：本次最多 2 分钟" });
+  }
   const earliest = earliestSelectedOpen();
   const bnLeft = bnLeftSec(earliest);
   if (bnLeft !== null && bnLeft > 86400) checks.push({ tone: "warn", text: "开放在 24 小时以后" });
@@ -296,11 +301,14 @@ function earliestSelectedExecutionEnd() {
   selectedItems().forEach((item) => {
     const open = toTs(item.sign_start);
     if (open === null) return;
-    const retryFor = Number(S.retryPolicy.retry_for_s);
+    const rawFor = Number(S.retryPolicy.retry_for_s);
+    /* -1 自动延长的初始预算就是 120 秒；0 才是「直到报名截止」；非法值回默认 */
+    const retryFor = rawFor === -1 ? RETRY_WINDOW_S
+      : (Number.isFinite(rawFor) ? rawFor : RETRY_WINDOW_S);
     const signEnd = toTs(item.sign_end);
     const base = open > now ? open : now;
     let end = Number.isFinite(retryFor) && retryFor > 0 ? base + retryFor
-      : (signEnd !== null ? signEnd : base + RETRY_WINDOW_S);
+      : (retryFor === 0 && signEnd !== null ? signEnd : base + RETRY_WINDOW_S);
     if (signEnd !== null) end = Math.min(end, signEnd);
     if (best === null || end < best) best = end;
   });
@@ -696,12 +704,16 @@ function taskHtml(task, now) {
  * 这里只算界面参考点，worker 的实际停止时机仍由后端决定。 */
 function effectiveRetryDeadline(task, fallbackNow) {
   const telemetry = telemetryDeadline(task);
+  /* 倒计时优先后端已接纳的 deadline：合法扩窗后的权威截止也从这里接管 */
   if (telemetry !== null) return telemetry;
   const now = Number.isFinite(fallbackNow) ? fallbackNow : bnowS();
-  const retryFor = task && Number.isFinite(Number(task.retry_for_s)) ? Number(task.retry_for_s) : RETRY_WINDOW_S;
+  const rawFor = task && Number.isFinite(Number(task.retry_for_s)) ? Number(task.retry_for_s) : RETRY_WINDOW_S;
+  /* -1 自动延长：初始预算按 120 秒算，扩窗后由上面的 telemetry 接管；
+   * 它不是「直到报名截止」——只有 0 才直接取 sign_end */
+  const retryFor = rawFor === -1 ? RETRY_WINDOW_S : rawFor;
   const signEnd = task ? toTs(task.sign_end) : null;
   /* 绝对截止不依赖任何起点：先把这条独立路径处理掉，别被 anchor 判空挡住 */
-  if (!(retryFor > 0) && signEnd !== null) return signEnd;
+  if (retryFor === 0 && signEnd !== null) return signEnd;
   /* 计划接纳时冻结的起点最权威：worker 就是拿它算 --retry-start，
    * 界面用它推导与 worker 完全同一口径（慢启动不会让两边差出几秒） */
   const policyStart = Number(task && task.retry_started_at);

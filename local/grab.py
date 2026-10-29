@@ -989,8 +989,14 @@ def retry_anchor(at_ts, now=None):
     return at_ts if at_ts and at_ts > now else now
 
 
-# 「直到报名截止」缺 sign_end 时的兜底窗口：绝不无限运行
-DEFAULT_RETRY_WINDOW_S = 120.0
+# 「直到报名截止」缺 sign_end 时的兜底窗口：绝不无限运行。
+# 数值口径统一在 domain.retry_window（父监督/桌面投影同源），此处保留旧名。
+from domain.retry_window import (  # noqa: E402
+    ADAPTIVE_SECONDS, ADAPTIVE_RETRY, DEFAULT_RETRY_SECONDS,
+    initial_deadline, resolve_window,
+)
+
+DEFAULT_RETRY_WINDOW_S = DEFAULT_RETRY_SECONDS
 
 
 def compute_retry_window(at_ts, sign_end_ts, retry_for_s, now=None):
@@ -998,20 +1004,16 @@ def compute_retry_window(at_ts, sign_end_ts, retry_for_s, now=None):
 
     未来活动从 sign_start 起算；已开放活动从本进程启动（≈用户启动计划）起算。
     - retry_for_s > 0：用户选的持续时长，sign_end 更早时被截断；
-    - retry_for_s == 0：持续到 sign_end；sign_end 缺失回退默认 120 秒。
+    - retry_for_s == 0：持续到 sign_end；sign_end 缺失回退默认 120 秒；
+    - retry_for_s == ADAPTIVE_RETRY(-1)：自动延长模式，初始 120 秒，
+      后续由合法 window_extended 事件扩窗（上限起点 + 25 分钟、sign_end 硬截）。
     返回 (retry_start, deadline, binding)，binding 是最终起约束的边界
     （duration / sign_end / fallback），终态归因用它。
     """
     now = default_now() if now is None else now
     retry_start = at_ts if at_ts and at_ts > now else now
-    if retry_for_s and retry_for_s > 0:
-        duration_end = retry_start + retry_for_s
-        if sign_end_ts and sign_end_ts < duration_end:
-            return retry_start, sign_end_ts, "sign_end"
-        return retry_start, duration_end, "duration"
-    if sign_end_ts:
-        return retry_start, sign_end_ts, "sign_end"
-    return retry_start, retry_start + DEFAULT_RETRY_WINDOW_S, "fallback"
+    deadline, binding = resolve_window(retry_start, retry_for_s, sign_end_ts)
+    return retry_start, deadline, binding
 
 
 def attempts_allowed(attempts: int, max_attempts: int) -> bool:
@@ -1067,7 +1069,7 @@ FULL_SPEED_INTERVAL_S = 0.18     # 常规全速最小间隔（180ms）
 NOT_READY_404_LIMIT = 3          # 连续 404 视为接口未就绪
 BACKOFF_FACTOR = 1.6             # 自适应退避倍率
 BACKOFF_MAX_S = 3.0              # 自适应退避上限
-ADAPTIVE_WINDOW_S = 1500.0       # 自适应扩窗上限（25 分钟）
+ADAPTIVE_WINDOW_S = ADAPTIVE_SECONDS   # 自适应扩窗上限（25 分钟）
 # --- v4 直发核心：调度账本与降级地板（§3/§5/§12）---
 SERVER_ERROR_MIN_GAP_S = 0.5     # 5xx 之后的最小间隔地板
 ADAPTIVE_IN_GOLDEN = False       # golden 内默认不进 adaptive（真实 200 才退黄金）
@@ -1915,7 +1917,10 @@ def cmd_grab(args):
                     max_attempts=args.max_attempts,
                     clock=clock,
                     retry_start=frozen or at_ts,
-                    allow_extend=args.retry_for is None,
+                    # 自动延长（--retry-for=-1）与旧「只给 --window」路径都开扩窗；
+                    # 显式正数/0 是用户硬承诺，整条扩窗路径不生效
+                    allow_extend=args.retry_for is None
+                                 or retry_for == ADAPTIVE_RETRY,
                 )
                 # 受控提交窗口：只承认本场盯按钮期间发出的 signUp 请求。
                 # 学校真实接口是 GET signUp/<opaque-hash>，hash 不含活动 ID，

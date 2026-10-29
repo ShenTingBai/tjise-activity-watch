@@ -630,6 +630,22 @@ class Api:
             "lifecycle": lifecycle_info,
             # demo 标记：界面据此放行演示计划（真实模式仍要求登录校验 valid）
             "demo": DEMO,
+            # 三种重试模式的权威选项与默认值：桌面/手机共用这一份口径，
+            # 不各维护第二套清单；缺截止的 0 模式回退秒数也在这里声明
+            "retry_options": {
+                "default": int(_retry_rules.DEFAULT_RETRY_SECONDS),
+                "fallback_seconds": int(_retry_rules.DEFAULT_RETRY_SECONDS),
+                "adaptive_cap_seconds": int(_retry_rules.ADAPTIVE_SECONDS),
+                "choices": [
+                    {"value": 120, "label": "2 分钟"},
+                    {"value": 600, "label": "10 分钟"},
+                    {"value": 1800, "label": "30 分钟"},
+                    {"value": 3600, "label": "1 小时"},
+                    {"value": int(_retry_rules.ADAPTIVE_RETRY),
+                     "label": "自动延长（最多25分钟）"},
+                    {"value": 0, "label": "直到报名截止"},
+                ],
+            },
         }
         # busy 与计划快照必须在同一「判定点」取：先取协调器快照（锁外），
         # 再回 Api 锁内确认这份快照仍属于当前计划并重新计算 busy。这样既不会
@@ -1290,7 +1306,10 @@ class Api:
                         "text": "暂时无法确认登录态：点「刷新」重试，确认登录有效后再开始"}
 
         policy = retry_policy if isinstance(retry_policy, dict) else {}
-        retry_for_s = _retry_rules.policy_int(policy.get("retry_for_s"), 120)
+        # 三种模式：正数=硬时长，0=直到截止，-1=自动延长（最多25分钟）；
+        # 其他负值/非法值回 120，不猜用户意图
+        retry_for_s = _retry_rules.policy_int(policy.get("retry_for_s"), 120,
+                                              minimum=_retry_rules.ADAPTIVE_RETRY)
         max_attempts = _retry_rules.policy_int(policy.get("max_attempts"), 0)
 
         # 计划项归一化/门禁的纯策略在 domain.plan_rules：前端只提交「选了哪

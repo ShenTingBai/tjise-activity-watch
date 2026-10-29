@@ -11,11 +11,13 @@ function applyPrefs(prefs) {
     checkout: ["all", "yes", "no"].indexOf(filter.checkout) >= 0 ? filter.checkout : "all",
   };
   S.logOpen = !!S.prefs.log_open;
-  /* 重试策略偏好：只认白名单值，脏数据回落默认（120 秒 / 不限） */
+  /* 重试策略偏好：只认白名单值，脏数据回落默认（120 秒 / 不限）。
+   * 白名单与默认值来自 bootstrap 的权威选项（桌面/手机同源），不各写一套。 */
   const policy = S.prefs.retry_policy || {};
-  const allowedFor = ["120", "600", "1800", "3600", "0"];
+  const allowedFor = (S.retryOptions.choices || []).map((item) => String(item.value));
+  const fallbackFor = Number(S.retryOptions.default) || 120;
   S.retryPolicy = {
-    retry_for_s: allowedFor.indexOf(String(policy.retry_for_s)) >= 0 ? Number(policy.retry_for_s) : 120,
+    retry_for_s: allowedFor.indexOf(String(policy.retry_for_s)) >= 0 ? Number(policy.retry_for_s) : fallbackFor,
     max_attempts: Number.isInteger(policy.max_attempts) && policy.max_attempts >= 0 ? policy.max_attempts : 0,
   };
   $("#q").value = S.filter.q;

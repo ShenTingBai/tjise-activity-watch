@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from domain.retry_window import initial_deadline
+
 
 def parse_local_time(text) -> "datetime | None":
     """ui.json / session.json 里的本地时间文本（YYYY-MM-DD HH:MM:SS）→ datetime。"""
@@ -51,15 +53,11 @@ def task_deadline(spec, epoch_of) -> "float | None":
 
     worker 自己也会算，但管道卡死、进程不退出时只有父进程能收走它；
     这里只用于监督兜底，不改变 worker 的调度。epoch_of 同 seconds_until。
+    算式统一委托 domain.retry_window.initial_deadline，三种模式
+    （正数硬时长 / 0 直达截止 / -1 自动延长初始 120）与 worker 同值。
     """
     start = float(getattr(spec, "retry_started_at", 0) or 0)
     if start <= 0:
         return None
     end = epoch_of(spec.sign_end) if getattr(spec, "sign_end", "") else None
-    retry_for = int(getattr(spec, "retry_for_s", 120) or 0)
-    if retry_for > 0:
-        deadline = start + retry_for
-        return min(deadline, end) if end else deadline
-    if end:
-        return end
-    return start + 120.0
+    return initial_deadline(start, getattr(spec, "retry_for_s", 120), end)

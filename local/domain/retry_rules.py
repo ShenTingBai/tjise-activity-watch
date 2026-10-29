@@ -11,6 +11,13 @@ from __future__ import annotations
 import re
 
 from domain.time_text import task_deadline, seconds_until  # noqa: F401  (对外统一出口)
+# 三种重试模式的常量出口：Api/worker/父监督都从这里取同一套数值口径
+from domain.retry_window import (  # noqa: F401
+    ADAPTIVE_RETRY,
+    ADAPTIVE_SECONDS,
+    DEFAULT_RETRY_SECONDS,
+    initial_deadline,
+)
 
 # worker 每次真正发起 signUp 时打印的行（带 [i] 前缀落日志）；
 # 只匹配这个形状，刷新 / is_joined 查询不会撞上

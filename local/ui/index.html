@@ -51,8 +51,8 @@
           <button id="btn-board-login" class="bb bb-primary board-quick" type="button" hidden>登录</button>
           <button id="btn-board-pick" class="bb bb-ghost board-quick" type="button" hidden>选这一场</button>
           <span class="grow"></span>
-          <!-- 计划级重试策略：时长 0=直到报名截止；次数 0=不限；报名截止永远是硬上限 -->
-          <label class="policy-select" for="retry-for"><span>尝试时长</span><select id="retry-for" aria-label="尝试时长"><option value="120">2 分钟</option><option value="600">10 分钟</option><option value="1800">30 分钟</option><option value="3600">1 小时</option><option value="0">直到报名截止</option></select></label>
+          <!-- 计划级重试策略：-1=自动延长（最多25分钟）；时长 0=直到报名截止（缺截止回退 2 分钟）；次数 0=不限；报名截止永远是硬上限 -->
+          <label class="policy-select" for="retry-for"><span>尝试时长</span><select id="retry-for" aria-label="尝试时长"><option value="120">2 分钟</option><option value="600">10 分钟</option><option value="1800">30 分钟</option><option value="3600">1 小时</option><option value="-1">自动延长（最多25分钟）</option><option value="0">直到报名截止</option></select></label>
           <label class="policy-select" for="max-attempts"><span>最多提交次数（0=不限）</span><input id="max-attempts" type="number" min="0" step="1" value="0" aria-label="最多提交次数，0 表示不限次数" title="0 表示不限次数；只统计真正发出去的提交"></label>
           <label class="tg" id="headed-label" for="headed"><input type="checkbox" id="headed"><span class="box" aria-hidden="true"></span><span>显示浏览器窗口</span></label>
           <button id="btn-clear-plan" class="bb bb-ghost" type="button">清空选择</button>

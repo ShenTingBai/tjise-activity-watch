@@ -18,6 +18,9 @@ import time
 from domain.errors import ClosingError
 from domain.plan_rules import classify_task_stop
 from domain.retry_rules import ATTEMPT_RE, attempts_of, parse_retry_line
+from domain.retry_window import (
+    ADAPTIVE_RETRY, DEFAULT_RETRY_SECONDS, extension_cap, extension_delta,
+)
 from domain.time_text import task_deadline
 from domain.worker_lines import parse_checkpoint_line
 
@@ -52,11 +55,18 @@ def run_plan_task(spec, cancel_event: threading.Event, status: callable, *,
         at_text = time_text_of(epoch=business_now)
     # 业务时刻读不到时保持原定开放：worker 会按自己的时钟门禁收成
     # clock_unavailable，绝不把系统日期当成北京时间
+    # 三种重试模式的 worker 参数：自动延长（-1）只给初始预算 --window，
+    # 扩窗交给 worker 的 window_extended 事件，不传 --retry-for 以保持扩窗
+    # 路径开启；正数与 0 是用户硬承诺，显式 --retry-for、扩窗整条不生效。
+    retry_for_s = getattr(spec, "retry_for_s", 120)
     args = worker_command("grab", "--activity-id", spec.activity_id, "--name", spec.name,
                           "--at", at_text,
                           "--lead", str(max(0, int(spec.lead_s or 0))),
-                          "--retry-for", str(spec.retry_for_s),
                           "--max-attempts", str(spec.max_attempts))
+    if retry_for_s == ADAPTIVE_RETRY:
+        args += ["--window", str(int(DEFAULT_RETRY_SECONDS))]
+    else:
+        args += ["--retry-for", str(retry_for_s)]
     if spec.sign_end:
         args += ["--sign-end", spec.sign_end]
     # 计划接纳时冻结的重试起点：worker 解码/鉴权/校时/开页都消耗这段预算，
@@ -96,7 +106,24 @@ def run_plan_task(spec, cancel_event: threading.Event, status: callable, *,
     supervised = {"fired": False}
     observed = {"attempts": 0}
     deadline = task_deadline(spec, epoch_of)
-    cancel_watch = threading.Event()
+    # 自动延长（retry_for_s=-1）才接纳本场 window_extended 扩窗；其余模式的
+    # 秒数是用户硬承诺，任何扩窗事件一律 0 增量。
+    auto_extend = retry_for_s == ADAPTIVE_RETRY
+    end_epoch = epoch_of(spec.sign_end) if getattr(spec, "sign_end", "") else None
+    extend_cap = (extension_cap(float(getattr(spec, "retry_started_at", 0) or 0),
+                                end_epoch)
+                  if auto_extend else None)
+    # 看门狗与主循环共用一把锁保护的单调截止：业务→单调映射只做一次；
+    # 合法扩窗按「候选业务截止 − 已接纳业务截止」平移单调点（new_hard_stop
+    # = hard_stop + (candidate - accepted_deadline)），绝不再读业务时钟做延期
+    # ——重校向后修正因此延长不了已接纳的时长，也不直接预留 25 分钟。
+    supervise = threading.Condition()
+    shared = {
+        "hard_stop": None,      # 单调秒：到点收树；None 表示不监督
+        "accepted": deadline,   # 业务 epoch：本场已接纳截止（扩窗同步前移）
+        "closed": False,        # 取消/终态/收尾：唤醒看门狗并禁止再扩窗
+        "stop_seen": False,     # worker 终态行已到：其后的扩窗事件忽略
+    }
     lines: "queue.Queue[str]" = queue.Queue()
     reader_done = threading.Event()
     tail: list[str] = []
@@ -114,37 +141,71 @@ def run_plan_task(spec, cancel_event: threading.Event, status: callable, *,
     reader.start()
 
     def _watchdog() -> None:
-        """到「有效截止 + 清理余量」就收走本场树。
+        """到「有效截止 + 清理余量」就收走本场树；扩窗后按新截止重算等待。
 
-        等待用 Event 而不是 time.sleep：正常收尾/取消/关闭都在 finally
-        置位，线程立刻退出，不把一个睡到截止的后台线程留在进程里。
-        退出条件不看父进程是否还活着：父已退出、孙进程握着 stdout 时，
-        仍然必须由这里结束监控。
+        等待用 Condition 而不是一次性延时：合法 window_extended 平移
+        hard_stop 后唤醒这里重算剩余时长（旧截止不再杀树，新截止才会）；
+        取消/终态/收尾置 closed 并唤醒，线程立刻退出，不把一个睡到截止的
+        后台线程留在进程里。退出条件不看父进程是否还活着：父已退出、孙进程
+        握着 stdout 时，仍然必须由这里结束监控。
         """
-        if watch_delay is None:
-            return
-        if cancel_watch.wait(watch_delay):
-            return
-        supervised["fired"] = True
+        with supervise:
+            while not shared["closed"] and shared["hard_stop"] is not None:
+                remaining = shared["hard_stop"] - time.monotonic()
+                if remaining <= 0:
+                    break
+                supervise.wait(remaining)
+            if shared["closed"] or shared["hard_stop"] is None:
+                return
+            supervised["fired"] = True
         tree.terminate()
 
     # 延迟只算一次，看门狗与主循环共用同一个上限：各算各的会在
     # 「截止已过」时出现主循环认为已超时、看门狗还在等 grace 的分叉
     # 监督上限按业务时刻换算成一次性延迟：重校向后纠正不得延长已接纳的时长。
-    # 校时失效时退回「本场最长可能时长 + grace」的独立经过时长上限——
-    # 只用于收走本场进程树，不重写树所有权，也不把系统时间当业务时刻。
+    # 校时失效时退回「本场初始预算 + grace」的独立经过时长上限——
+    # 只用于收走本场进程树，不重写树所有权，也不把系统时间当业务时刻；
+    # 自动延长的后续扩窗按增量平移这里建立的单调点，不重新换算。
     if deadline:
         if business_now is not None:
             watch_delay = max(0.0, deadline - business_now) + grace_s
         else:
-            watch_delay = float(spec.retry_for_s or 120) + grace_s
+            # 初始预算：正数用用户秒数；0/-1/未定义都按 120 兜底（-1 别当负数）
+            budget_s = (float(retry_for_s)
+                        if retry_for_s and retry_for_s > 0
+                        else float(DEFAULT_RETRY_SECONDS))
+            watch_delay = budget_s + grace_s
     else:
         watch_delay = None
     watchdog = None
     if watch_delay is not None:
+        with supervise:
+            shared["hard_stop"] = time.monotonic() + watch_delay
         watchdog = threading.Thread(target=_watchdog, name="signup-watchdog",
                                     daemon=True)
         watchdog.start()
+
+    def _accept_window_extension(parsed: dict) -> None:
+        """合法 window_extended 才平移单调截止；其余一律 0 增量（决策 2）。
+
+        只认本场自动延长模式、未终态、有限且严格增长、不越上限的候选；
+        重复/缩短/越界/伪造/固定模式/终态后都不延期。增量只用候选与已接纳
+        截止之差，不重新读业务时钟。
+        """
+        if not auto_extend:
+            return
+        with supervise:
+            if shared["closed"] or shared["stop_seen"] or supervised["fired"]:
+                return
+            delta = extension_delta(shared["accepted"], parsed.get("retry_deadline"),
+                                    extend_cap, True)
+            if delta <= 0:
+                return
+            if shared["hard_stop"] is not None:
+                # 关键算式：new_hard_stop = hard_stop + (candidate - accepted)
+                shared["hard_stop"] += delta
+            shared["accepted"] = shared["accepted"] + delta
+            supervise.notify_all()
 
     def feed(line: str) -> None:
         """输出行统一入口：落日志、存尾巴，并把源事件时间与遥测推成任务 detail。
@@ -180,6 +241,12 @@ def run_plan_task(spec, cancel_event: threading.Event, status: callable, *,
                     observed["attempts"] = max(observed["attempts"], int(raw_attempts))
                 except (TypeError, ValueError):
                     pass
+            if parsed.get("stop_reason"):
+                with supervise:
+                    shared["stop_seen"] = True
+            elif parsed.get("kind") == "window_extended":
+                # 进度型扩窗事件：合法的才平移单调截止（自动延长模式）
+                _accept_window_extension(parsed)
         if parsed and status:
             # 窗口确定/请求发起都是进度行：先把截止与次数推上去，
             # 不必等进程收尾；终态行才带 stop_reason，由收尾逻辑消费
@@ -196,7 +263,7 @@ def run_plan_task(spec, cancel_event: threading.Event, status: callable, *,
 
     code = None
     try:
-        hard_stop = (time.monotonic() + watch_delay) if watch_delay is not None else None
+        # 初始单调截止已在启动看门狗时映射一次；扩窗只平移它，不在此重算
         # 正常收尾要求 reader_done（输出读完）；取消与父层监督只要求
         # 进程树死透——onefile 引导进程被收走后，真实 worker 可能还握着
         # stdout 管道，再等 EOF 这条循环就永远出不去，plan_done 也发不出去。
@@ -210,7 +277,9 @@ def run_plan_task(spec, cancel_event: threading.Event, status: callable, *,
             if supervised["fired"]:
                 # 监督已收走进程树：不再等 EOF，也不把管道当「还活着」的证据
                 break
-            if hard_stop is not None and time.monotonic() >= hard_stop:
+            with supervise:
+                stop_at = shared["hard_stop"]
+            if stop_at is not None and time.monotonic() >= stop_at:
                 # 看门狗线程可能被调度延迟；主循环自己再守一次同一个上限
                 supervised["fired"] = True
                 tree.terminate()
@@ -244,10 +313,12 @@ def run_plan_task(spec, cancel_event: threading.Event, status: callable, *,
                 code = -1
     finally:
         # 监控循环无论怎么退出（含异常）都要：撤销监督、收走本场树、
-        # 清进程表、关管道。顺序是硬要求——先置取消、再有界 join 监督
-        # 线程，最后才终止/释放 Job 句柄：否则迟到的 watchdog 可能拿着
+        # 清进程表、关管道。顺序是硬要求——先置关闭并唤醒看门狗、再有界 join
+        # 监督线程，最后才终止/释放 Job 句柄：否则迟到的 watchdog 可能拿着
         # 已关闭（甚至已被复用）的句柄去 TerminateJobObject（FR02）。
-        cancel_watch.set()
+        with supervise:
+            shared["closed"] = True
+            supervise.notify_all()
         if watchdog is not None:
             watchdog.join(timeout=2.0)
         try:
