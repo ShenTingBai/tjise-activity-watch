@@ -20,7 +20,22 @@ def read(rel: str) -> str:
     path = LOCAL / rel
     self_msg = "契约文件缺失：%s" % path
     assert path.exists(), self_msg
+    if rel == "ui/app.js":
+        # 结构重构后界面脚本按层拆成多文件：契约断言读「前端脚本联合源码」，
+        # 加载序取自 index.html（led.js 是独立字库渲染器，不含业务契约文本）。
+        return read_ui_scripts()
     return path.read_text(encoding="utf-8")
+
+
+def read_ui_scripts() -> str:
+    """index.html 加载序的全部业务脚本拼接（led.js 除外）。"""
+    html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
+    parts = []
+    for src in re.findall(r'<script src="([^"]+)"></script>', html):
+        if src == "led.js":
+            continue
+        parts.append((LOCAL / "ui" / src).read_text(encoding="utf-8"))
+    return "\n".join(parts)
 
 
 def help_dialog(html: str) -> str:
@@ -191,11 +206,10 @@ class LoginStateContractTests(unittest.TestCase):
     def test_backend_login_state_fields_in_payloads(self):
         py = read("app.py")
         self.assertIn("def login_state", py, "app.py 必须有三态快照函数 login_state")
-        start = py.index("def _do_check")
-        body = py[start:py.index("def _do_list", start)]
+        # check 事件载荷整理已下沉 application.login_service：三态字段随载荷迁移
+        svc = read("application/login_service.py")
         for field in ("session_present", "session_expired"):
-            self.assertIn('"%s"' % field, py, "登录载荷缺字段 %s" % field)
-            self.assertIn(field, body, "check 事件载荷必须带 %s" % field)
+            self.assertIn('"%s"' % field, svc, "登录载荷缺字段 %s" % field)
 
     def test_login_state_semantics(self):
         import json
@@ -343,6 +357,39 @@ class BridgeContractTests(unittest.TestCase):
         self.assertNotIn("proto/", html, "index.html 不得引用 design/prototype 的资源")
 
 
+class LayerBoundaryContractTests(unittest.TestCase):
+    """分层结构契约：呈现归 views，controller 不直接读写 DOM；加载序即依赖序。"""
+
+    VIEW_BEFORE_DEPENDENT = (
+        ("views/terms.js", "controllers/terms.js"),
+        ("views/update.js", "controllers/update.js"),
+        ("views/update.js", "views/help.js"),
+    )
+
+    def test_script_load_order_puts_views_before_dependents(self):
+        html = read("ui/index.html")
+        scripts = re.findall(r'<script src="([^"]+)"></script>', html)
+        for view, dependent in self.VIEW_BEFORE_DEPENDENT:
+            self.assertIn(view, scripts, "缺少 %s" % view)
+            self.assertIn(dependent, scripts, "缺少 %s" % dependent)
+            self.assertLess(scripts.index(view), scripts.index(dependent),
+                            "%s 必须先于 %s 加载（经典 script 顺序即依赖序）"
+                            % (view, dependent))
+
+    def test_terms_and_update_controllers_do_not_render_dom(self):
+        """条款/更新 controller 只做状态编排与桥接效果，DOM 查询与呈现都在 views。"""
+        banned = (
+            "$(", "document.", "querySelector", ".textContent", ".innerHTML",
+            ".dataset.", "showModal", ".hidden = ", ".disabled = ", ".focus(",
+            "classList", "scrollTop", "setAttribute", ".close()", "createElement",
+        )
+        for rel in ("ui/controllers/terms.js", "ui/controllers/update.js"):
+            js = read(rel)
+            for token in banned:
+                self.assertNotIn(token, js,
+                                 "%s 不得直接呈现 DOM：%s" % (rel, token))
+
+
 class NameContractTests(unittest.TestCase):
     """正式名称契约：天软活动预报名工具；「准点」只留在历史说明里。"""
 
@@ -406,11 +453,15 @@ class StopLifecycleContractTests(unittest.TestCase):
     """停止生命周期的静态契约：进程树终止、「正在停止」反馈、重试窗口硬截止。"""
 
     def test_app_py_kills_process_tree(self):
-        py = read("app.py")
-        self.assertIn("def _kill_tree", py, "必须有进程树终止 helper")
-        self.assertIn("taskkill", py, "Windows 下必须按 taskkill /F /T 终止整棵进程树")
+        # 树终止 helper 已下沉 infrastructure.process_tree；任务监督的
+        # 取消收尾契约在 application.plan_service（app.py 保留 stop_plan 入口）
+        tree_src = read("infrastructure/process_tree.py")
+        self.assertIn("def kill_tree", tree_src, "必须有进程树终止 helper")
+        self.assertIn("taskkill", tree_src, "Windows 下必须按 taskkill /F /T 终止整棵进程树")
+        plan_src = read("application/plan_service.py")
         self.assertIn("canceled or reader_done.is_set()",
-                      py, "取消路径的退出条件不得依赖管道 EOF（孙进程可能握着管道）")
+                      plan_src, "取消路径的退出条件不得依赖管道 EOF（孙进程可能握着管道）")
+        py = read("app.py")
         self.assertIn("_terminate_plan_procs", py, "stop_plan 必须主动终止活着的 worker")
 
     def test_grab_retry_window_is_hard_deadline(self):
@@ -498,10 +549,12 @@ class RetryPolicyUiContractTests(unittest.TestCase):
         self.assertIn("telemetryDeadline", js, "重试截止必须优先用 telemetry")
 
     def test_backend_contract_strings(self):
+        # worker 命令行已随任务监督下沉 application.plan_service
+        plan_src = read("application/plan_service.py")
+        self.assertIn("--sign-end", plan_src, "worker 命令必须传报名截止")
+        self.assertIn("--retry-for", plan_src, "worker 命令必须传重试时长")
+        self.assertIn("--max-attempts", plan_src, "worker 命令必须传最大提交次数")
         py = read("app.py")
-        self.assertIn("--sign-end", py, "worker 命令必须传报名截止")
-        self.assertIn("--retry-for", py, "worker 命令必须传重试时长")
-        self.assertIn("--max-attempts", py, "worker 命令必须传最大提交次数")
         self.assertIn("def _parse_retry_line", py, "必须解析 [retry] 结构化行")
         grab = read("grab.py")
         self.assertIn("def compute_retry_window", grab, "缺少窗口纯函数")
@@ -562,8 +615,10 @@ class StateGapsContractTests(unittest.TestCase):
         self.assertIn("result-action", js, "失败结论必须带行动按钮（刷新列表/再试一次）")
 
     def test_check_event_carries_hint(self):
+        # check 事件载荷整理已下沉 application.login_service
+        svc = read("application/login_service.py")
+        self.assertIn('"hint": check_hint', svc, "check 事件必须带可区分的 hint 分类字段")
         py = read("app.py")
-        self.assertIn('"hint": _check_hint', py, "check 事件必须带可区分的 hint 分类字段")
         self.assertIn("def _check_hint", py, "缺少 hint 分类函数")
 
 
@@ -613,13 +668,16 @@ class DualModeUiContractTests(unittest.TestCase):
         # 统计口径排除已截止
         self.assertIn("S.items.filter(isEligibleForPlan)", js,
                       "可报名统计必须排除已截止")
-        # 后端最终防线
+        # 后端最终防线：拒绝策略在 domain.plan_rules，start_plan 仍走这条门禁
+        rules = read("domain/plan_rules.py")
+        self.assertIn("sign_end_passed", rules,
+                      "start_plan 必须拒绝已截止活动（后端最终防线）")
+        self.assertIn("报名已截止", rules, "拒绝时要返回具体说明")
         py = read("app.py")
         start_plan = py.index("def start_plan")
         plan_body = py[start_plan:py.index("def cancel_task", start_plan)]
-        self.assertIn("sign_end_passed", plan_body,
-                      "start_plan 必须拒绝已截止活动（后端最终防线）")
-        self.assertIn("报名已截止", plan_body, "拒绝时要返回具体说明")
+        self.assertIn("closed_items_error", plan_body,
+                      "start_plan 必须经 closed_items_error 过已截止门禁")
 
     def test_start_plan_payload_carries_sign_end_and_mode(self):
         """startPlan 显式传 sign_end 与 signup_mode，后端缺口数据也能拦截。"""
@@ -704,8 +762,9 @@ class PreopenRouteContractTests(unittest.TestCase):
 
     def test_worker_payload_carries_lead(self):
         """worker 载荷显式携带与 TaskSpec 一致的 --lead；快照携带 lead_s。"""
-        py = read("app.py")
-        self.assertIn('"--lead", str(max(0, int(spec.lead_s or 0)))', py,
+        # worker 命令行已随任务监督下沉 application.plan_service
+        plan_src = read("application/plan_service.py")
+        self.assertIn('"--lead", str(max(0, int(spec.lead_s or 0)))', plan_src,
                       "_run_plan_task 必须显式传 --lead（预报名提前准备窗口）")
         sp = read("signup_plan.py")
         self.assertIn("lead_s: int = 100", sp, "TaskSpec 快照必须携带 lead_s（默认 100）")
@@ -907,7 +966,8 @@ JS_HARNESS = r"""
 "use strict";
 const vm = require("vm");
 const fs = require("fs");
-const appJs = process.argv[2];
+const path = require("path");
+const uiDir = process.argv[2];
 const snippetFile = process.argv[3];
 
 const out = [];
@@ -1016,7 +1076,15 @@ const sandbox = {
 sandbox.window = sandbox;
 sandbox.document.body = el2("body");
 vm.createContext(sandbox);
-vm.runInContext(fs.readFileSync(appJs, "utf8"), sandbox, { filename: "app.js" });
+/* 结构重构后界面按层拆成多脚本：按 index.html 的加载序喂进同一个沙箱，
+ * 与真实 WebView 顺序一致。led.js 不进沙箱——字库渲染器只在真实 DOM 有
+ * 意义，且历史行为就是 LED_UI 缺席时 ledSet 回退纯文本层。 */
+const html = fs.readFileSync(path.join(uiDir, "index.html"), "utf8");
+const scripts = Array.from(html.matchAll(/<script src="([^"]+)"><\/script>/g))
+  .map((m) => m[1]).filter((src) => src !== "led.js");
+for (const src of scripts) {
+  vm.runInContext(fs.readFileSync(path.join(uiDir, src), "utf8"), sandbox, { filename: src });
+}
 /* 决策 012：node 桩显式注入可信假时钟（锚定 Date.now），不以 Date.now 作默认成功桩 */
 vm.runInContext(
   "ingestBusinessClock({ schema: 1, owner_id: 'harness-clock', generation: 1," +
@@ -1061,7 +1129,7 @@ def run_js(snippet: str, env: dict | None = None):
         part.write_text(snippet, encoding="utf-8")
         child_env = dict(os.environ)
         child_env.update(env or {})
-        res = subprocess.run([node, str(harness), str(LOCAL / "ui" / "app.js"), str(part)],
+        res = subprocess.run([node, str(harness), str(LOCAL / "ui"), str(part)],
                              capture_output=True, text=True, encoding="utf-8",
                              errors="replace", timeout=30, env=child_env)
         if res.returncode != 0:
@@ -3794,7 +3862,7 @@ class AriaAndPlaceTests(unittest.TestCase):
 
     def test_chips_use_aria_pressed_not_selected(self):
         html = (LOCAL / "ui" / "index.html").read_text(encoding="utf-8")
-        app = (LOCAL / "ui" / "app.js").read_text(encoding="utf-8")
+        app = read("ui/app.js")   # 前端脚本联合源码（chips 渲染已随分层拆分）
         self.assertIn('aria-pressed="true"', html)
         self.assertNotIn('aria-selected="false">可报名', html,
                          "button 上的 aria-selected 非法，必须用 aria-pressed")
@@ -4782,7 +4850,14 @@ document.querySelector("#btn-help").click();
 const helpOpen = document.querySelector("#help").open;
 document.querySelector("#btn-help-terms").click();
 const termsFromHelp = document.querySelector("#dlg-terms").open;
-out.push({ firstOpen, afterDecline, reopened, helpOpen, termsFromHelp, calls, saved,
+/* 重复拒绝回归：从帮助重开同版条款后再点暂不使用，必须仍关闭弹窗 */
+document.querySelector("#btn-terms-decline").click();
+await Promise.resolve(); await Promise.resolve();
+const afterRepeat = { open: document.querySelector("#dlg-terms").open,
+  declined: S.terms.declined,
+  declinedWrites: saved.filter((p) => p.terms_declined_version !== undefined).length };
+out.push({ firstOpen, afterDecline, reopened, helpOpen, termsFromHelp, afterRepeat,
+  calls, saved,
   loginDisabled: document.querySelector("#btn-login").disabled,
   refreshDisabled: document.querySelector("#btn-refresh").disabled,
   planDisabled: document.querySelector("#btn-plan").disabled });
@@ -4800,6 +4875,10 @@ out.push({ firstOpen, afterDecline, reopened, helpOpen, termsFromHelp, calls, sa
         self.assertTrue(case["loginDisabled"])
         self.assertTrue(case["refreshDisabled"])
         self.assertTrue(case["planDisabled"])
+        self.assertFalse(case["afterRepeat"]["open"], "重复拒绝必须仍关闭条款弹窗")
+        self.assertTrue(case["afterRepeat"]["declined"], "重复拒绝后 declined 仍为 true")
+        self.assertEqual(case["afterRepeat"]["declinedWrites"], 1, "拒绝版本只写一次")
+        self.assertEqual(case["calls"], [], "重复拒绝后网络动作仍全部被拦")
 
     def test_declined_version_persists_and_version_change_reprompts(self):
         """重启后同一版本不重弹；条款版本变化时重新提示。"""

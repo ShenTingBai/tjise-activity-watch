@@ -20,7 +20,7 @@ if str(LOCAL) not in sys.path:
     sys.path.insert(0, str(LOCAL))
 if str(LOCAL / 'tests') not in sys.path:
     sys.path.insert(0, str(LOCAL / 'tests'))
-from test_ui_contract import run_js
+from test_ui_contract import run_js, read_ui_scripts
 from business_clock import BusinessClock
 from fixtures.business_clock import ntp_response
 
@@ -146,7 +146,8 @@ class SyncProgressTailTests(unittest.TestCase):
 class ClockDisplayTailTests(unittest.TestCase):
     def test_clock_status_does_not_rebuild_open_details_every_tick(self):
         """顶栏走字不能重建浮层，否则原生 details 会在一秒内自动收起。"""
-        js = (LOCAL / "ui" / "app.js").read_text(encoding="utf-8")
+        # 界面已按层拆分：契约断言读前端脚本联合源码（含 state/clock.js）
+        js = read_ui_scripts()
         start = js.index("function paintClockStatus()")
         end = js.index("/* 重新校准", start)
         body = js[start:end]

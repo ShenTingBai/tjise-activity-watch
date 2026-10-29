@@ -150,3 +150,43 @@
 | `activity_watch.py` | 每次成功抓取后 | 连续失败按 120/300/900 秒退避 | 只写 `data/activity_watch.log`，不往群里发技术错误 |
 
 告警一律优先私聊 owner，失败回落群通道；同一失效周期只发一次，恢复后自动清零。
+
+## 本机工具（local/）分层
+
+本机版按 Clean/Hexagonal 方向分层，依赖只准向下：
+
+```
+ui/（WebView 界面）→ app.py（Api 外观/组合根）→ application/（用例）→ domain/（纯规则）
+                                                   └→ infrastructure/（副作用适配器，由外观注入端口）
+```
+
+| 层 | 模块 | 做什么 | 谁调用 | 依赖什么 |
+|----|------|--------|--------|----------|
+| domain | `login_rules` | 登录三态快照分类、check 四态结论、来源行归因 | app 外观、application | 无（纯函数） |
+| domain | `retry_rules` | `[retry]` 行解析、次数归并、telemetry 载荷、策略归一 | application | 无 |
+| domain | `plan_rules` | 计划项归一化/截止门禁、列表合并、任务终态分类 | app 外观、application | 无（classify_mode/validate_fn/epoch_of 由 app.py 注入） |
+| domain | `lifecycle_rules` | 跨关闭时长/质量记账（v1 文本 / v2 epoch） | infrastructure | 无 |
+| domain | `time_text` / `worker_lines` / `demo_data` / `errors` | 时间文本换算、worker 行解析、演示样例、语义类型 | 各层 | 无（换算/格式化函数由 app.py 注入；不读墙钟，此刻值由调用方传入） |
+| application | `plan_service` | 单场 worker 的启动、监督、终态收尾（端口注入） | app.Api._run_plan_task | domain + 注入端口 |
+| application | `update_service` | 更新检查/下载校验用例（fetch/download 端口注入） | app.Api 更新方法 | 注入端口 |
+| application | `login_service` | check 事件载荷与 done 结论整理 | app.Api._do_check_inner/_pump | domain |
+| infrastructure | `prefs_store` | ui.json 跨进程锁 + 原子读-合并-写 | app 外观、lifecycle_store | 无 |
+| infrastructure | `process_tree` | Windows Job Object 进程树所有权、taskkill 整树终止 | app 外观（spawn 端口） | 无 |
+| infrastructure | `lifecycle_store` | 启动冻结/心跳/正常关闭的 ui.json 记账 | app.get_lifecycle | prefs_store + domain |
+| interface | `app.py` | Api 24 个公开方法、条款门禁、事件发射、worker 命令装配、main；composition root：向 domain/application 注入 signup_plan 纯函数、time_contract 换算、business_clock 异常类型 | pywebview / 测试 | 全部下层（裸名注入缝保持 app.X 可替换） |
+| interface | `ui/state/**` | 状态仓库 S 与纯投影（clock/plan/login/filters/labels/time/task-display） | controllers/views | 无（store.js 仅 `$` 选择器工具；login.js 一处 body 就绪守卫） |
+| interface | `ui/controllers/**` | 用例编排与桥接（bridge/refresh/plan/plan-events/clock/terms/update/prefs/tick） | app.js 事件绑定 | state + api()；terms/update 两个 controller 零 DOM（结构契约测试守护） |
+| interface | `ui/views/**` | DOM 呈现（list/board/login/clock/clock-pop/log/selection/terms/help/update/tour） | render/tick 与 controller 调用 | state 投影（不发桥接请求）；terms/update 的 DOM 查询与呈现全部在此 |
+
+前端脚本按 index.html 的加载序执行（保持原 app.js 的顶层初始化依赖；views/terms.js、
+views/update.js 排在消费它们的 controller 之前），app.js 只保留 boot 初始化、
+`window.onBackend` 事件分发和 DOM 事件绑定。状态唯一持有者是 `state/store.js` 的 `S`；
+契约测试按「前端脚本联合源码」核对（`read_ui_scripts()`，led.js 除外），行为测试用
+node 沙箱按同一加载序回放。
+
+兼容入口边界（重构未删旧名）：`app.py` 保留旧模块级名字的兼容包装/再导出（测试按
+`app.X` 注入与 patch 的语义不变）；`views/update.js` 的 `paintUpdate` 同时是
+`views/help.js` 消费的更新呈现入口。DOM 分离是**局部完成**而非全局：条款/更新两个
+controller 已零 DOM（结构契约测试 `LayerBoundaryContractTests` 守护），但
+`controllers/tick.js` 仍做每秒增量 DOM 更新、`app.js` 事件绑定直接触 DOM——全局
+controller/view DOM 分离不在本轮范围。

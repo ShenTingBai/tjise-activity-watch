@@ -295,11 +295,18 @@ local/
 ├─ install.bat              首次使用双击一次：装依赖 + 内核 + 自检
 ├─ _py.bat                  四个 bat 共用的 Python 探测（缺环境时提示去装）
 ├─ grab.py                  主脚本（登录 / 查活动 / 到点自动报名 / 自检）
-├─ app.py                   图形界面外壳和多活动计划 API
+├─ app.py                   图形界面外壳和多活动计划 API（组合入口）
+├─ domain/                  纯规则层：登录分类、重试策略、计划门禁、时间换算（无 IO）
+├─ application/             用例层：计划任务监督、更新通道、check 事件整理（端口注入）
+├─ infrastructure/          适配器层：偏好存储、进程树所有权、生命周期持久化
 ├─ update_check.py          手动查 GitHub 正式版本、挑安装器资产、校验 manifest
 ├─ updater.py               安装器流式下载（D:/@Temp、SHA-256）与启动桥接
 ├─ signup_plan.py           报名批次、活动时段冲突和任务状态协调器
-├─ ui/                      界面本体：index.html / styles.css / app.js
+├─ ui/                      界面本体：index.html / styles.css + 按层拆分的脚本
+│  ├─ state/                状态与纯规则（store/rounds/clock/plan/login/filters/labels/task-display/time）
+│  ├─ controllers/          用例与桥接（bridge/refresh/plan/plan-events/clock/terms/update/prefs/tick）
+│  ├─ views/                DOM 呈现（list/board/login/clock/clock-pop/log/selection/terms/help/update/tour）
+│  └─ app.js                唯一入口：初始化、window.onBackend 事件绑定
 ├─ gui.py                   旧版 tkinter 界面（已停用，保留作对照）
 ├─ gui-preview.png          界面预览图（README 用）
 ├─ requirements.txt         依赖清单：playwright + pillow + pywebview

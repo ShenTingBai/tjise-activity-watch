@@ -764,10 +764,15 @@ class WorkerOwnershipTests(_WorkerCase):
         super().setUp()
 
     def _patch_kernel(self, **overrides):
-        """只改 Windows API 的返回值，保留其余真实实现。"""
-        app = self.app
-        real = app._win_kernel32()
-        saved = app._KERNEL32
+        """只改 Windows API 的返回值，保留其余真实实现。
+
+        kernel32 替身注入在 infrastructure.process_tree（进程树适配器的
+        替换接口）：_run_plan_task 经 app 的 spawn_owned_worker 再导出走
+        到该模块，这里替的就是那一层。
+        """
+        from infrastructure import process_tree
+        real = process_tree.win_kernel32()
+        saved = process_tree._KERNEL32
 
         class Wrap:
             def __getattr__(self, name):
@@ -775,8 +780,8 @@ class WorkerOwnershipTests(_WorkerCase):
                     return overrides[name]
                 return getattr(real, name)
 
-        app._KERNEL32 = Wrap()
-        self.addCleanup(setattr, app, "_KERNEL32", saved)
+        process_tree._KERNEL32 = Wrap()
+        self.addCleanup(setattr, process_tree, "_KERNEL32", saved)
 
     def test_worker_body_starts_only_after_job_ownership(self):
         """归属成功的时刻必须早于 worker 主体的第一条指令。

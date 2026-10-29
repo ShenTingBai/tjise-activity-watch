@@ -310,8 +310,10 @@ class ComponentFailureCloseoutTests(unittest.TestCase):
                 "signed": False}
         # R05：先登记权威缓存再开始；这里验证的是关闭/校验交错，不是陈旧快照门禁
         api._activities = {item["id"]: dict(item)}
+        # 结论构造已下沉 application.login_service：外层兜底的注入缝随实现迁移
+        from application import login_service
         with mock.patch.object(app.Api, "_run", ok_run), \
-                mock.patch.object(app, "_check_reason_line",
+                mock.patch.object(login_service, "check_reason_line",
                                   mock.Mock(side_effect=TypeError("结论构造炸了"))), \
                 mock.patch.object(app, "PlanCoordinator", fake_coord):
             api._do_check()
@@ -474,11 +476,15 @@ class ShutdownLifecycleTests(unittest.TestCase):
         self.assertIn("self._proc = subprocess.Popen", spawn)
 
     def test_kill_tree_is_pid_only(self):
-        """树终止只按 PID：不得出现按映像名扫杀（用户可能开着别的实例）。"""
-        src = read("local/app.py")
+        """树终止只按 PID：不得出现按映像名扫杀（用户可能开着别的实例）。
+
+        树终止实现已下沉 infrastructure.process_tree，契约随实现迁移。
+        """
+        src = read("local/infrastructure/process_tree.py")
         self.assertIn('["taskkill", "/F", "/T", "/PID", str(proc.pid)]', src,
                       "树终止命令必须按 PID")
         self.assertNotIn('"/IM"', src, "不得按映像名扫杀")
+        self.assertNotIn('"/IM"', read("local/app.py"), "不得按映像名扫杀")
 
 
 class _FakeProc:

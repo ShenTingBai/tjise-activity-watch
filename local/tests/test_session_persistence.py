@@ -794,10 +794,14 @@ class LifecycleContractTests(unittest.TestCase):
                 self.assertIsNone(second["hours_left"],
                                   "换凭证后旧锚点不匹配：宁可不报数，不沿用旧估算")
             # 生命周期快照不再携带登录估算（唯一来源是 login_state 载荷）
-            src = (LOCAL / "app.py").read_text(encoding="utf-8")
+            # check 事件载荷整理已下沉 application.login_service
+            src = (LOCAL / "application" / "login_service.py").read_text(encoding="utf-8")
             self.assertIn('"estimated_expires_at": state.get("estimated_expires_at")', src,
                           "check 事件必须带当前会话的估算锚点（与 bootstrap 同源）")
-            self.assertNotIn('"login": {', src[src.index("def snapshot"):src.index("def finalize")],
+            # 生命周期实现已下沉 infrastructure.lifecycle_store，快照契约随实现迁移
+            life_src = (LOCAL / "infrastructure" / "lifecycle_store.py").read_text(encoding="utf-8")
+            self.assertNotIn('"login": {',
+                             life_src[life_src.index("def snapshot"):life_src.index("def finalize")],
                              "lifecycle 快照不得再内嵌登录估算（避免冻结旧值第二来源）")
 
     def test_saved_at_estimate_survives_overnight_gap(self):

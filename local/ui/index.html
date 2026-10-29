@@ -251,6 +251,37 @@
     <div class="dlg-foot"><form method="dialog"><button class="btn btn-line" type="submit" value="no">继续计划</button><button class="btn btn-solid btn-stop-confirm" type="submit" value="yes">停止计划</button></form></div>
   </dialog>
   <script src="led.js"></script>
+  <!-- 分层脚本加载序保持原 app.js 的顶层初始化依赖（const 初始化跨文件引用）；
+       模块归属按职责：state=状态与纯规则 / controllers=用例 / views=DOM 呈现 / app=入口 -->
+  <script src="state/store.js"></script>
+  <script src="state/rounds.js"></script>
+  <script src="controllers/bridge.js"></script>
+  <script src="controllers/refresh.js"></script>
+  <script src="views/list.js"></script>
+  <script src="state/task-display.js"></script>
+  <script src="views/board.js"></script>
+  <script src="controllers/plan.js"></script>
+  <script src="state/clock.js"></script>
+  <script src="views/clock.js"></script>
+  <script src="controllers/clock.js"></script>
+  <script src="state/plan.js"></script>
+  <script src="controllers/plan-events.js"></script>
+  <script src="state/login.js"></script>
+  <script src="views/login.js"></script>
+  <script src="views/clock-pop.js"></script>
+  <script src="views/log.js"></script>
+  <script src="views/terms.js"></script>
+  <script src="controllers/terms.js"></script>
+  <script src="views/update.js"></script>
+  <script src="views/help.js"></script>
+  <script src="controllers/update.js"></script>
+  <script src="controllers/prefs.js"></script>
+  <script src="state/filters.js"></script>
+  <script src="views/selection.js"></script>
+  <script src="state/labels.js"></script>
+  <script src="controllers/tick.js"></script>
+  <script src="state/time.js"></script>
+  <script src="views/tour.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
