@@ -57,17 +57,26 @@ echo "── 写入 crontab ──"
 # 注意：这里必须写全服务器上真实的全部任务——写入方式是「先删掉所有含
 # tjise-activity-watch 的旧行再追加」，漏写一条就等于把那条任务停掉。
 # 按注释行不能带这个路径，否则每次安装都会重复堆积。
+#
+# 错峰：下面每条周期任务都错开自己的分钟偏移与秒偏移，避免整点齐发。
+# 2026-10-30 07:00 实测过一次「同一 token、同一接口，token_probe 报 ok、
+# run.py 报 4001」——学校在并发挤兑下会偶发一次 4001，被 fetch 单次判成
+# 登录失效、又被 auto_login 单条日志判据放大成真重登，反而把还在用的
+# token 换掉。fetch 侧的 4001 重试与 auto_login 的连败判据是第二道防线，
+# 这里是第一道：让它们不同时发生。
+# 不用 */5 而写 2-59/5 这类区间起点，是为了避开 0 分 0 秒——run.py 的四个
+# 整点任务要卡准活动开放时刻，不能被挤。
 CRON_LINES="0 7 * * * cd $APP && ${OWNER_ENV}$PY scripts/run.py --with-grab >> $APP/data/cron.log 2>&1
 5 7 * * * cd $APP && ${OWNER_ENV}$PY scripts/remind.py >> $APP/data/remind.log 2>&1
 30 10 * * * cd $APP && $PY scripts/run.py >> $APP/data/cron.log 2>&1
 30 16 * * * cd $APP && $PY scripts/run.py >> $APP/data/cron.log 2>&1
 30 21 * * * cd $APP && $PY scripts/run.py --late-checkin --with-open >> $APP/data/cron.log 2>&1
-*/5 * * * * cd $APP && $PY scripts/scan.py >> $APP/data/scan.log 2>&1
-*/15 * * * * cd $APP && ${OWNER_ENV}$PY scripts/token_probe.py >> $APP/data/token_probe.log 2>&1
-*/30 * * * * cd $APP && $PY scripts/token_report.py >> $APP/data/token_report.log 2>&1
-*/5 * * * * cd $APP && ${OWNER_ENV}$PY scripts/net_probe.py >> $APP/data/net_probe.log 2>&1
-*/1 * * * * cd $APP && ${OWNER_ENV}$PY scripts/watchlist_runner.py >> $APP/data/watchlist.log 2>&1
-* * * * * cd $APP && $PY scripts/activity_watch.py >> $APP/data/activity_watch.log 2>&1"
+2-59/5 * * * * cd $APP && $PY scripts/scan.py >> $APP/data/scan.log 2>&1
+4-59/15 * * * * cd $APP && ${OWNER_ENV}$PY scripts/token_probe.py >> $APP/data/token_probe.log 2>&1
+9-59/30 * * * * cd $APP && $PY scripts/token_report.py >> $APP/data/token_report.log 2>&1
+1-59/5 * * * * cd $APP && ${OWNER_ENV}$PY scripts/net_probe.py >> $APP/data/net_probe.log 2>&1
+* * * * * sleep 20; cd $APP && ${OWNER_ENV}$PY scripts/watchlist_runner.py >> $APP/data/watchlist.log 2>&1
+* * * * * sleep 40; cd $APP && $PY scripts/activity_watch.py >> $APP/data/activity_watch.log 2>&1"
 
 ( crontab -l 2>/dev/null | grep -v 'tjise-activity-watch' || true; echo "$CRON_LINES" ) | crontab -
 echo "✓ 已安装定时任务：清单 07:00（--with-grab）/ 10:30 / 16:30 / 21:30，私人提醒 07:05，扫描每 5 分钟，令牌探活每 15 分钟、令牌报告每 30 分钟、出网自检每 5 分钟、预报名 runner 每分钟、动态监测每分钟唤醒（自行控频）"
