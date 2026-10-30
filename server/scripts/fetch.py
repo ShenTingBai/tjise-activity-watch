@@ -11,6 +11,7 @@
 
 import json
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -169,8 +170,32 @@ def gender_mismatch(name: str, gender: str) -> bool:
     return False
 
 
+# 4001 不必然是登录态真失效。整点 cron 齐发时学校接口会偶发一次
+# 「身份验证失败」：2026-10-30 07:00:01 token_probe 用同一 token 打同一接口
+# 返回 ok，07:00:02 这边就 4001。隔一会儿重试该页即可；直接把单次 4001
+# 判成失效，会连带 auto_login 立刻重登，反而把还在用的 token 真换掉。
+LOGIN_RETRY_DELAY_S = 1.5
+LOGIN_RETRY_ATTEMPTS = 2
+
+
+def call_page(token: str, page_num: int, timeout: int = REQUEST_TIMEOUT) -> dict:
+    """取一页；遇到 4001 先重试，仍失败才把判断交给调用方。
+
+    只对 4001 重试。其它错误码（分页为空、接口异常）照旧立即上抛：
+    那些是真实的数据问题，重试只会把错误推迟一轮。
+    """
+    last = {}
+    for attempt in range(LOGIN_RETRY_ATTEMPTS):
+        last = call_api(token, page_num, timeout=timeout)
+        if last.get("code") != 4001:
+            return last
+        if attempt + 1 < LOGIN_RETRY_ATTEMPTS:
+            time.sleep(LOGIN_RETRY_DELAY_S)
+    return last
+
+
 def fetch_all(token: str, timeout: int = REQUEST_TIMEOUT) -> list:
-    first = call_api(token, 1, timeout=timeout)
+    first = call_page(token, 1, timeout=timeout)
     if first.get("code") == 4001:
         raise PermissionError(first.get("message", "身份验证失败"))
     if first.get("code") != 1:
@@ -182,7 +207,7 @@ def fetch_all(token: str, timeout: int = REQUEST_TIMEOUT) -> list:
     page = 1
     while len(items) < total and page < 30:
         page += 1
-        more = call_api(token, page, timeout=timeout)
+        more = call_page(token, page, timeout=timeout)
         code = more.get("code")
         if code == 4001:
             raise PermissionError(more.get("message", "身份验证失败"))

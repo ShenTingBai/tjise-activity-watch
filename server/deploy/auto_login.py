@@ -89,6 +89,12 @@ PROBE_LOG = os.path.join(APP_DIR, "data", "token_probe.log")
 MAX_ATTEMPTS = 5
 ALERT_COOLDOWN_SEC = 30 * 60
 PROBE_STALE_SEC = 3600
+# 单次 probe 失败不足以断言登录失效：整点 cron 齐发时学校接口会偶发一次 4001，
+# 同一 token 前后两个请求会一个 ok 一个 fail（2026-10-30 07:00 实测：
+# probe 07:00:01 ok、fetch 07:00:02 4001）。连续失败这个次数才直接重登；
+# 只失败一次时现查接口确认。判错的代价是立刻换掉 token，把所有正在用
+# 旧 token 的进程一起打成 4001 —— 那才是真正的失效。
+PROBE_FAIL_STREAK = 2
 # 两次尝试之间等一会儿：连着打容易撞同一段降质窗口，间隔后换到的是新图
 RETRY_DELAY_SEC = 30
 # 验证码字符集（学校侧就是大写字母 + 数字，4 位）
@@ -473,39 +479,52 @@ def _alert(reason):
 
 
 # ------------------------------------------------------------ 自测
-def _probe_says_failing():
-    """读 token_probe.log 最后一行判断最近一次探测结果。
+def _probe_fail_streak(limit: int = PROBE_FAIL_STREAK) -> int:
+    """从 token_probe.log 末尾往前数，连续失败了几次。
 
-    返回 True=失败（该尝试登录）、False=正常（跳过）、None=日志缺失/过旧（调用方退回接口校验）。
-    正常时段靠这个判据跳过登录，不给学校接口增加任何请求。
+    返回 -1 表示无法判断（日志缺失、过旧、格式异常、出现 http-error 这种
+    「判定不了」的结果），调用方退回现查接口；0 表示最近一次就是 ok；
+    n 表示从末尾起连续 n 次失败（最多数到 limit 就停）。
+
+    为什么不看单次失败：整点 cron 齐发时学校接口会偶发一次 4001，同一 token
+    前后两个请求一个 ok 一个 fail。按单次判失效会立刻触发重登，把还能用的
+    token 换掉，反而让其它进程全部 4001 —— 那是自己制造的真失效。
     """
     try:
         with open(PROBE_LOG, "r", encoding="utf-8", errors="replace") as f:
             lines = [ln.strip() for ln in f if ln.strip()]
     except Exception:
-        return None
+        return -1
     if not lines:
-        return None
+        return -1
     tokens = lines[-1].split()
     if len(tokens) < 2:
-        return None
+        return -1
     try:
         when = datetime.strptime(tokens[0] + " " + tokens[1], "%Y-%m-%d %H:%M:%S")
     except ValueError:
-        return None
+        return -1
     if (datetime.now() - when).total_seconds() > PROBE_STALE_SEC:
-        return None
-    for token in tokens:
-        if token.startswith("result="):
-            result = token[len("result="):]
-            if result == "ok":
-                return False
-            if result in ("fail", "no-session", "no-token"):
-                return True
-            # http-error / bad-json 这类是「判定不了」，交给调用方现查接口；
-            # 否则一次断网就会被当成登录态失效，白跑一轮重新登录。
-            return None
-    return None
+        return -1
+
+    streak = 0
+    for line in reversed(lines):
+        result = ""
+        for part in line.split():
+            if part.startswith("result="):
+                result = part[len("result="):]
+                break
+        if result == "ok":
+            break
+        if result in ("fail", "no-session", "no-token"):
+            streak += 1
+            if streak >= limit:
+                break
+            continue
+        # http-error / bad-json 这类是「判定不了」，整段作废：
+        # 否则一次断网就会被当成登录态失效，白跑一轮重新登录。
+        return -1
+    return streak
 
 
 def _session_fresh(seconds=600):
@@ -719,12 +738,13 @@ def main():
                 preempt_due = True
 
         if not preempt_due and args.trigger == "log":
-            verdict = _probe_says_failing()
-            if verdict is False:
+            streak = _probe_fail_streak()
+            if streak == 0:
                 log("[i] token_probe 最近一次结果为 ok，跳过自动登录")
                 _clear_alert_state()
                 return 0
-            if verdict is None:
+            if streak < PROBE_FAIL_STREAK:
+                # 无法判断（-1）或只失败了一次：现查接口确认，不直接换 token。
                 ok, detail = token_valid(token)
                 if ok:
                     log("[i] token 有效（fp=%s），跳过自动登录" % _token_fp(token))
@@ -735,7 +755,7 @@ def main():
                     return 0
                 log("[i] token 失效（%s），开始自动登录" % detail)
             else:
-                log("[i] token_probe 最近一次结果为失败，开始自动登录")
+                log("[i] token_probe 连续 %d 次失败，开始自动登录" % streak)
         elif not preempt_due:
             ok, detail = token_valid(token)
             if ok:
